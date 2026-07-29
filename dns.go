@@ -19,17 +19,12 @@ func dns() error {
 		return err
 	}
 
-	path, err := records.Write(cfg, signer.Record())
+	_, body, err := records.Write(cfg, signer.Record())
 	if err != nil {
 		return err
 	}
 
-	body, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
+	_, err = os.Stdout.Write(body)
 
-	os.Stdout.Write(body)
-
-	return nil
+	return err
 }

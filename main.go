@@ -93,7 +93,7 @@ func serve() error {
 
 	log.Println("Writing DNS instructions...")
 
-	path, err := records.Write(cfg, signer.Record())
+	path, _, err := records.Write(cfg, signer.Record())
 	if err != nil {
 		return err
 	}
@@ -111,6 +111,12 @@ func serve() error {
 	defer stop()
 
 	submission := smtpd.New(cfg, keeper, signer, spool, log)
+
+	err = submission.Listen()
+	if err != nil {
+		return err
+	}
+
 	deliverer := deliver.New(cfg, spool, log)
 
 	var (

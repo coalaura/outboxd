@@ -32,13 +32,16 @@ type Config struct {
 }
 
 type Server struct {
-	Hostname        string `yaml:"hostname"`
-	Domain          string `yaml:"domain"`
-	MaxMessageBytes int64  `yaml:"max_message_bytes"`
-	MaxRecipients   int    `yaml:"max_recipients"`
-	ReadTimeout     string `yaml:"read_timeout"`
-	WriteTimeout    string `yaml:"write_timeout"`
-	DataDirectory   string `yaml:"data_directory"`
+	Hostname                  string `yaml:"hostname"`
+	Domain                    string `yaml:"domain"`
+	MaxMessageBytes           int64  `yaml:"max_message_bytes"`
+	MaxRecipients             int    `yaml:"max_recipients"`
+	MaxMessagesPerHour        int    `yaml:"max_messages_per_hour"`
+	MaxRecipientsPerHour      int    `yaml:"max_recipients_per_hour"`
+	IncludeClientIPInReceived bool   `yaml:"include_client_ip_in_received"`
+	ReadTimeout               string `yaml:"read_timeout"`
+	WriteTimeout              string `yaml:"write_timeout"`
+	DataDirectory             string `yaml:"data_directory"`
 }
 
 type TLS struct {
@@ -57,6 +60,7 @@ type DKIM struct {
 type Delivery struct {
 	TLSMode               string `yaml:"tls_mode"`
 	MaxAttempts           int    `yaml:"max_attempts"`
+	MaximumLifetime       string `yaml:"maximum_lifetime"`
 	InitialRetryDelay     string `yaml:"initial_retry_delay"`
 	MaximumRetryDelay     string `yaml:"maximum_retry_delay"`
 	DomainConcurrency     int    `yaml:"domain_concurrency"`
@@ -82,19 +86,26 @@ type User struct {
 	Enabled        bool     `yaml:"enabled"`
 }
 
+type durationEntry struct {
+	name  string
+	value string
+}
+
 const configPath = "config.yml"
 
 // Default returns the default config
 func Default() *Config {
 	return &Config{
 		Server: Server{
-			Hostname:        "mail.example.invalid",
-			Domain:          "example.invalid",
-			MaxMessageBytes: 25 << 20,
-			MaxRecipients:   100,
-			ReadTimeout:     "5m",
-			WriteTimeout:    "5m",
-			DataDirectory:   "./data",
+			Hostname:             "mail.example.invalid",
+			Domain:               "example.invalid",
+			MaxMessageBytes:      25 << 20,
+			MaxRecipients:        100,
+			MaxMessagesPerHour:   1000,
+			MaxRecipientsPerHour: 10000,
+			ReadTimeout:          "5m",
+			WriteTimeout:         "5m",
+			DataDirectory:        "./data",
 		},
 		TLS: TLS{
 			Mode:            "self_signed",
@@ -121,6 +132,7 @@ func Default() *Config {
 		Delivery: Delivery{
 			TLSMode:               "opportunistic",
 			MaxAttempts:           15,
+			MaximumLifetime:       "120h",
 			InitialRetryDelay:     "5m",
 			MaximumRetryDelay:     "8h",
 			DomainConcurrency:     2,
@@ -159,6 +171,8 @@ func Load() (*Config, error) {
 	}
 
 	defer file.Close()
+
+	cfg.Users = nil
 
 	err = yaml.NewDecoder(file, yaml.DisallowUnknownField()).Decode(cfg)
 	if err != nil {
@@ -250,23 +264,8 @@ func (cfg *Config) User(username string) (User, bool) {
 	}, true
 }
 
-// Store atomically writes the current configuration.
-func (cfg *Config) Store() error {
-	cfg.initializeRuntime()
-
-	body, err := cfg.marshal()
-	if err != nil {
-		return err
-	}
-
-	cfg.fileMu.Lock()
-	defer cfg.fileMu.Unlock()
-
-	return disk.Write(configPath, body, 0600)
-}
-
 // Validate validates all config options.
-func (cfg Config) Validate() error {
+func (cfg *Config) Validate() error {
 	err := validateDomain("server.hostname", cfg.Server.Hostname)
 	if err != nil {
 		return err
@@ -285,22 +284,31 @@ func (cfg Config) Validate() error {
 		return errors.New("server.max_recipients must be positive")
 	}
 
+	if cfg.Server.MaxMessagesPerHour <= 0 {
+		return errors.New("server.max_messages_per_hour must be positive")
+	}
+
+	if cfg.Server.MaxRecipientsPerHour <= 0 {
+		return errors.New("server.max_recipients_per_hour must be positive")
+	}
+
 	if cfg.Server.DataDirectory == "" {
 		return errors.New("server.data_directory must not be empty")
 	}
 
-	durations := map[string]string{
-		"server.read_timeout":          cfg.Server.ReadTimeout,
-		"server.write_timeout":         cfg.Server.WriteTimeout,
-		"delivery.initial_retry_delay": cfg.Delivery.InitialRetryDelay,
-		"delivery.maximum_retry_delay": cfg.Delivery.MaximumRetryDelay,
-		"delivery.connection_timeout":  cfg.Delivery.ConnectionTimeout,
-		"delivery.command_timeout":     cfg.Delivery.CommandTimeout,
-		"delivery.submission_timeout":  cfg.Delivery.SubmissionTimeout,
+	durations := []durationEntry{
+		{"server.read_timeout", cfg.Server.ReadTimeout},
+		{"server.write_timeout", cfg.Server.WriteTimeout},
+		{"delivery.maximum_lifetime", cfg.Delivery.MaximumLifetime},
+		{"delivery.initial_retry_delay", cfg.Delivery.InitialRetryDelay},
+		{"delivery.maximum_retry_delay", cfg.Delivery.MaximumRetryDelay},
+		{"delivery.connection_timeout", cfg.Delivery.ConnectionTimeout},
+		{"delivery.command_timeout", cfg.Delivery.CommandTimeout},
+		{"delivery.submission_timeout", cfg.Delivery.SubmissionTimeout},
 	}
 
-	for name, value := range durations {
-		err = validateDuration(name, value)
+	for _, duration := range durations {
+		err = validateDuration(duration.name, duration.value)
 		if err != nil {
 			return err
 		}
@@ -380,6 +388,15 @@ func (cfg Config) Validate() error {
 			return fmt.Errorf("users[%d]: %w", i, err)
 		}
 
+		// Sender outside the DKIM domain can never produce an aligned DMARC pass.
+		for _, sender := range user.AllowedSenders {
+			domain := strings.ToLower(sender[strings.LastIndexByte(sender, '@')+1:])
+
+			if domain != cfg.Server.Domain && !strings.HasSuffix(domain, "."+cfg.Server.Domain) {
+				return fmt.Errorf("users[%d]: sender %q is outside server.domain %q; DKIM signs with d=%s so this mail cannot pass DMARC", i, sender, cfg.Server.Domain, cfg.Server.Domain)
+			}
+		}
+
 		username := canonicalUsername(user.Username)
 		if _, exists := usernames[username]; exists {
 			return fmt.Errorf("duplicate username %q", user.Username)
@@ -427,14 +444,14 @@ func (u *User) Validate() error {
 		}
 
 		senders[canonicalSender] = struct{}{}
-		u.AllowedSenders[i] = address.Address
+		u.AllowedSenders[i] = canonicalSender
 	}
 
 	return nil
 }
 
 // IsReady reports configuration options that must be corrected before serving.
-func (cfg Config) IsReady() error {
+func (cfg *Config) IsReady() error {
 	var problems []error
 
 	if strings.HasSuffix(cfg.Server.Domain, ".invalid") {
@@ -457,7 +474,7 @@ func (cfg Config) IsReady() error {
 }
 
 // Warnings reports non-fatal deliverability problems.
-func (cfg Config) Warnings() []string {
+func (cfg *Config) Warnings() []string {
 	var warnings []string
 
 	if cfg.TLS.Mode == "self_signed" {
@@ -514,14 +531,17 @@ func (cfg *Config) marshal() ([]byte, error) {
 	var buffer bytes.Buffer
 
 	comments := yaml.CommentMap{
-		"$.server":                   {yaml.HeadComment(" SMTP submission server")},
-		"$.server.hostname":          {yaml.HeadComment(" public SMTP hostname used for EHLO, TLS, MX, and reverse DNS")},
-		"$.server.domain":            {yaml.HeadComment(" sending domain used for DKIM, SPF, and DMARC")},
-		"$.server.max_message_bytes": {yaml.HeadComment(" maximum accepted message size in bytes")},
-		"$.server.max_recipients":    {yaml.HeadComment(" maximum recipients accepted for one message")},
-		"$.server.read_timeout":      {yaml.HeadComment(" maximum time spent waiting for an SMTP command")},
-		"$.server.write_timeout":     {yaml.HeadComment(" maximum time spent writing an SMTP response")},
-		"$.server.data_directory":    {yaml.HeadComment(" generated keys, certificates, DNS instructions and queue data")},
+		"$.server":                               {yaml.HeadComment(" SMTP submission server")},
+		"$.server.hostname":                      {yaml.HeadComment(" public SMTP hostname used for EHLO, TLS, MX, and reverse DNS")},
+		"$.server.domain":                        {yaml.HeadComment(" sending domain used for DKIM, SPF, and DMARC")},
+		"$.server.max_message_bytes":             {yaml.HeadComment(" maximum accepted message size in bytes")},
+		"$.server.max_recipients":                {yaml.HeadComment(" maximum recipients accepted for one message")},
+		"$.server.max_messages_per_hour":         {yaml.HeadComment(" per-user token-bucket limit for accepted messages")},
+		"$.server.max_recipients_per_hour":       {yaml.HeadComment(" per-user token-bucket limit for accepted recipients")},
+		"$.server.include_client_ip_in_received": {yaml.HeadComment(" include the submitting client's IP address in Received headers")},
+		"$.server.read_timeout":                  {yaml.HeadComment(" maximum time spent waiting for an SMTP command")},
+		"$.server.write_timeout":                 {yaml.HeadComment(" maximum time spent writing an SMTP response")},
+		"$.server.data_directory":                {yaml.HeadComment(" generated keys, certificates, DNS instructions and queue data")},
 
 		"$.tls":                  {yaml.HeadComment("\n# TLS used by the submission listeners")},
 		"$.tls.mode":             {yaml.HeadComment(` "self_signed" generates a development certificate; use "files" in production`)},
@@ -537,6 +557,7 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.delivery":                                  {yaml.HeadComment("\n# outbound SMTP delivery and retry policy")},
 		"$.delivery.tls_mode":                         {yaml.HeadComment(` destination TLS policy: "opportunistic" or "required"`)},
 		"$.delivery.max_attempts":                     {yaml.HeadComment(" maximum delivery attempts before moving a message to dead-letter state")},
+		"$.delivery.maximum_lifetime":                 {yaml.HeadComment(" absolute time a message may remain queued before dead-lettering")},
 		"$.delivery.initial_retry_delay":              {yaml.HeadComment(" delay after the first temporary delivery failure")},
 		"$.delivery.maximum_retry_delay":              {yaml.HeadComment(" upper bound for exponential retry delays")},
 		"$.delivery.domain_concurrency":               {yaml.HeadComment(" maximum simultaneous deliveries to one recipient domain")},
@@ -564,7 +585,7 @@ func (cfg *Config) marshal() ([]byte, error) {
 		return nil, err
 	}
 
-	body := bytes.ReplaceAll(buffer.Bytes(), []byte("#\n"), []byte("\n"))
+	body := bytes.ReplaceAll(buffer.Bytes(), []byte("\n#\n"), []byte("\n\n"))
 
 	return body, nil
 }

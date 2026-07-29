@@ -6,11 +6,16 @@ import (
 	"time"
 )
 
+// MinimumTLSVersion returns the configured floor for the submission listeners.
+func (cfg *Config) MinimumTLSVersion() uint16 {
+	if cfg.TLS.MinimumVersion == "1.3" {
+		return tls.VersionTLS13
+	}
+
+	return tls.VersionTLS12
+}
+
 // Allows reports whether the user may send as the given address.
-//
-// Local parts are compared case-insensitively, which is not strictly RFC 5321
-// conformant but matches every deployed mail system. A sender of the form
-// "*@example.com" authorizes the whole domain.
 func (u User) Allows(address string) bool {
 	address = strings.ToLower(strings.TrimSpace(address))
 
@@ -22,8 +27,6 @@ func (u User) Allows(address string) bool {
 	domain := address[at+1:]
 
 	for _, sender := range u.AllowedSenders {
-		sender = strings.ToLower(sender)
-
 		if sender == address {
 			return true
 		}
@@ -41,13 +44,4 @@ func Duration(value string) time.Duration {
 	duration, _ := time.ParseDuration(value)
 
 	return duration
-}
-
-// MinimumTLSVersion returns the configured floor for the submission listeners.
-func (cfg Config) MinimumTLSVersion() uint16 {
-	if cfg.TLS.MinimumVersion == "1.3" {
-		return tls.VersionTLS13
-	}
-
-	return tls.VersionTLS12
 }

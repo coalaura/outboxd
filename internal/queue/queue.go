@@ -42,6 +42,7 @@ type Envelope struct {
 	Attempts    int         `json:"attempts"`
 	NextAttempt time.Time   `json:"next_attempt"`
 	LastError   string      `json:"last_error,omitempty"`
+	SMTPUTF8    bool        `json:"smtp_utf8,omitempty"`
 
 	index int
 }
@@ -198,22 +199,6 @@ func (q *Queue) store(envelope *Envelope) error {
 	return disk.Write(q.metadata(envelope.ID), body, 0600)
 }
 
-func (q *Queue) read(path string) (*Envelope, error) {
-	body, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	envelope := new(Envelope)
-
-	err = json.Unmarshal(body, envelope)
-	if err != nil {
-		return nil, err
-	}
-
-	return envelope, nil
-}
-
 func (q *Queue) message(id string) string {
 	return filepath.Join(q.directory, id+".eml")
 }
@@ -245,12 +230,18 @@ func Open(directory string) (*Queue, error) {
 		return nil, err
 	}
 
+	metadata := make(map[string]struct{}, len(entries))
+
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		name := entry.Name()
+
+		if entry.IsDir() || !strings.HasSuffix(name, ".json") {
 			continue
 		}
 
-		envelope, err := q.read(filepath.Join(q.directory, entry.Name()))
+		metadata[strings.TrimSuffix(name, ".json")] = struct{}{}
+
+		envelope, err := read(filepath.Join(q.directory, name))
 		if err != nil {
 			continue
 		}
@@ -265,5 +256,33 @@ func Open(directory string) (*Queue, error) {
 		heap.Push(&q.pending, envelope)
 	}
 
+	for _, entry := range entries {
+		name := entry.Name()
+
+		if entry.IsDir() || !strings.HasSuffix(name, ".eml") {
+			continue
+		}
+
+		if _, ok := metadata[strings.TrimSuffix(name, ".eml")]; !ok {
+			os.Remove(filepath.Join(q.directory, name))
+		}
+	}
+
 	return q, nil
+}
+
+func read(path string) (*Envelope, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	envelope := new(Envelope)
+
+	err = json.Unmarshal(body, envelope)
+	if err != nil {
+		return nil, err
+	}
+
+	return envelope, nil
 }

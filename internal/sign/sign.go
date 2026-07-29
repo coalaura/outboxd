@@ -62,10 +62,10 @@ func (s *Signer) Signature(message []byte) (string, error) {
 		return "", err
 	}
 
-	defer signer.Close()
-
 	_, err = signer.Write(message)
 	if err != nil {
+		signer.Close()
+
 		return "", err
 	}
 

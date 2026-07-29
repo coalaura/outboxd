@@ -57,7 +57,7 @@ func Verify(hash, password string) (bool, error) {
 		return false, ErrInvalidHash
 	}
 
-	memory, time, threads, err := parameters(parts[3])
+	memory, iterations, threads, err := parameters(parts[3])
 	if err != nil {
 		return false, err
 	}
@@ -72,7 +72,7 @@ func Verify(hash, password string) (bool, error) {
 		return false, ErrInvalidHash
 	}
 
-	key := argon2.IDKey([]byte(password), salt, time, memory, threads, uint32(len(expected)))
+	key := argon2.IDKey([]byte(password), salt, iterations, memory, threads, uint32(len(expected)))
 
 	return subtle.ConstantTimeCompare(key, expected) == 1, nil
 }
@@ -83,7 +83,7 @@ func Waste() {
 	argon2.IDKey([]byte("outboxd"), make([]byte, saltLength), hashTime, hashMemory, hashThreads, keyLength)
 }
 
-func parameters(value string) (memory uint32, time uint32, threads uint8, err error) {
+func parameters(value string) (memory uint32, iterations uint32, threads uint8, err error) {
 	for pair := range strings.SplitSeq(value, ",") {
 		key, raw, ok := strings.Cut(pair, "=")
 		if !ok {
@@ -99,7 +99,7 @@ func parameters(value string) (memory uint32, time uint32, threads uint8, err er
 		case "m":
 			memory = uint32(number)
 		case "t":
-			time = uint32(number)
+			iterations = uint32(number)
 		case "p":
 			threads = uint8(number)
 		default:
@@ -107,9 +107,9 @@ func parameters(value string) (memory uint32, time uint32, threads uint8, err er
 		}
 	}
 
-	if memory == 0 || time == 0 || threads == 0 {
+	if memory == 0 || iterations == 0 || threads == 0 {
 		return 0, 0, 0, ErrInvalidHash
 	}
 
-	return memory, time, threads, nil
+	return memory, iterations, threads, nil
 }

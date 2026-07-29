@@ -3,7 +3,9 @@ package smtpd
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
 	"net/mail"
 	"strconv"
@@ -18,15 +20,25 @@ import (
 	"github.com/emersion/go-smtp"
 )
 
-var temporaryFailureErr = &smtp.SMTPError{
-	Code:         451,
-	EnhancedCode: smtp.EnhancedCode{4, 3, 0},
-	Message:      "Temporary failure, try again later",
-}
+var (
+	errTemporaryFailure = &smtp.SMTPError{
+		Code:         451,
+		EnhancedCode: smtp.EnhancedCode{4, 3, 0},
+		Message:      "Temporary failure, try again later",
+	}
+
+	errSubmissionRate = &smtp.SMTPError{
+		Code:         452,
+		EnhancedCode: smtp.EnhancedCode{4, 7, 0},
+		Message:      "Submission rate limit exceeded, try again later",
+	}
+)
 
 const (
 	SubmissionPort  = ":587"
 	ImplicitTLSPort = ":465"
+
+	maxResponseLength = 256
 )
 
 // Logger receives operational messages.
@@ -43,6 +55,7 @@ type Server struct {
 	log    Logger
 
 	limiter *limiter
+	rates   *submissionLimiter
 
 	// Bounds concurrent Argon2id derivations so authentication floods cannot
 	// exhaust memory.
@@ -50,6 +63,9 @@ type Server struct {
 
 	starttls *smtp.Server
 	implicit *smtp.Server
+
+	starttlsListener net.Listener
+	implicitListener net.Listener
 }
 
 // New builds the submission server.
@@ -60,6 +76,7 @@ func New(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signer, spool *q
 		signer:  signer,
 		log:     log,
 		limiter: newLimiter(),
+		rates:   newSubmissionLimiter(cfg.Server.MaxMessagesPerHour, cfg.Server.MaxRecipientsPerHour),
 		hashing: make(chan struct{}, 4),
 	}
 
@@ -72,8 +89,42 @@ func New(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signer, spool *q
 	return srv
 }
 
+// Listen opens both submission listeners without starting their accept loops.
+func (s *Server) Listen() error {
+	if s.starttlsListener != nil || s.implicitListener != nil {
+		return errors.New("submission listeners are already open")
+	}
+
+	starttlsListener, err := net.Listen("tcp", s.starttls.Addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", s.starttls.Addr, err)
+	}
+
+	implicitListener, err := net.Listen("tcp", s.implicit.Addr)
+	if err != nil {
+		starttlsListener.Close()
+
+		return fmt.Errorf("listen on %s: %w", s.implicit.Addr, err)
+	}
+
+	s.starttlsListener = starttlsListener
+	s.implicitListener = implicitListener
+
+	s.log.Printf(
+		"Listening for submission on %s (STARTTLS) and %s (implicit TLS)\n",
+		s.starttls.Addr,
+		s.implicit.Addr,
+	)
+
+	return nil
+}
+
 // Run serves both listeners until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
+	if s.starttlsListener == nil || s.implicitListener == nil {
+		return errors.New("submission listeners are not open")
+	}
+
 	var (
 		wg     sync.WaitGroup
 		errs   [2]error
@@ -90,16 +141,16 @@ func (s *Server) Run(ctx context.Context) error {
 		})
 	}
 
-	s.log.Printf("Listening for submission on %s (STARTTLS) and %s (implicit TLS)\n", SubmissionPort, ImplicitTLSPort)
-
 	wg.Go(func() {
-		errs[0] = ignoreClosed(s.starttls.ListenAndServe())
+		errs[0] = ignoreClosed(s.starttls.Serve(s.starttlsListener))
 
 		stop()
 	})
 
 	wg.Go(func() {
-		errs[1] = ignoreClosed(s.implicit.ListenAndServeTLS())
+		listener := tls.NewListener(s.implicitListener, s.implicit.TLSConfig)
+
+		errs[1] = ignoreClosed(s.implicit.Serve(listener))
 
 		stop()
 	})
@@ -186,4 +237,26 @@ func ignoreClosed(err error) error {
 	}
 
 	return err
+}
+
+func responseText(value string) string {
+	value = strings.Map(func(char rune) rune {
+		if char < 32 || char > 126 {
+			return ' '
+		}
+
+		return char
+	}, value)
+
+	value = strings.Join(strings.Fields(value), " ")
+
+	if value == "" {
+		return "Invalid message"
+	}
+
+	if len(value) > maxResponseLength {
+		return value[:maxResponseLength]
+	}
+
+	return value
 }

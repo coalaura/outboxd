@@ -3,6 +3,7 @@ package smtpd
 import (
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"time"
 
@@ -21,6 +22,7 @@ type session struct {
 	user       config.User
 	sender     string
 	recipients []string
+	smtpUTF8   bool
 }
 
 func (s *session) AuthMechanisms() []string {
@@ -74,6 +76,7 @@ func (s *session) Mail(from string, opts *smtp.MailOptions) error {
 
 	s.sender = address
 	s.recipients = s.recipients[:0]
+	s.smtpUTF8 = opts != nil && opts.UTF8
 
 	return nil
 }
@@ -88,12 +91,24 @@ func (s *session) Rcpt(to string, opts *smtp.RcptOptions) error {
 	}
 
 	address, err := address(to)
-	if err != nil || !strings.Contains(address[strings.LastIndexByte(address, '@')+1:], ".") {
+
+	var domain string
+
+	if err == nil {
+		domain = address[strings.LastIndexByte(address, '@')+1:]
+	}
+
+	if err != nil || !strings.Contains(domain, ".") || strings.HasPrefix(domain, "[") {
 		return &smtp.SMTPError{
 			Code:         501,
 			EnhancedCode: smtp.EnhancedCode{5, 1, 3},
 			Message:      "Invalid recipient address",
 		}
+	}
+
+	// RFC 5321 lets a client repeat a recipient.
+	if slices.Contains(s.recipients, address) {
+		return nil
 	}
 
 	s.recipients = append(s.recipients, address)
@@ -113,10 +128,16 @@ func (s *session) Data(r io.Reader) error {
 		}
 	}
 
+	var remoteAddress string
+
+	if s.server.cfg.Server.IncludeClientIPInReceived {
+		remoteAddress = host(s.conn)
+	}
+
 	prepared, err := message.Prepare(r, message.Options{
 		Hostname: s.server.cfg.Server.Hostname,
 		Helo:     s.conn.Hostname(),
-		Remote:   remote(s.conn),
+		Remote:   remoteAddress,
 		TLS:      s.tls(),
 	})
 
@@ -124,7 +145,7 @@ func (s *session) Data(r io.Reader) error {
 		return &smtp.SMTPError{
 			Code:         550,
 			EnhancedCode: smtp.EnhancedCode{5, 6, 0},
-			Message:      err.Error(),
+			Message:      responseText(err.Error()),
 		}
 	}
 
@@ -138,11 +159,25 @@ func (s *session) Data(r io.Reader) error {
 		}
 	}
 
+	if !s.server.rates.take(s.user.Username, len(s.recipients)) {
+		s.server.log.Printf("rate-limited submission for user %q\n", s.user.Username)
+
+		return errSubmissionRate
+	}
+
+	var accepted bool
+
+	defer func() {
+		if !accepted {
+			s.server.rates.refund(s.user.Username, len(s.recipients))
+		}
+	}()
+
 	signature, err := s.server.signer.Signature(prepared.Data)
 	if err != nil {
 		s.server.log.Printf("dkim signing failed: %v\n", err)
 
-		return temporaryFailureErr
+		return errTemporaryFailure
 	}
 
 	data := make([]byte, 0, len(signature)+len(prepared.Data))
@@ -156,6 +191,7 @@ func (s *session) Data(r io.Reader) error {
 		Recipients:  make([]queue.Recipient, 0, len(s.recipients)),
 		Created:     time.Now(),
 		NextAttempt: time.Now(),
+		SMTPUTF8:    s.smtpUTF8,
 	}
 
 	for _, recipient := range s.recipients {
@@ -170,8 +206,10 @@ func (s *session) Data(r io.Reader) error {
 	if err != nil {
 		s.server.log.Printf("failed to queue message: %v\n", err)
 
-		return temporaryFailureErr
+		return errTemporaryFailure
 	}
+
+	accepted = true
 
 	s.server.log.Printf("queued %s from %s for %d recipient(s)\n", envelope.ID, s.sender, len(envelope.Recipients))
 
@@ -181,6 +219,7 @@ func (s *session) Data(r io.Reader) error {
 func (s *session) Reset() {
 	s.sender = ""
 	s.recipients = s.recipients[:0]
+	s.smtpUTF8 = false
 }
 
 func (s *session) Logout() error {

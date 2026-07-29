@@ -13,7 +13,10 @@ import (
 	"time"
 )
 
-const maxLineLength = 998
+const (
+	maxLineLength  = 998
+	maxTraceLength = 128
+)
 
 var (
 	errEmpty     = errors.New("message is empty")
@@ -108,16 +111,28 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 		from = address.Address
 	}
 
-	identifier := messageID(opts.Hostname)
+	identifierDomain := opts.Hostname
+
+	if at := strings.LastIndexByte(from, '@'); at >= 0 && at < len(from)-1 {
+		identifierDomain = from[at+1:]
+	}
+
+	identifier := messageID(identifierDomain)
 
 	var out bytes.Buffer
 
 	out.Grow(len(data) + 512)
 
+	fmt.Fprintf(&out, "Received: from %s", traceValue(opts.Helo))
+
+	if opts.Remote != "" {
+		fmt.Fprintf(&out, " (%s)", traceValue(opts.Remote))
+	}
+
 	fmt.Fprintf(
 		&out,
-		"Received: from %s (%s)\r\n\tby %s with %s id %s;\r\n\t%s\r\n",
-		opts.Helo, opts.Remote, opts.Hostname, protocol(opts.TLS), strings.Trim(identifier, "<>"),
+		"\r\n\tby %s with %s id %s;\r\n\t%s\r\n",
+		opts.Hostname, protocol(opts.TLS), strings.Trim(identifier, "<>"),
 		time.Now().Format(time.RFC1123Z),
 	)
 
@@ -133,11 +148,16 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 		out.WriteString("To: undisclosed-recipients:;\r\n")
 	}
 
-	if present["content-type"] == 0 && !ascii(body) {
+	eightBit := !ascii(body)
+
+	if present["content-type"] == 0 && eightBit {
 		out.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
-		out.WriteString("Content-Transfer-Encoding: 8bit\r\n")
 
 		present["content-type"]++
+	}
+
+	if present["content-transfer-encoding"] == 0 && eightBit {
+		out.WriteString("Content-Transfer-Encoding: 8bit\r\n")
 	}
 
 	if present["mime-version"] == 0 && present["content-type"] > 0 {
@@ -263,6 +283,30 @@ func scan(header []byte) ([]field, error) {
 	return fields, nil
 }
 
+func traceValue(value string) string {
+	var builder strings.Builder
+
+	builder.Grow(min(len(value), maxTraceLength))
+
+	for _, char := range value {
+		if builder.Len() >= maxTraceLength {
+			break
+		}
+
+		if char < 33 || char > 126 || char == '(' || char == ')' || char == '\\' {
+			continue
+		}
+
+		builder.WriteRune(char)
+	}
+
+	if builder.Len() == 0 {
+		return "unknown"
+	}
+
+	return builder.String()
+}
+
 func messageID(hostname string) string {
 	return fmt.Sprintf(
 		"<%s.%s@%s>",
@@ -270,6 +314,28 @@ func messageID(hostname string) string {
 		strings.ToLower(rand.Text()),
 		hostname,
 	)
+}
+
+func comment(value string) string {
+	const limit = 128
+
+	value = strings.Map(func(char rune) rune {
+		if char < 33 || char > 126 || char == '(' || char == ')' || char == '\\' {
+			return -1
+		}
+
+		return char
+	}, value)
+
+	if value == "" {
+		return "unknown"
+	}
+
+	if len(value) > limit {
+		return value[:limit]
+	}
+
+	return value
 }
 
 func protocol(state string) string {

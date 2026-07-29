@@ -18,13 +18,19 @@ import (
 	"github.com/emersion/go-smtp"
 )
 
+const lifetimeDetail = "maximum queue lifetime exceeded"
+
 // Logger receives operational messages.
 type Logger interface {
 	Printf(format string, values ...any)
 	Println(values ...any)
 }
 
-var errNullMX = errors.New("domain does not accept mail (null MX)")
+var (
+	errNullMX              = errors.New("domain does not accept mail (null MX)")
+	errNoSuchDomain        = errors.New("recipient domain does not exist")
+	errSMTPUTF8Unsupported = errors.New("destination does not support SMTPUTF8")
+)
 
 // Deliverer drains the queue towards the destination MX servers.
 type Deliverer struct {
@@ -34,31 +40,47 @@ type Deliverer struct {
 
 	resolver *net.Resolver
 	dialer   *net.Dialer
+	network  string
 
 	global  chan struct{}
 	domains *domainLimiter
 
 	command    time.Duration
 	submission time.Duration
+	lifetime   time.Duration
 	initial    time.Duration
 	maximum    time.Duration
 }
 
 // New builds the outbound delivery worker pool.
 func New(cfg *config.Config, spool *queue.Queue, log Logger) *Deliverer {
+	dialer := &net.Dialer{Timeout: config.Duration(cfg.Delivery.ConnectionTimeout)}
+	network := "tcp"
+
+	if cfg.DNS.PublicIPv6 == "" {
+		network = "tcp4"
+
+		ip := net.ParseIP(cfg.DNS.PublicIPv4)
+		if ip != nil {
+			dialer.LocalAddr = &net.TCPAddr{IP: ip}
+		}
+	}
+
 	return &Deliverer{
 		cfg:   cfg,
 		queue: spool,
 		log:   log,
 
 		resolver: net.DefaultResolver,
-		dialer:   &net.Dialer{Timeout: config.Duration(cfg.Delivery.ConnectionTimeout)},
+		dialer:   dialer,
+		network:  network,
 
 		global:  make(chan struct{}, cfg.Delivery.GlobalConcurrency),
 		domains: newDomainLimiter(cfg.Delivery.DomainConcurrency),
 
 		command:    config.Duration(cfg.Delivery.CommandTimeout),
 		submission: config.Duration(cfg.Delivery.SubmissionTimeout),
+		lifetime:   config.Duration(cfg.Delivery.MaximumLifetime),
 		initial:    config.Duration(cfg.Delivery.InitialRetryDelay),
 		maximum:    config.Duration(cfg.Delivery.MaximumRetryDelay),
 	}
@@ -75,7 +97,11 @@ func (d *Deliverer) Run(ctx context.Context) error {
 	for {
 		envelope, err := d.queue.Next(ctx)
 		if err != nil {
-			return nil
+			if ctx.Err() != nil {
+				return nil
+			}
+
+			return err
 		}
 
 		select {
@@ -95,6 +121,14 @@ func (d *Deliverer) Run(ctx context.Context) error {
 }
 
 func (d *Deliverer) attempt(ctx context.Context, envelope *queue.Envelope) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	if d.expire(envelope) {
+		return
+	}
+
 	envelope.Attempts++
 	envelope.LastError = ""
 
@@ -151,6 +185,11 @@ func (d *Deliverer) attempt(ctx context.Context, envelope *queue.Envelope) {
 	default:
 		envelope.NextAttempt = time.Now().Add(d.backoff(envelope.Attempts))
 
+		deadline := envelope.Created.Add(d.lifetime)
+		if deadline.Before(envelope.NextAttempt) {
+			envelope.NextAttempt = deadline
+		}
+
 		d.log.Printf("retrying %s in %s: %s\n", envelope.ID, time.Until(envelope.NextAttempt).Round(time.Second), envelope.LastError)
 
 		err := d.queue.Retry(envelope)
@@ -158,6 +197,32 @@ func (d *Deliverer) attempt(ctx context.Context, envelope *queue.Envelope) {
 			d.log.Printf("failed to reschedule %s: %v\n", envelope.ID, err)
 		}
 	}
+}
+
+func (d *Deliverer) expire(envelope *queue.Envelope) bool {
+	if time.Now().Before(envelope.Created.Add(d.lifetime)) {
+		return false
+	}
+
+	for i := range envelope.Recipients {
+		recipient := &envelope.Recipients[i]
+
+		if recipient.Status == queue.StatusPending {
+			recipient.Status = queue.StatusFailed
+			recipient.Detail = lifetimeDetail
+		}
+	}
+
+	envelope.LastError = lifetimeDetail
+
+	d.log.Printf("expiring %s after %s\n", envelope.ID, d.lifetime)
+
+	err := d.queue.Bury(envelope)
+	if err != nil {
+		d.log.Printf("failed to bury expired message %s: %v\n", envelope.ID, err)
+	}
+
+	return true
 }
 
 func (d *Deliverer) finish(envelope *queue.Envelope) {
@@ -180,7 +245,7 @@ func (d *Deliverer) finish(envelope *queue.Envelope) {
 func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain string, indexes []int) error {
 	hosts, err := d.hosts(ctx, domain)
 	if err != nil {
-		if errors.Is(err, errNullMX) {
+		if errors.Is(err, errNullMX) || errors.Is(err, errNoSuchDomain) {
 			d.reject(envelope, indexes, err.Error())
 
 			return nil
@@ -189,7 +254,10 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 		return err
 	}
 
-	var last error
+	var (
+		last               error
+		allUTF8Unsupported = len(hosts) > 0
+	)
 
 	for _, host := range hosts {
 		if ctx.Err() != nil {
@@ -201,7 +269,22 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 			return nil
 		}
 
+		if errors.Is(err, errSMTPUTF8Unsupported) {
+			if last == nil {
+				last = err
+			}
+
+			continue
+		}
+
+		allUTF8Unsupported = false
 		last = err
+	}
+
+	if allUTF8Unsupported && last != nil {
+		d.reject(envelope, indexes, errSMTPUTF8Unsupported.Error())
+
+		return nil
 	}
 
 	if last == nil {
@@ -222,7 +305,20 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 	client.CommandTimeout = d.command
 	client.SubmissionTimeout = d.submission
 
-	err = client.Mail(envelope.Sender, &smtp.MailOptions{Size: envelope.Size})
+	if envelope.SMTPUTF8 {
+		supported, _ := client.Extension("SMTPUTF8")
+		if !supported {
+			client.Quit()
+
+			return false, errSMTPUTF8Unsupported
+		}
+	}
+
+	err = client.Mail(envelope.Sender, &smtp.MailOptions{
+		Size: envelope.Size,
+		UTF8: envelope.SMTPUTF8,
+	})
+
 	if err != nil {
 		if permanent(err) {
 			d.reject(envelope, indexes, describe(err))
@@ -237,6 +333,11 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 
 	for _, index := range indexes {
 		recipient := &envelope.Recipients[index]
+
+		// An earlier MX in this attempt already rejected the address for good.
+		if recipient.Status != queue.StatusPending {
+			continue
+		}
 
 		err = client.Rcpt(recipient.Address, nil)
 		if err == nil {
@@ -309,35 +410,49 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 
 func (d *Deliverer) connect(ctx context.Context, host string) (*smtp.Client, error) {
 	required := d.cfg.Delivery.TLSMode == "required"
+	requireValidCertificate := d.cfg.Delivery.RequireValidMXTLSCert
 
-	client, err := d.dial(ctx, host, true)
-	if err == nil {
+	client, verifiedErr := d.dial(ctx, host, true)
+	if verifiedErr == nil {
 		return client, nil
 	}
 
-	if required && d.cfg.Delivery.RequireValidMXTLSCert {
-		return nil, err
-	}
+	var unverifiedErr error
 
-	client, verifyErr := d.dial(ctx, host, false)
-	if verifyErr == nil {
-		return client, nil
-	}
+	if requireValidCertificate {
+		if required {
+			return nil, verifiedErr
+		}
+	} else {
+		client, unverifiedErr = d.dial(ctx, host, false)
+		if unverifiedErr == nil {
+			return client, nil
+		}
 
-	if required {
-		return nil, errors.Join(err, verifyErr)
+		if required {
+			return nil, errors.Join(verifiedErr, unverifiedErr)
+		}
 	}
 
 	conn, plainErr := d.dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, "25"))
 	if plainErr != nil {
-		return nil, errors.Join(err, verifyErr, plainErr)
+		return nil, errors.Join(verifiedErr, unverifiedErr, plainErr)
 	}
 
-	return smtp.NewClient(conn), nil
+	client = smtp.NewClient(conn)
+
+	helloErr := client.Hello(d.cfg.Server.Hostname)
+	if helloErr != nil {
+		client.Close()
+
+		return nil, errors.Join(verifiedErr, unverifiedErr, helloErr)
+	}
+
+	return client, nil
 }
 
 func (d *Deliverer) dial(ctx context.Context, host string, verify bool) (*smtp.Client, error) {
-	conn, err := d.dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, "25"))
+	conn, err := d.dialer.DialContext(ctx, d.network, net.JoinHostPort(host, "25"))
 	if err != nil {
 		return nil, err
 	}
@@ -369,11 +484,21 @@ func (d *Deliverer) dial(ctx context.Context, host string, verify bool) (*smtp.C
 func (d *Deliverer) hosts(ctx context.Context, domain string) ([]string, error) {
 	records, err := d.resolver.LookupMX(ctx, domain)
 	if err != nil {
-		if dnsErr, ok := errors.AsType[*net.DNSError](err); ok && dnsErr.IsNotFound {
-			return []string{domain}, nil
+		dnsErr, ok := errors.AsType[*net.DNSError](err)
+		if !ok || !dnsErr.IsNotFound {
+			return nil, err
 		}
 
-		return nil, err
+		_, err = d.resolver.LookupNetIP(ctx, "ip", domain)
+		if err != nil {
+			if dnsErr, ok := errors.AsType[*net.DNSError](err); ok && dnsErr.IsNotFound {
+				return nil, errNoSuchDomain
+			}
+
+			return nil, err
+		}
+
+		return []string{domain}, nil
 	}
 
 	if len(records) == 0 {

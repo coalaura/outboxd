@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/coalaura/outboxd/internal/config"
 	"github.com/coalaura/outboxd/internal/disk"
 )
+
+const maxString = 255
 
 // Record is a single DNS entry the operator has to publish.
 type Record struct {
@@ -52,6 +55,13 @@ func Build(cfg *config.Config, dkim string) []Record {
 	})
 
 	records = append(records, Record{
+		Name:    hostname,
+		Type:    "TXT",
+		Value:   spf(cfg),
+		Purpose: "SPF for the EHLO name; receivers check the HELO identity separately from the envelope sender",
+	})
+
+	records = append(records, Record{
 		Name:    fmt.Sprintf("%s._domainkey.%s", cfg.DKIM.Selector, domain),
 		Type:    "TXT",
 		Value:   dkim,
@@ -87,17 +97,28 @@ func Build(cfg *config.Config, dkim string) []Record {
 }
 
 // Write renders the DNS instructions next to the other generated files.
-func Write(cfg *config.Config, dkim string) (string, error) {
+func Write(cfg *config.Config, dkim string) (string, []byte, error) {
 	var buffer bytes.Buffer
 
 	buffer.Grow(4096)
 
 	fmt.Fprintf(&buffer, "DNS setup for %s (%s)\n", cfg.Server.Domain, time.Now().Format(time.RFC3339))
 
-	buffer.WriteString("- Public IPv4/IPv6 must match reverse DNS records\n")
 	buffer.WriteString("- Outbound TCP port 25 (sending mail) must be open\n")
 	buffer.WriteString("- Inbound TCP port 465 (implicit TLS) must be open\n")
-	buffer.WriteString("- Inbound TCP port 587 (STARTLS) must be open\n")
+	buffer.WriteString("- Inbound TCP port 587 (STARTTLS) must be open\n")
+
+	if cfg.DNS.PublicIPv4 != "" {
+		fmt.Fprintf(&buffer, "- PTR for %s must resolve to %s, and %s must resolve back to %s\n", cfg.DNS.PublicIPv4, cfg.Server.Hostname, cfg.Server.Hostname, cfg.DNS.PublicIPv4)
+	}
+
+	if cfg.DNS.PublicIPv6 != "" {
+		fmt.Fprintf(&buffer, "- PTR for %s must resolve to %s; drop the AAAA record until it does\n", cfg.DNS.PublicIPv6, cfg.Server.Hostname)
+	}
+
+	buffer.WriteString("- PTR records are set at the hosting provider, not in this zone\n")
+	fmt.Fprintf(&buffer, "- %s needs an MX pointing at a mailbox that accepts bounces and replies;\n  receivers reject mail whose envelope sender cannot be bounced to\n", cfg.Server.Domain)
+	buffer.WriteString("- TXT values above 255 characters are shown pre-split; keep the quoting as-is\n")
 
 	if cfg.TLS.Mode == "self_signed" {
 		buffer.WriteString("- Replace self-signed submission certificate\n")
@@ -113,15 +134,34 @@ func Write(cfg *config.Config, dkim string) (string, error) {
 		fmt.Fprintf(&buffer, "  type  %s\n", record.Type)
 
 		if record.Type == "TXT" {
-			fmt.Fprintf(&buffer, "  value %q\n", record.Value)
+			fmt.Fprintf(&buffer, "  value %s\n", quote(record.Value))
 		} else {
 			fmt.Fprintf(&buffer, "  value %s\n", record.Value)
 		}
 	}
 
 	path := cfg.ResolvePath(cfg.DNS.OutputFile)
+	body := buffer.Bytes()
 
-	return path, disk.Write(path, buffer.Bytes(), 0644)
+	return path, body, disk.Write(path, body, 0644)
+}
+
+func quote(value string) string {
+	if len(value) <= maxString {
+		return strconv.Quote(value)
+	}
+
+	var builder strings.Builder
+
+	for start := 0; start < len(value); start += maxString {
+		if start > 0 {
+			builder.WriteByte(' ')
+		}
+
+		builder.WriteString(strconv.Quote(value[start:min(start+maxString, len(value))]))
+	}
+
+	return builder.String()
 }
 
 func spf(cfg *config.Config) string {
