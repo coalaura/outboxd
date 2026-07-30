@@ -3,6 +3,8 @@ package records
 import (
 	"bytes"
 	"fmt"
+	"net/mail"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -22,12 +24,15 @@ type Record struct {
 	Purpose string
 }
 
-// Build returns every DNS record needed for the configured domain.
+// Build returns every DNS record needed for the configured placement.
+//
+// At most one SPF TXT is emitted per owner name. When the EHLO hostname equals
+// the envelope domain, a single SPF covers both identities.
 func Build(cfg *config.Config, dkim string) []Record {
-	hostname := cfg.Server.Hostname + "."
-	domain := cfg.Server.Domain + "."
+	hostname := strings.TrimSuffix(strings.ToLower(cfg.Server.Hostname), ".") + "."
+	domain := strings.TrimSuffix(strings.ToLower(cfg.Server.Domain), ".") + "."
 
-	records := make([]Record, 0, 6)
+	records := make([]Record, 0, 8)
 
 	if cfg.DNS.PublicIPv4 != "" {
 		records = append(records, Record{
@@ -47,19 +52,23 @@ func Build(cfg *config.Config, dkim string) []Record {
 		})
 	}
 
-	records = append(records, Record{
-		Name:    domain,
-		Type:    "TXT",
-		Value:   spf(cfg),
-		Purpose: "SPF; authorizes this server to send for the domain and rejects everything else",
-	})
-
-	records = append(records, Record{
-		Name:    hostname,
-		Type:    "TXT",
-		Value:   spf(cfg),
-		Purpose: "SPF for the EHLO name; receivers check the HELO identity separately from the envelope sender",
-	})
+	// One SPF TXT per distinct owner name.
+	spfOwners := spfOwnerNames(cfg)
+	spfValue := spf(cfg)
+	for _, owner := range spfOwners {
+		purpose := "SPF; authorizes this server to send for this domain and rejects everything else"
+		if owner == hostname && owner != domain {
+			purpose = "SPF for the EHLO/HELO name; receivers may check HELO separately from the envelope sender"
+		} else if owner != domain && owner != hostname {
+			purpose = "SPF for an allowed envelope-sender domain"
+		}
+		records = append(records, Record{
+			Name:    owner,
+			Type:    "TXT",
+			Value:   spfValue,
+			Purpose: purpose,
+		})
+	}
 
 	records = append(records, Record{
 		Name:    fmt.Sprintf("%s._domainkey.%s", cfg.DKIM.Selector, domain),
@@ -72,25 +81,31 @@ func Build(cfg *config.Config, dkim string) []Record {
 		Name:    "_dmarc." + domain,
 		Type:    "TXT",
 		Value:   dmarc(cfg),
-		Purpose: "DMARC policy; \"quarantine\" is a safe default; move to \"reject\" once reports look clean",
+		Purpose: `DMARC policy; start with p=none (monitor), then stage to "quarantine" and "reject" once reports look clean`,
 	})
 
-	for _, host := range external(cfg) {
+	// External DMARC reporting hosts need an authorization record.
+	// outboxd does not accept inbound mail or DMARC reports — operators must
+	// point rua at a mailbox that does.
+	for _, host := range external(cfg.DNS.ReportURI, cfg.Server.Domain) {
 		records = append(records, Record{
-			Name:    fmt.Sprintf("%s_report._dmarc.%s.", domain, host),
+			Name:    fmt.Sprintf("%s._report._dmarc.%s.", strings.TrimSuffix(domain, "."), host),
 			Type:    "TXT",
 			Value:   "v=DMARC1",
-			Purpose: fmt.Sprintf("authorizes %s to receive DMARC reports for %s", host, cfg.Server.Domain),
+			Purpose: fmt.Sprintf("authorizes %s to receive DMARC aggregate reports for %s (external destination)", host, cfg.Server.Domain),
 		})
 	}
 
-	if cfg.DNS.ReportURI != "" {
-		records = append(records, Record{
-			Name:    "_smtp._tls." + domain,
-			Type:    "TXT",
-			Value:   fmt.Sprintf("v=TLSRPTv1; rua=%s", cfg.DNS.ReportURI),
-			Purpose: "optional TLS reporting endpoint",
-		})
+	// TLS-RPT is separate from DMARC reporting.
+	if tlsURI := strings.TrimSpace(cfg.DNS.TLSRPTURI); tlsURI != "" {
+		if err := validateReportURIList(tlsURI); err == nil {
+			records = append(records, Record{
+				Name:    "_smtp._tls." + domain,
+				Type:    "TXT",
+				Value:   fmt.Sprintf("v=TLSRPTv1; rua=%s", tlsURI),
+				Purpose: "optional SMTP TLS reporting endpoint (separate from DMARC rua)",
+			})
+		}
 	}
 
 	return records
@@ -104,12 +119,14 @@ func Write(cfg *config.Config, dkim string) (string, []byte, error) {
 
 	fmt.Fprintf(&buffer, "DNS setup for %s (%s)\n", cfg.Server.Domain, time.Now().Format(time.RFC3339))
 
-	buffer.WriteString("- Outbound TCP port 25 (sending mail) must be open\n")
-	buffer.WriteString("- Inbound TCP port 465 (implicit TLS) must be open\n")
-	buffer.WriteString("- Inbound TCP port 587 (STARTTLS) must be open\n")
+	buffer.WriteString("- Outboxd is outbound submission + delivery only: it does not provide inbound MX\n")
+	buffer.WriteString("- Outbound TCP port 25 (sending mail) must be open from this host\n")
+	buffer.WriteString("- Inbound TCP port 465 (implicit TLS submission) must be open for clients\n")
+	buffer.WriteString("- Inbound TCP port 587 (STARTTLS submission) must be open for clients\n")
+	buffer.WriteString("- Do not publish an MX for this host unless a separate mailbox accepts mail elsewhere\n")
 
 	if cfg.DNS.PublicIPv4 != "" {
-		fmt.Fprintf(&buffer, "- PTR for %s must resolve to %s, and %s must resolve back to %s\n", cfg.DNS.PublicIPv4, cfg.Server.Hostname, cfg.Server.Hostname, cfg.DNS.PublicIPv4)
+		fmt.Fprintf(&buffer, "- PTR for %s must resolve to %s, and %s must resolve back to %s (FCrDNS)\n", cfg.DNS.PublicIPv4, cfg.Server.Hostname, cfg.Server.Hostname, cfg.DNS.PublicIPv4)
 	}
 
 	if cfg.DNS.PublicIPv6 != "" {
@@ -117,11 +134,22 @@ func Write(cfg *config.Config, dkim string) (string, []byte, error) {
 	}
 
 	buffer.WriteString("- PTR records are set at the hosting provider, not in this zone\n")
-	fmt.Fprintf(&buffer, "- %s needs an MX pointing at a mailbox that accepts bounces and replies;\n  receivers reject mail whose envelope sender cannot be bounced to\n", cfg.Server.Domain)
+	fmt.Fprintf(&buffer, "- Envelope-sender domain(s) need MX (or an A/AAAA implicit MX) pointing at a mailbox that accepts bounces and replies;\n  receivers reject mail whose envelope sender cannot be bounced to. outboxd itself is not that mailbox.\n")
+	buffer.WriteString("- Publish exactly one SPF TXT per owner name (never two SPF records at the same name)\n")
+	buffer.WriteString("- DMARC aggregate reports (rua) must go to a mailbox you control; outboxd does not ingest reports\n")
+	buffer.WriteString("- External DMARC report destinations need a <org>._report._dmarc.<rua-host> authorization TXT\n")
+	buffer.WriteString("- TLS-RPT (_smtp._tls) is optional and separate from DMARC rua\n")
 	buffer.WriteString("- TXT values above 255 characters are shown pre-split; keep the quoting as-is\n")
 
 	if cfg.TLS.Mode == "self_signed" {
-		buffer.WriteString("- Replace self-signed submission certificate\n")
+		buffer.WriteString("- tls.mode is self_signed (development only); replace with a publicly trusted certificate for production clients\n")
+	}
+
+	if err := validateReportURIList(cfg.DNS.ReportURI); err != nil && strings.TrimSpace(cfg.DNS.ReportURI) != "" {
+		fmt.Fprintf(&buffer, "- WARNING: dns.dmarc_report_uri is invalid: %v\n", err)
+	}
+	if err := validateReportURIList(cfg.DNS.TLSRPTURI); err != nil && strings.TrimSpace(cfg.DNS.TLSRPTURI) != "" {
+		fmt.Fprintf(&buffer, "- WARNING: dns.tlsrpt_uri is invalid: %v\n", err)
 	}
 
 	records := Build(cfg, dkim)
@@ -164,6 +192,52 @@ func quote(value string) string {
 	return builder.String()
 }
 
+// spfOwnerNames returns distinct DNS owner names that need an SPF TXT:
+// the envelope domain, every distinct allowed-sender domain, and the HELO
+// hostname when it differs from those.
+func spfOwnerNames(cfg *config.Config) []string {
+	domain := strings.TrimSuffix(strings.ToLower(cfg.Server.Domain), ".") + "."
+	hostname := strings.TrimSuffix(strings.ToLower(cfg.Server.Hostname), ".") + "."
+
+	var owners []string
+	add := func(name string) {
+		name = strings.TrimSuffix(strings.ToLower(name), ".") + "."
+		if name == "." {
+			return
+		}
+		if !slices.Contains(owners, name) {
+			owners = append(owners, name)
+		}
+	}
+
+	add(domain)
+
+	for i := range cfg.Users {
+		for _, sender := range cfg.Users[i].AllowedSenders {
+			sender = strings.TrimSpace(sender)
+			if sender == "" {
+				continue
+			}
+			if strings.HasPrefix(sender, "*@") {
+				add(sender[2:])
+				continue
+			}
+			at := strings.LastIndexByte(sender, '@')
+			if at < 0 || at == len(sender)-1 {
+				continue
+			}
+			add(sender[at+1:])
+		}
+	}
+
+	// HELO SPF only when the EHLO name is distinct from every envelope owner.
+	if !slices.Contains(owners, hostname) {
+		add(hostname)
+	}
+
+	return owners
+}
+
 func spf(cfg *config.Config) string {
 	var builder strings.Builder
 
@@ -177,33 +251,93 @@ func spf(cfg *config.Config) string {
 		fmt.Fprintf(&builder, " ip6:%s", cfg.DNS.PublicIPv6)
 	}
 
+	for _, include := range cfg.DNS.SPFIncludes {
+		include = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(include)), ".")
+		if include == "" {
+			continue
+		}
+		fmt.Fprintf(&builder, " include:%s", include)
+	}
+
 	builder.WriteString(" -all")
 
 	return builder.String()
 }
 
 func dmarc(cfg *config.Config) string {
+	policy := cfg.DNS.DMARC
+	if policy == "" {
+		policy = "none"
+	}
+
 	var builder strings.Builder
 
-	fmt.Fprintf(&builder, "v=DMARC1; p=%s; sp=%s; np=reject; adkim=r; aspf=r", cfg.DNS.DMARC, cfg.DNS.DMARC)
+	// Microwave default is p=none (monitor). Stage to quarantine/reject after verifying alignment.
+	fmt.Fprintf(&builder, "v=DMARC1; p=%s; sp=%s; adkim=r; aspf=r", policy, policy)
 
-	if cfg.DNS.ReportURI != "" {
-		fmt.Fprintf(&builder, "; rua=%s", cfg.DNS.ReportURI)
+	rua := strings.TrimSpace(cfg.DNS.ReportURI)
+	if rua != "" {
+		if err := validateReportURIList(rua); err == nil {
+			fmt.Fprintf(&builder, "; rua=%s", rua)
+		}
 	}
 
 	return builder.String()
 }
 
-func external(cfg *config.Config) []string {
-	var domains []string
+func validateReportURIList(list string) error {
+	list = strings.TrimSpace(list)
+	if list == "" {
+		return nil
+	}
+	parts := strings.Split(list, ",")
+	if len(parts) == 0 {
+		return fmt.Errorf("empty report URI list")
+	}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return fmt.Errorf("empty report URI entry")
+		}
+		// Optional size suffix: mailto:a@b!10m
+		uriPart, _, _ := strings.Cut(part, "!")
+		u, err := url.Parse(uriPart)
+		if err != nil {
+			return fmt.Errorf("invalid report URI %q: %w", part, err)
+		}
+		switch strings.ToLower(u.Scheme) {
+		case "mailto":
+			addr := u.Opaque
+			if addr == "" {
+				addr = strings.TrimPrefix(u.String(), "mailto:")
+				addr, _, _ = strings.Cut(addr, "?")
+			}
+			if _, err := mail.ParseAddress(addr); err != nil {
+				return fmt.Errorf("invalid mailto report address %q: %w", addr, err)
+			}
+		case "https":
+			if u.Host == "" {
+				return fmt.Errorf("https report URI missing host: %q", part)
+			}
+		default:
+			return fmt.Errorf("unsupported report URI scheme %q (use mailto: or https:)", u.Scheme)
+		}
+	}
+	return nil
+}
 
-	for uri := range strings.SplitSeq(cfg.DNS.ReportURI, ",") {
+func external(reportURI, orgDomain string) []string {
+	var domains []string
+	orgDomain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(orgDomain), "."))
+
+	for _, uri := range strings.Split(reportURI, ",") {
 		address, ok := strings.CutPrefix(strings.TrimSpace(uri), "mailto:")
 		if !ok {
 			continue
 		}
 
 		address, _, _ = strings.Cut(address, "!")
+		address, _, _ = strings.Cut(address, "?")
 
 		at := strings.LastIndexByte(address, '@')
 		if at < 0 {
@@ -212,7 +346,7 @@ func external(cfg *config.Config) []string {
 
 		host := strings.ToLower(strings.TrimSuffix(address[at+1:], "."))
 
-		if host == "" || host == cfg.Server.Domain || strings.HasSuffix(host, "."+cfg.Server.Domain) {
+		if host == "" || host == orgDomain || strings.HasSuffix(host, "."+orgDomain) {
 			continue
 		}
 

@@ -10,10 +10,9 @@ import (
 
 	"github.com/coalaura/outboxd/internal/config"
 	"github.com/coalaura/outboxd/internal/passwd"
-	"github.com/goccy/go-yaml"
 )
 
-func user(arguments []string) error {
+func user(configPath string, arguments []string) error {
 	if len(arguments) < 2 || arguments[0] != "add" {
 		return errors.New("usage: outboxd user add <username> [sender...]")
 	}
@@ -46,33 +45,26 @@ func user(arguments []string) error {
 		Enabled:        true,
 	}
 
-	err = entry.Validate()
+	cfg, created, err := loadConfig(configPath)
 	if err != nil {
 		return err
 	}
+	if created {
+		fmt.Fprintf(os.Stderr, "created default config at %s\n", cfg.Path())
+	}
 
-	block, err := yaml.MarshalWithOptions([]config.User{entry}, yaml.Indent(2))
-	if err != nil {
+	if err := cfg.AddUser(entry); err != nil {
 		return err
 	}
 
 	var out strings.Builder
-
-	out.Grow(len(block) + 512)
-
+	out.Grow(256)
+	fmt.Fprintf(&out, "Added user %s to %s\n", entry.Username, cfg.Path())
 	if generated {
-		fmt.Fprintf(&out, "\nGenerated password for %s\n\n  %s\n\n", entry.Username, password)
-		out.WriteString("Store it now. It is shown once and never written to disk in plaintext.\n")
-	}
-
-	out.WriteString("\nAdd the following to the config:\n\nusers:\n")
-
-	for line := range strings.SplitSeq(strings.TrimRight(string(block), "\n"), "\n") {
-		fmt.Fprintf(&out, "  %s\n", line)
+		fmt.Fprintf(&out, "\nGenerated password (store it now; shown once):\n\n  %s\n", password)
 	}
 
 	_, err = os.Stdout.WriteString(out.String())
-
 	return err
 }
 

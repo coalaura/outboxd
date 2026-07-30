@@ -57,6 +57,10 @@ func Verify(hash, password string) (bool, error) {
 		return false, ErrInvalidHash
 	}
 
+	if err := ValidatePHC(hash); err != nil {
+		return false, err
+	}
+
 	memory, iterations, threads, err := parameters(parts[3])
 	if err != nil {
 		return false, err
@@ -81,6 +85,49 @@ func Verify(hash, password string) (bool, error) {
 // timing does not disclose which usernames exist.
 func Waste() {
 	argon2.IDKey([]byte("outboxd"), make([]byte, saltLength), hashTime, hashMemory, hashThreads, keyLength)
+}
+
+const (
+	maxMemory     = 1 << 30 // 1 GiB
+	maxIterations = 100
+	maxThreads    = 16
+	maxSaltLen    = 64
+	maxKeyLen     = 64
+)
+
+// ValidatePHC checks an Argon2id PHC string without deriving a key, enforcing
+// bounds so hostile parameters cannot exhaust memory at authentication time.
+func ValidatePHC(hash string) error {
+	parts := strings.Split(hash, "$")
+	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" {
+		return ErrInvalidHash
+	}
+	var version int
+	if _, err := fmt.Sscanf(parts[2], "v=%d", &version); err != nil || version != argon2.Version {
+		return ErrInvalidHash
+	}
+	memory, iterations, threads, err := parameters(parts[3])
+	if err != nil {
+		return err
+	}
+	if memory == 0 || memory > maxMemory {
+		return fmt.Errorf("%w: memory out of range", ErrInvalidHash)
+	}
+	if iterations == 0 || iterations > maxIterations {
+		return fmt.Errorf("%w: iterations out of range", ErrInvalidHash)
+	}
+	if threads == 0 || threads > maxThreads {
+		return fmt.Errorf("%w: parallelism out of range", ErrInvalidHash)
+	}
+	salt, err := encoding.DecodeString(parts[4])
+	if err != nil || len(salt) == 0 || len(salt) > maxSaltLen {
+		return fmt.Errorf("%w: salt size", ErrInvalidHash)
+	}
+	expected, err := encoding.DecodeString(parts[5])
+	if err != nil || len(expected) == 0 || len(expected) > maxKeyLen {
+		return fmt.Errorf("%w: output size", ErrInvalidHash)
+	}
+	return nil
 }
 
 func parameters(value string) (memory uint32, iterations uint32, threads uint8, err error) {

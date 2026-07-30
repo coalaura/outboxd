@@ -3,13 +3,12 @@ package main
 import (
 	"os"
 
-	"github.com/coalaura/outboxd/internal/config"
 	"github.com/coalaura/outboxd/internal/records"
 	"github.com/coalaura/outboxd/internal/sign"
 )
 
-func dns() error {
-	cfg, _, err := config.Ensure()
+func dns(configPath string) error {
+	cfg, _, err := loadConfig(configPath)
 	if err != nil {
 		return err
 	}

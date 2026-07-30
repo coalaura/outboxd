@@ -3,13 +3,16 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 
 	"github.com/coalaura/outboxd/internal/certs"
+	"github.com/coalaura/outboxd/internal/check"
 	"github.com/coalaura/outboxd/internal/config"
 	"github.com/coalaura/outboxd/internal/deliver"
 	"github.com/coalaura/outboxd/internal/disk"
@@ -23,28 +26,48 @@ import (
 var log = plain.New(plain.WithDate(plain.RFC3339Local))
 
 func main() {
-	arguments := os.Args[1:]
+	configPath, args := parseGlobalFlags(os.Args[1:])
 
-	if len(arguments) == 0 {
-		log.MustFail(serve())
-
+	if len(args) == 0 {
+		log.MustFail(serve(configPath))
 		return
 	}
 
-	switch arguments[0] {
+	switch args[0] {
 	case "user":
-		log.MustFail(user(arguments[1:]))
+		log.MustFail(user(configPath, args[1:]))
 	case "dns":
-		log.MustFail(dns())
+		log.MustFail(dns(configPath))
+	case "check":
+		log.MustFail(runCheck(configPath))
+	case "dead":
+		log.MustFail(dead(configPath, args[1:]))
 	default:
-		log.MustFail(fmt.Errorf("unknown command %q, expected user or dns", arguments[0]))
+		log.MustFail(fmt.Errorf("unknown command %q, expected user, dns, check, dead, or serve (default)", args[0]))
 	}
 }
 
-func serve() error {
+// parseGlobalFlags extracts -config / --config before the subcommand.
+func parseGlobalFlags(args []string) (configPath string, rest []string) {
+	fs := flag.NewFlagSet("outboxd", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	fs.StringVar(&configPath, "config", "", "path to config.yml (or set OUTBOXD_CONFIG)")
+	// Stop at first non-flag so subcommands keep their own args.
+	if err := fs.Parse(args); err != nil {
+		// flag package already printed; exit like a normal CLI.
+		os.Exit(2)
+	}
+	return configPath, fs.Args()
+}
+
+func loadConfig(configPath string) (*config.Config, bool, error) {
+	return config.EnsurePath(config.ResolveConfigPath(configPath))
+}
+
+func serve(configPath string) error {
 	log.Println("Loading config...")
 
-	cfg, created, err := config.Ensure()
+	cfg, created, err := loadConfig(configPath)
 	if err != nil {
 		return err
 	}
@@ -66,6 +89,10 @@ func serve() error {
 
 	err = cfg.IsReady()
 	if err != nil {
+		return err
+	}
+
+	if err := verifyBindAddresses(cfg); err != nil {
 		return err
 	}
 
@@ -100,9 +127,18 @@ func serve() error {
 
 	log.Printf("Wrote DNS instructions to %s\n", path)
 
-	spool, err := queue.Open(cfg.ResolvePath("queue"))
+	spool, err := queue.Open(cfg.ResolvePath("queue"), queue.Limits{
+		MaxMessages: cfg.Server.MaxQueueMessages,
+		MaxBytes:    cfg.Server.MaxQueueBytes,
+		MinFreeDisk: cfg.Server.MinFreeDiskBytes,
+	})
 	if err != nil {
 		return err
+	}
+	spool.FreeDisk = disk.FreeBytes
+
+	for _, cerr := range spool.Corrupt {
+		log.Warnln("corrupt queue entry:", cerr)
 	}
 
 	log.Println("Starting server...")
@@ -117,7 +153,7 @@ func serve() error {
 		return err
 	}
 
-	deliverer := deliver.New(cfg, spool, log)
+	deliverer := deliver.NewWithSigner(cfg, spool, log, signer)
 
 	var (
 		wg   sync.WaitGroup
@@ -143,4 +179,88 @@ func serve() error {
 	log.Warnln("Stopped")
 
 	return errors.Join(errs[0], errs[1])
+}
+
+// verifyBindAddresses ensures configured outbound bind IPs exist on this host.
+func verifyBindAddresses(cfg *config.Config) error {
+	need := make([]net.IP, 0, 2)
+	if cfg.Delivery.BindIPv4 != "" {
+		ip := net.ParseIP(cfg.Delivery.BindIPv4)
+		if ip == nil || ip.To4() == nil {
+			return fmt.Errorf("invalid delivery.bind_ipv4 %q", cfg.Delivery.BindIPv4)
+		}
+		need = append(need, ip)
+	}
+	if cfg.Delivery.BindIPv6 != "" {
+		ip := net.ParseIP(cfg.Delivery.BindIPv6)
+		if ip == nil || ip.To4() != nil {
+			return fmt.Errorf("invalid delivery.bind_ipv6 %q", cfg.Delivery.BindIPv6)
+		}
+		need = append(need, ip)
+	}
+	if len(need) == 0 {
+		return nil
+	}
+
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return fmt.Errorf("list interface addresses: %w", err)
+	}
+
+	local := make([]net.IP, 0, len(addrs))
+	for _, a := range addrs {
+		var ip net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip != nil {
+			local = append(local, ip)
+		}
+	}
+
+	for _, want := range need {
+		found := false
+		for _, have := range local {
+			if have.Equal(want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("delivery bind address %s is not configured on any local interface", want)
+		}
+	}
+	return nil
+}
+
+func runCheck(configPath string) error {
+	cfg, err := config.LoadFile(config.ResolveConfigPath(configPath))
+	if err != nil {
+		return err
+	}
+
+	opts := check.Options{Config: cfg, Resolver: check.DefaultResolver{}}
+
+	if signer, _, err := sign.Ensure(cfg); err == nil {
+		opts.DKIM = &check.DKIMKey{
+			Selector:  cfg.DKIM.Selector,
+			PublicKey: signer.PublicKey,
+		}
+	}
+
+	results := check.Run(context.Background(), opts)
+	var failed bool
+	for _, r := range results {
+		fmt.Printf("%s  %-24s  %s\n", r.Level, r.Name, r.Message)
+		if r.Level == check.Fail {
+			failed = true
+		}
+	}
+	if failed {
+		return errors.New("one or more deployment checks failed")
+	}
+	return nil
 }

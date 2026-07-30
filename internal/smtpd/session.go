@@ -1,6 +1,8 @@
 package smtpd
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
@@ -64,6 +66,15 @@ func (s *session) Mail(from string, opts *smtp.MailOptions) error {
 		}
 	}
 
+	utf8Wanted := opts != nil && opts.UTF8
+	if needsUTF8(address) && !utf8Wanted {
+		return &smtp.SMTPError{
+			Code:         550,
+			EnhancedCode: smtp.EnhancedCode{5, 6, 7},
+			Message:      "SMTPUTF8 required for this sender address",
+		}
+	}
+
 	if !s.user.Allows(address) {
 		s.server.log.Printf("rejected sender %q for user %q\n", address, s.user.Username)
 
@@ -76,7 +87,7 @@ func (s *session) Mail(from string, opts *smtp.MailOptions) error {
 
 	s.sender = address
 	s.recipients = s.recipients[:0]
-	s.smtpUTF8 = opts != nil && opts.UTF8
+	s.smtpUTF8 = utf8Wanted
 
 	return nil
 }
@@ -103,6 +114,14 @@ func (s *session) Rcpt(to string, opts *smtp.RcptOptions) error {
 			Code:         501,
 			EnhancedCode: smtp.EnhancedCode{5, 1, 3},
 			Message:      "Invalid recipient address",
+		}
+	}
+
+	if needsUTF8(address) && !s.smtpUTF8 {
+		return &smtp.SMTPError{
+			Code:         553,
+			EnhancedCode: smtp.EnhancedCode{5, 6, 7},
+			Message:      "SMTPUTF8 required for this recipient address",
 		}
 	}
 
@@ -134,18 +153,40 @@ func (s *session) Data(r io.Reader) error {
 		remoteAddress = host(s.conn)
 	}
 
-	prepared, err := message.Prepare(r, message.Options{
+	maxBytes := s.server.cfg.Server.MaxMessageBytes
+	body := io.Reader(r)
+	if maxBytes > 0 {
+		body = io.LimitReader(r, maxBytes+1)
+	}
+
+	prepared, err := message.Prepare(body, message.Options{
 		Hostname: s.server.cfg.Server.Hostname,
 		Helo:     s.conn.Hostname(),
 		Remote:   remoteAddress,
 		TLS:      s.tls(),
+		MaxBytes: maxBytes,
 	})
 
 	if err != nil {
+		if errors.Is(err, message.ErrOversized) {
+			return &smtp.SMTPError{
+				Code:         552,
+				EnhancedCode: smtp.EnhancedCode{5, 3, 4},
+				Message:      "Message too large",
+			}
+		}
 		return &smtp.SMTPError{
 			Code:         550,
 			EnhancedCode: smtp.EnhancedCode{5, 6, 0},
 			Message:      responseText(err.Error()),
+		}
+	}
+
+	if prepared.NeedsUTF8 && !s.smtpUTF8 {
+		return &smtp.SMTPError{
+			Code:         550,
+			EnhancedCode: smtp.EnhancedCode{5, 6, 7},
+			Message:      "SMTPUTF8 required for this message",
 		}
 	}
 
@@ -184,6 +225,8 @@ func (s *session) Data(r io.Reader) error {
 	data = append(data, signature...)
 	data = append(data, prepared.Data...)
 
+	useUTF8 := s.smtpUTF8 || prepared.NeedsUTF8
+
 	envelope := &queue.Envelope{
 		ID:          identifier(),
 		Username:    s.user.Username,
@@ -191,13 +234,14 @@ func (s *session) Data(r io.Reader) error {
 		Recipients:  make([]queue.Recipient, 0, len(s.recipients)),
 		Created:     time.Now(),
 		NextAttempt: time.Now(),
-		SMTPUTF8:    s.smtpUTF8,
+		SMTPUTF8:    useUTF8,
+		EightBit:    prepared.EightBit,
 	}
 
 	for _, recipient := range s.recipients {
 		envelope.Recipients = append(envelope.Recipients, queue.Recipient{
 			Address: recipient,
-			Domain:  recipient[strings.LastIndexByte(recipient, '@')+1:],
+			Domain:  strings.ToLower(recipient[strings.LastIndexByte(recipient, '@')+1:]),
 			Status:  queue.StatusPending,
 		})
 	}
@@ -205,6 +249,9 @@ func (s *session) Data(r io.Reader) error {
 	err = s.server.queue.Add(envelope, data)
 	if err != nil {
 		s.server.log.Printf("failed to queue message: %v\n", err)
+		if errors.Is(err, queue.ErrQueueFull) || errors.Is(err, queue.ErrInsufficientDisk) {
+			return errQueueFull
+		}
 
 		return errTemporaryFailure
 	}
@@ -229,19 +276,25 @@ func (s *session) Logout() error {
 func (s *session) authenticate(username, password string) error {
 	ip := host(s.conn)
 
-	if !s.server.limiter.allow(ip) {
-		s.server.log.Printf("throttled authentication from %s\n", ip)
+	if !s.server.authLimit.reserve(ip, username) {
+		s.server.log.Printf("throttled authentication from %s user %q\n", ip, username)
 
 		return smtp.ErrAuthFailed
 	}
 
-	s.server.hashing <- struct{}{}
-	defer func() { <-s.server.hashing }()
+	// Bound waiters: non-blocking queue, corners out with 451 when saturated.
+	if err := s.server.acquireHashSlot(context.Background()); err != nil {
+		// Release reserve without attributing a password failure.
+		s.server.authLimit.succeeded(ip, username)
+		s.server.log.Printf("authentication busy from %s\n", ip)
+		return errAuthBusy
+	}
+	defer s.server.releaseHashSlot()
 
 	user, ok := s.server.cfg.User(username)
 	if !ok || !user.Enabled {
 		passwd.Waste()
-		s.server.limiter.failed(ip)
+		s.server.authLimit.failed(ip, username)
 
 		return smtp.ErrAuthFailed
 	}
@@ -252,12 +305,12 @@ func (s *session) authenticate(username, password string) error {
 	}
 
 	if !valid {
-		s.server.limiter.failed(ip)
+		s.server.authLimit.failed(ip, username)
 
 		return smtp.ErrAuthFailed
 	}
 
-	s.server.limiter.succeeded(ip)
+	s.server.authLimit.succeeded(ip, username)
 	s.user = user
 
 	return nil

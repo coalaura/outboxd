@@ -9,56 +9,83 @@ type submissionAllowance struct {
 	messages   float64
 	recipients float64
 	updated    time.Time
+	seen       time.Time
 }
 
 type submissionLimiter struct {
-	maxMessages   int
-	maxRecipients int
+	maxMessages   float64
+	maxRecipients float64
+	msgBurst      float64
+	rcptBurst     float64
 
 	mu      sync.Mutex
 	entries map[string]*submissionAllowance
+	pruned  time.Time
 }
 
-func newSubmissionLimiter(maxMessages, maxRecipients int) *submissionLimiter {
+const maxRateEntries = 10000
+
+func newSubmissionLimiter(maxMessages, maxRecipients, msgBurst, rcptBurst int) *submissionLimiter {
+	if msgBurst <= 0 {
+		msgBurst = 1
+	}
+	if rcptBurst <= 0 {
+		rcptBurst = 1
+	}
+	if msgBurst > maxMessages && maxMessages > 0 {
+		msgBurst = maxMessages
+	}
+	if rcptBurst > maxRecipients && maxRecipients > 0 {
+		rcptBurst = maxRecipients
+	}
 	return &submissionLimiter{
-		maxMessages:   maxMessages,
-		maxRecipients: maxRecipients,
+		maxMessages:   float64(maxMessages),
+		maxRecipients: float64(maxRecipients),
+		msgBurst:      float64(msgBurst),
+		rcptBurst:     float64(rcptBurst),
 		entries:       make(map[string]*submissionAllowance),
+		pruned:        time.Now(),
 	}
 }
 
 func (l *submissionLimiter) take(username string, recipients int) bool {
 	now := time.Now()
-
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	l.prune(now)
+
 	allowance, ok := l.entries[username]
 	if !ok {
+		// Start with burst only, not a full hourly allowance.
 		allowance = &submissionAllowance{
-			messages:   float64(l.maxMessages),
-			recipients: float64(l.maxRecipients),
+			messages:   l.msgBurst,
+			recipients: l.rcptBurst,
 			updated:    now,
+			seen:       now,
 		}
-
+		if len(l.entries) >= maxRateEntries {
+			l.forcePrune(now)
+			if len(l.entries) >= maxRateEntries {
+				return false
+			}
+		}
 		l.entries[username] = allowance
 	}
 
 	l.refill(allowance, now)
+	allowance.seen = now
 
 	if allowance.messages < 1 || allowance.recipients < float64(recipients) {
 		return false
 	}
-
 	allowance.messages--
 	allowance.recipients -= float64(recipients)
-
 	return true
 }
 
 func (l *submissionLimiter) refund(username string, recipients int) {
 	now := time.Now()
-
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -66,31 +93,36 @@ func (l *submissionLimiter) refund(username string, recipients int) {
 	if !ok {
 		return
 	}
-
 	l.refill(allowance, now)
-
-	allowance.messages = min(allowance.messages+1, float64(l.maxMessages))
-	allowance.recipients = min(allowance.recipients+float64(recipients), float64(l.maxRecipients))
+	allowance.messages = min(allowance.messages+1, l.msgBurst)
+	allowance.recipients = min(allowance.recipients+float64(recipients), l.rcptBurst)
+	allowance.seen = now
 }
 
-func (l *submissionLimiter) refill(allowance *submissionAllowance, now time.Time) {
-	elapsed := now.Sub(allowance.updated)
-
-	allowance.updated = now
-
+func (l *submissionLimiter) refill(a *submissionAllowance, now time.Time) {
+	elapsed := now.Sub(a.updated)
+	a.updated = now
 	if elapsed <= 0 {
 		return
 	}
-
 	hours := elapsed.Hours()
+	// Cap accumulated tokens at the burst size, not the full hourly rate.
+	a.messages = min(a.messages+hours*l.maxMessages, l.msgBurst)
+	a.recipients = min(a.recipients+hours*l.maxRecipients, l.rcptBurst)
+}
 
-	allowance.messages = min(
-		allowance.messages+hours*float64(l.maxMessages),
-		float64(l.maxMessages),
-	)
+func (l *submissionLimiter) prune(now time.Time) {
+	if now.Sub(l.pruned) < entryExpiry {
+		return
+	}
+	l.forcePrune(now)
+}
 
-	allowance.recipients = min(
-		allowance.recipients+hours*float64(l.maxRecipients),
-		float64(l.maxRecipients),
-	)
+func (l *submissionLimiter) forcePrune(now time.Time) {
+	l.pruned = now
+	for k, a := range l.entries {
+		if now.Sub(a.seen) > entryExpiry {
+			delete(l.entries, k)
+		}
+	}
 }

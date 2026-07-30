@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/mail"
 	"os"
@@ -12,14 +13,19 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/coalaura/outboxd/internal/disk"
+	"github.com/coalaura/outboxd/internal/passwd"
 	"github.com/goccy/go-yaml"
 )
 
 type Config struct {
 	dataMu *sync.RWMutex
 	fileMu *sync.Mutex
+
+	path    string
+	baseDir string
 
 	userLookup map[string]*User
 
@@ -38,10 +44,23 @@ type Server struct {
 	MaxRecipients             int    `yaml:"max_recipients"`
 	MaxMessagesPerHour        int    `yaml:"max_messages_per_hour"`
 	MaxRecipientsPerHour      int    `yaml:"max_recipients_per_hour"`
+	MessageBurst              int    `yaml:"message_burst"`
+	RecipientBurst            int    `yaml:"recipient_burst"`
 	IncludeClientIPInReceived bool   `yaml:"include_client_ip_in_received"`
 	ReadTimeout               string `yaml:"read_timeout"`
 	WriteTimeout              string `yaml:"write_timeout"`
 	DataDirectory             string `yaml:"data_directory"`
+	SubmissionAddr            string `yaml:"submission_addr"`
+	ImplicitTLSAddr           string `yaml:"implicit_tls_addr"`
+	DisableSubmission         bool   `yaml:"disable_submission,omitempty"`
+	DisableImplicitTLS        bool   `yaml:"disable_implicit_tls,omitempty"`
+	MaxConnections            int    `yaml:"max_connections"`
+	MaxConnectionsPerIP       int    `yaml:"max_connections_per_ip"`
+	AuthWorkers               int    `yaml:"auth_workers"`
+	AuthQueue                 int    `yaml:"auth_queue"`
+	MaxQueueMessages          int    `yaml:"max_queue_messages"`
+	MaxQueueBytes             int64  `yaml:"max_queue_bytes"`
+	MinFreeDiskBytes          int64  `yaml:"min_free_disk_bytes"`
 }
 
 type TLS struct {
@@ -58,25 +77,38 @@ type DKIM struct {
 }
 
 type Delivery struct {
-	TLSMode               string `yaml:"tls_mode"`
-	MaxAttempts           int    `yaml:"max_attempts"`
-	MaximumLifetime       string `yaml:"maximum_lifetime"`
-	InitialRetryDelay     string `yaml:"initial_retry_delay"`
-	MaximumRetryDelay     string `yaml:"maximum_retry_delay"`
-	DomainConcurrency     int    `yaml:"domain_concurrency"`
-	GlobalConcurrency     int    `yaml:"global_concurrency"`
-	ConnectionTimeout     string `yaml:"connection_timeout"`
-	CommandTimeout        string `yaml:"command_timeout"`
-	SubmissionTimeout     string `yaml:"submission_timeout"`
-	RequireValidMXTLSCert bool   `yaml:"require_valid_mx_tls_certificate"`
+	// TLSMode: opportunistic | required | opportunistic_insecure
+	TLSMode        string `yaml:"tls_mode"`
+	AllowPlaintext *bool  `yaml:"allow_plaintext,omitempty"`
+
+	MaxAttempts       int    `yaml:"max_attempts"`
+	MaximumLifetime   string `yaml:"maximum_lifetime"`
+	InitialRetryDelay string `yaml:"initial_retry_delay"`
+	MaximumRetryDelay string `yaml:"maximum_retry_delay"`
+	DomainConcurrency int    `yaml:"domain_concurrency"`
+	GlobalConcurrency int    `yaml:"global_concurrency"`
+	ConnectionTimeout string `yaml:"connection_timeout"`
+	CommandTimeout    string `yaml:"command_timeout"`
+	SubmissionTimeout string `yaml:"submission_timeout"`
+
+	RequireValidMXTLSCert bool `yaml:"require_valid_mx_tls_certificate"`
+
+	// BindIPv4/BindIPv6 are local outbound bind addresses (not DNS public IPs).
+	BindIPv4 string `yaml:"bind_ipv4"`
+	BindIPv6 string `yaml:"bind_ipv6"`
+
+	AllowPrivateDestinations bool     `yaml:"allow_private_destinations"`
+	DestinationAllowlist     []string `yaml:"destination_allowlist"`
 }
 
 type DNS struct {
-	PublicIPv4 string `yaml:"public_ipv4"`
-	PublicIPv6 string `yaml:"public_ipv6"`
-	DMARC      string `yaml:"dmarc_policy"`
-	ReportURI  string `yaml:"dmarc_report_uri"`
-	OutputFile string `yaml:"output_file"`
+	PublicIPv4  string   `yaml:"public_ipv4"`
+	PublicIPv6  string   `yaml:"public_ipv6"`
+	DMARC       string   `yaml:"dmarc_policy"`
+	ReportURI   string   `yaml:"dmarc_report_uri"`
+	TLSRPTURI   string   `yaml:"tlsrpt_uri"`
+	SPFIncludes []string `yaml:"spf_includes"`
+	OutputFile  string   `yaml:"output_file"`
 }
 
 type User struct {
@@ -91,10 +123,15 @@ type durationEntry struct {
 	value string
 }
 
-const configPath = "config.yml"
+const (
+	defaultConfigName = "config.yml"
+	// EnvConfigPath overrides the config file path.
+	EnvConfigPath = "OUTBOXD_CONFIG"
+)
 
-// Default returns the default config
+// Default returns the default config without an example password hash.
 func Default() *Config {
+	allowPlain := true
 	return &Config{
 		Server: Server{
 			Hostname:             "mail.example.invalid",
@@ -106,6 +143,15 @@ func Default() *Config {
 			ReadTimeout:          "5m",
 			WriteTimeout:         "5m",
 			DataDirectory:        "./data",
+			SubmissionAddr:       ":587",
+			ImplicitTLSAddr:      ":465",
+			MaxConnections:       256,
+			MaxConnectionsPerIP:  16,
+			AuthWorkers:          4,
+			AuthQueue:            64,
+			MaxQueueMessages:     10000,
+			MaxQueueBytes:        10 << 30,
+			MinFreeDiskBytes:     1 << 30,
 		},
 		TLS: TLS{
 			Mode:            "self_signed",
@@ -131,6 +177,7 @@ func Default() *Config {
 		},
 		Delivery: Delivery{
 			TLSMode:               "opportunistic",
+			AllowPlaintext:        &allowPlain,
 			MaxAttempts:           15,
 			MaximumLifetime:       "120h",
 			InitialRetryDelay:     "5m",
@@ -143,87 +190,195 @@ func Default() *Config {
 			RequireValidMXTLSCert: true,
 		},
 		DNS: DNS{
-			DMARC:      "quarantine",
+			DMARC:      "none",
 			OutputFile: "dns-records.txt",
 		},
-		Users: []User{
-			{
-				Username:     "example",
-				PasswordHash: "$argon2id$v=19$m=19456,t=2,p=1$dmgLPdAEgsPfBznUbnX0jA$3jpi3X+lrcemQBB4cL5OwOcyaB3hFPBvwoNYpxbTxjs",
-				AllowedSenders: []string{
-					"example@example.invalid",
-				},
-				Enabled: false,
-			},
-		},
+		Users: nil,
 	}
 }
 
-// Load loads the config
-func Load() (*Config, error) {
-	cfg := Default()
+// ResolveConfigPath picks the config path from flag/env/default.
+func ResolveConfigPath(flagPath string) string {
+	if flagPath != "" {
+		return flagPath
+	}
+	if v := os.Getenv(EnvConfigPath); v != "" {
+		return v
+	}
+	return defaultConfigName
+}
 
+// LoadFile loads configuration from path.
+func LoadFile(path string) (*Config, error) {
+	cfg := Default()
 	cfg.initializeRuntime()
 
-	file, err := os.OpenFile(configPath, os.O_RDONLY, 0)
+	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
 	}
+	cfg.path = abs
+	cfg.baseDir = filepath.Dir(abs)
 
-	defer file.Close()
+	raw, err := os.ReadFile(abs)
+	if err != nil {
+		return nil, err
+	}
+	if err := rejectMultiDoc(raw); err != nil {
+		return nil, err
+	}
 
 	cfg.Users = nil
-
-	err = yaml.NewDecoder(file, yaml.DisallowUnknownField()).Decode(cfg)
-	if err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(raw), yaml.DisallowUnknownField())
+	if err := dec.Decode(cfg); err != nil {
 		return nil, err
 	}
-
-	err = cfg.Init()
-	if err != nil {
-		return nil, err
+	var extra any
+	if err := dec.Decode(&extra); err == nil {
+		return nil, errors.New("config contains trailing YAML content")
+	} else if err != io.EOF && !isYAMLEOF(err) {
+		return nil, fmt.Errorf("trailing YAML content: %w", err)
 	}
 
+	cfg.applyDefaults()
+	if err := cfg.Init(); err != nil {
+		return nil, err
+	}
 	return cfg, nil
+}
+
+func isYAMLEOF(err error) bool {
+	return err != nil && (errors.Is(err, io.EOF) || strings.Contains(err.Error(), "EOF"))
+}
+
+func rejectMultiDoc(raw []byte) error {
+	count := 0
+	for _, line := range bytes.Split(raw, []byte("\n")) {
+		if bytes.Equal(bytes.TrimSpace(line), []byte("---")) {
+			count++
+			if count > 1 {
+				return errors.New("config contains multiple YAML documents")
+			}
+		}
+	}
+	return nil
+}
+
+// Load loads from the default path resolution.
+func Load() (*Config, error) {
+	return LoadFile(ResolveConfigPath(""))
 }
 
 // Ensure loads the config or atomically creates it with secure defaults.
 func Ensure() (*Config, bool, error) {
-	cfg, err := Load()
+	return EnsurePath(ResolveConfigPath(""))
+}
+
+// EnsurePath loads or creates config at path.
+func EnsurePath(path string) (*Config, bool, error) {
+	cfg, err := LoadFile(path)
 	if err == nil {
 		return cfg, false, nil
 	}
-
 	if !errors.Is(err, os.ErrNotExist) {
 		return nil, false, err
 	}
 
 	cfg = Default()
-
 	cfg.initializeRuntime()
-
-	err = cfg.Init()
+	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, false, err
 	}
-
-	err = cfg.storeExclusive()
-	if err != nil {
+	cfg.path = abs
+	cfg.baseDir = filepath.Dir(abs)
+	cfg.applyDefaults()
+	if err := cfg.Init(); err != nil {
+		return nil, false, err
+	}
+	if err := cfg.storeExclusive(); err != nil {
 		if errors.Is(err, os.ErrExist) {
-			cfg, err = Load()
-
+			cfg, err = LoadFile(path)
 			return cfg, false, err
 		}
-
 		return nil, false, err
 	}
-
 	return cfg, true, nil
+}
+
+func (cfg *Config) applyDefaults() {
+	if cfg.Server.DisableSubmission {
+		cfg.Server.SubmissionAddr = ""
+	} else if cfg.Server.SubmissionAddr == "" {
+		cfg.Server.SubmissionAddr = ":587"
+	}
+	if cfg.Server.DisableImplicitTLS {
+		cfg.Server.ImplicitTLSAddr = ""
+	} else if cfg.Server.ImplicitTLSAddr == "" {
+		cfg.Server.ImplicitTLSAddr = ":465"
+	}
+	if cfg.Server.MaxConnections <= 0 {
+		cfg.Server.MaxConnections = 256
+	}
+	if cfg.Server.MaxConnectionsPerIP <= 0 {
+		cfg.Server.MaxConnectionsPerIP = 16
+	}
+	if cfg.Server.AuthWorkers <= 0 {
+		cfg.Server.AuthWorkers = 4
+	}
+	if cfg.Server.AuthQueue <= 0 {
+		cfg.Server.AuthQueue = 64
+	}
+	if cfg.Delivery.TLSMode == "" {
+		cfg.Delivery.TLSMode = "opportunistic"
+	}
+	if cfg.DNS.DMARC == "" {
+		cfg.DNS.DMARC = "none"
+	}
+	if cfg.DNS.OutputFile == "" {
+		cfg.DNS.OutputFile = "dns-records.txt"
+	}
+}
+
+// SubmissionListenAddr returns the STARTTLS listen address or "" if disabled.
+func (s Server) SubmissionListenAddr() string {
+	if s.DisableSubmission {
+		return ""
+	}
+	return s.SubmissionAddr
+}
+
+// ImplicitTLSListenAddr returns the implicit TLS listen address or "" if disabled.
+func (s Server) ImplicitTLSListenAddr() string {
+	if s.DisableImplicitTLS {
+		return ""
+	}
+	return s.ImplicitTLSAddr
+}
+
+// PlaintextAllowed reports whether opportunistic plaintext delivery is allowed.
+func (d Delivery) PlaintextAllowed() bool {
+	if d.TLSMode == "required" {
+		return false
+	}
+	if d.AllowPlaintext != nil {
+		return *d.AllowPlaintext
+	}
+	return d.TLSMode == "opportunistic" || d.TLSMode == "opportunistic_insecure"
+}
+
+// InsecureTLSAllowed reports whether STARTTLS without certificate verification is allowed.
+func (d Delivery) InsecureTLSAllowed() bool {
+	if d.TLSMode == "opportunistic_insecure" {
+		return true
+	}
+	return d.TLSMode == "opportunistic" && !d.RequireValidMXTLSCert
 }
 
 // Init validates the configuration and builds its runtime indexes.
 func (cfg *Config) Init() error {
 	cfg.initializeRuntime()
+	cfg.canonicalize()
 
 	err := cfg.Validate()
 	if err != nil {
@@ -244,6 +399,65 @@ func (cfg *Config) Init() error {
 	}
 
 	return nil
+}
+
+func (cfg *Config) canonicalize() {
+	cfg.Server.Hostname = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(cfg.Server.Hostname), "."))
+	cfg.Server.Domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(cfg.Server.Domain), "."))
+	cfg.DKIM.Selector = strings.ToLower(strings.TrimSpace(cfg.DKIM.Selector))
+	for i, inc := range cfg.DNS.SPFIncludes {
+		cfg.DNS.SPFIncludes[i] = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(inc), "."))
+	}
+}
+
+// Path returns the absolute config file path.
+func (cfg *Config) Path() string { return cfg.path }
+
+// BaseDir returns the directory containing the config file.
+func (cfg *Config) BaseDir() string { return cfg.baseDir }
+
+// AddUser appends a user and atomically rewrites the config after Validate.
+func (cfg *Config) AddUser(user User) error {
+	if err := user.Validate(); err != nil {
+		return err
+	}
+	if err := passwd.ValidatePHC(user.PasswordHash); err != nil {
+		return err
+	}
+
+	cfg.dataMu.Lock()
+	for i := range cfg.Users {
+		if canonicalUsername(cfg.Users[i].Username) == canonicalUsername(user.Username) {
+			cfg.dataMu.Unlock()
+			return fmt.Errorf("duplicate username %q", user.Username)
+		}
+	}
+	cfg.Users = append(cfg.Users, user)
+	cfg.dataMu.Unlock()
+
+	if err := cfg.Init(); err != nil {
+		cfg.dataMu.Lock()
+		cfg.Users = cfg.Users[:len(cfg.Users)-1]
+		cfg.dataMu.Unlock()
+		_ = cfg.Init()
+		return err
+	}
+	return cfg.Save()
+}
+
+// Save atomically replaces the config file.
+func (cfg *Config) Save() error {
+	body, err := cfg.marshal()
+	if err != nil {
+		return err
+	}
+	path := cfg.path
+	if path == "" {
+		path = defaultConfigName
+	}
+	cfg.fileMu.Lock()
+	defer cfg.fileMu.Unlock()
+	return disk.Write(path, body, 0600)
 }
 
 // User returns a snapshot of the configured user.
@@ -295,6 +509,15 @@ func (cfg *Config) Validate() error {
 	if cfg.Server.DataDirectory == "" {
 		return errors.New("server.data_directory must not be empty")
 	}
+	if cfg.Server.SubmissionListenAddr() == "" && cfg.Server.ImplicitTLSListenAddr() == "" {
+		return errors.New("at least one submission listener must be enabled")
+	}
+	if cfg.Server.MaxConnections <= 0 || cfg.Server.MaxConnectionsPerIP <= 0 {
+		return errors.New("connection limits must be positive")
+	}
+	if cfg.Server.AuthWorkers <= 0 || cfg.Server.AuthQueue <= 0 {
+		return errors.New("auth worker/queue limits must be positive")
+	}
 
 	durations := []durationEntry{
 		{"server.read_timeout", cfg.Server.ReadTimeout},
@@ -312,6 +535,19 @@ func (cfg *Config) Validate() error {
 		if err != nil {
 			return err
 		}
+	}
+
+	initial := Duration(cfg.Delivery.InitialRetryDelay)
+	maximum := Duration(cfg.Delivery.MaximumRetryDelay)
+	lifetime := Duration(cfg.Delivery.MaximumLifetime)
+	if initial > maximum {
+		return errors.New("delivery.initial_retry_delay must be <= maximum_retry_delay")
+	}
+	if maximum > lifetime {
+		return errors.New("delivery.maximum_retry_delay must be <= maximum_lifetime")
+	}
+	if initial > 24*365*time.Hour {
+		return errors.New("delivery.initial_retry_delay is unreasonably large")
 	}
 
 	switch cfg.TLS.Mode {
@@ -339,18 +575,30 @@ func (cfg *Config) Validate() error {
 		return errors.New("dkim.private_key_file must not be empty")
 	}
 
-	hasFromHeader := slices.ContainsFunc(cfg.DKIM.Headers, func(header string) bool {
-		return strings.EqualFold(header, "From")
-	})
+	hasFromHeader := false
+	seenDKIMHeaders := make(map[string]struct{}, len(cfg.DKIM.Headers))
+	for _, header := range cfg.DKIM.Headers {
+		if err := validateHeaderName(header); err != nil {
+			return fmt.Errorf("dkim.headers: %w", err)
+		}
+		canon := strings.ToLower(header)
+		if _, ok := seenDKIMHeaders[canon]; ok {
+			return fmt.Errorf("dkim.headers: duplicate %q", header)
+		}
+		seenDKIMHeaders[canon] = struct{}{}
+		if canon == "from" {
+			hasFromHeader = true
+		}
+	}
 
 	if !hasFromHeader {
 		return errors.New("dkim.headers must contain From")
 	}
 
 	switch cfg.Delivery.TLSMode {
-	case "opportunistic", "required":
+	case "opportunistic", "required", "opportunistic_insecure":
 	default:
-		return fmt.Errorf("delivery.tls_mode must be opportunistic or required, got %q", cfg.Delivery.TLSMode)
+		return fmt.Errorf("delivery.tls_mode must be opportunistic, required, or opportunistic_insecure, got %q", cfg.Delivery.TLSMode)
 	}
 
 	if cfg.Delivery.MaxAttempts <= 0 {
@@ -361,10 +609,31 @@ func (cfg *Config) Validate() error {
 		return errors.New("delivery concurrency limits must be positive")
 	}
 
+	if cfg.Delivery.BindIPv4 != "" {
+		if ip := net.ParseIP(cfg.Delivery.BindIPv4); ip == nil || ip.To4() == nil {
+			return fmt.Errorf("invalid delivery.bind_ipv4 %q", cfg.Delivery.BindIPv4)
+		}
+	}
+	if cfg.Delivery.BindIPv6 != "" {
+		ip := net.ParseIP(cfg.Delivery.BindIPv6)
+		if ip == nil || ip.To4() != nil {
+			return fmt.Errorf("invalid delivery.bind_ipv6 %q", cfg.Delivery.BindIPv6)
+		}
+	}
+	for i, a := range cfg.Delivery.DestinationAllowlist {
+		if net.ParseIP(a) == nil {
+			return fmt.Errorf("delivery.destination_allowlist[%d] invalid", i)
+		}
+	}
+
 	switch cfg.DNS.DMARC {
 	case "none", "quarantine", "reject":
 	default:
 		return fmt.Errorf("invalid DMARC policy %q", cfg.DNS.DMARC)
+	}
+
+	if cfg.DNS.OutputFile == "" {
+		return errors.New("dns.output_file must not be empty")
 	}
 
 	if cfg.DNS.PublicIPv4 != "" && net.ParseIP(cfg.DNS.PublicIPv4).To4() == nil {
@@ -378,6 +647,22 @@ func (cfg *Config) Validate() error {
 		}
 	}
 
+	if cfg.DNS.ReportURI != "" {
+		if err := validateReportURIList(cfg.DNS.ReportURI); err != nil {
+			return fmt.Errorf("dns.dmarc_report_uri: %w", err)
+		}
+	}
+	if cfg.DNS.TLSRPTURI != "" {
+		if err := validateReportURIList(cfg.DNS.TLSRPTURI); err != nil {
+			return fmt.Errorf("dns.tlsrpt_uri: %w", err)
+		}
+	}
+	for i, inc := range cfg.DNS.SPFIncludes {
+		if err := validateDomain(fmt.Sprintf("dns.spf_includes[%d]", i), inc); err != nil {
+			return err
+		}
+	}
+
 	usernames := make(map[string]struct{}, len(cfg.Users))
 
 	for i := range cfg.Users {
@@ -385,6 +670,9 @@ func (cfg *Config) Validate() error {
 
 		err = user.Validate()
 		if err != nil {
+			return fmt.Errorf("users[%d]: %w", i, err)
+		}
+		if err := passwd.ValidatePHC(user.PasswordHash); err != nil {
 			return fmt.Errorf("users[%d]: %w", i, err)
 		}
 
@@ -434,7 +722,10 @@ func (u *User) Validate() error {
 		sender = strings.TrimSpace(sender)
 
 		address, err := mail.ParseAddress(sender)
-		if err != nil || address.Address != sender {
+		if err != nil || address.Name != "" {
+			return fmt.Errorf("user %q has invalid sender %q", u.Username, sender)
+		}
+		if address.Address != sender && sender != "<"+address.Address+">" {
 			return fmt.Errorf("user %q has invalid sender %q", u.Username, sender)
 		}
 
@@ -444,7 +735,8 @@ func (u *User) Validate() error {
 		}
 
 		senders[canonicalSender] = struct{}{}
-		u.AllowedSenders[i] = canonicalSender
+		// Preserve local-part case for policy storage / comparisons via Allows.
+		u.AllowedSenders[i] = address.Address
 	}
 
 	return nil
@@ -470,6 +762,16 @@ func (cfg *Config) IsReady() error {
 		problems = append(problems, errors.New("configure at least one SMTP user"))
 	}
 
+	enabled := 0
+	for i := range cfg.Users {
+		if cfg.Users[i].Enabled {
+			enabled++
+		}
+	}
+	if enabled == 0 {
+		problems = append(problems, errors.New("configure at least one enabled SMTP user"))
+	}
+
 	return errors.Join(problems...)
 }
 
@@ -478,11 +780,11 @@ func (cfg *Config) Warnings() []string {
 	var warnings []string
 
 	if cfg.TLS.Mode == "self_signed" {
-		warnings = append(warnings, "tls.mode is self_signed; submission clients must trust the generated certificate")
+		warnings = append(warnings, "tls.mode is self_signed (development only); ordinary SMTP clients will not trust the certificate — use tls.mode=files with a publicly trusted certificate in production")
 	}
 
 	if cfg.DNS.DMARC == "none" {
-		warnings = append(warnings, `dmarc_policy is "none"; move to quarantine or reject once alignment is verified`)
+		warnings = append(warnings, `dmarc_policy is "none"; stage to quarantine then reject after verifying SPF/DKIM alignment via aggregate reports`)
 	}
 
 	if cfg.DNS.ReportURI == "" {
@@ -490,19 +792,49 @@ func (cfg *Config) Warnings() []string {
 	}
 
 	if cfg.Delivery.TLSMode == "opportunistic" {
-		warnings = append(warnings, "delivery.tls_mode is opportunistic; destinations without STARTTLS receive plaintext")
+		warnings = append(warnings, "delivery.tls_mode is opportunistic; destinations without STARTTLS may receive plaintext when allow_plaintext is true")
+	}
+
+	if cfg.Delivery.TLSMode == "opportunistic_insecure" {
+		warnings = append(warnings, "delivery.tls_mode is opportunistic_insecure; certificate verification is disabled for STARTTLS — development/legacy only")
+	}
+
+	if cfg.Server.Domain == cfg.Server.Hostname {
+		warnings = append(warnings, "server.hostname equals server.domain; prefer a dedicated sending subdomain when the parent domain has other senders")
 	}
 
 	return warnings
 }
 
 // ResolvePath resolves a path relative to the configured data directory.
+// Relative data_directory values are resolved against the config file directory.
 func (cfg Config) ResolvePath(path string) string {
 	if filepath.IsAbs(path) {
 		return path
 	}
 
-	return filepath.Join(cfg.Server.DataDirectory, path)
+	data := cfg.Server.DataDirectory
+	if !filepath.IsAbs(data) && cfg.baseDir != "" {
+		data = filepath.Join(cfg.baseDir, data)
+	}
+
+	return filepath.Join(data, path)
+}
+
+// ResolvedDataDir returns the absolute data directory.
+func (cfg Config) ResolvedDataDir() string {
+	data := cfg.Server.DataDirectory
+	if filepath.IsAbs(data) {
+		return data
+	}
+	if cfg.baseDir != "" {
+		return filepath.Join(cfg.baseDir, data)
+	}
+	abs, err := filepath.Abs(data)
+	if err != nil {
+		return data
+	}
+	return abs
 }
 
 func (cfg *Config) initializeRuntime() {
@@ -521,30 +853,46 @@ func (cfg *Config) storeExclusive() error {
 		return err
 	}
 
+	path := cfg.path
+	if path == "" {
+		path = defaultConfigName
+	}
+
 	cfg.fileMu.Lock()
 	defer cfg.fileMu.Unlock()
 
-	return disk.WriteExclusive(configPath, body, 0600)
+	return disk.WriteExclusive(path, body, 0600)
 }
 
 func (cfg *Config) marshal() ([]byte, error) {
 	var buffer bytes.Buffer
 
 	comments := yaml.CommentMap{
-		"$.server":                               {yaml.HeadComment(" SMTP submission server")},
-		"$.server.hostname":                      {yaml.HeadComment(" public SMTP hostname used for EHLO, TLS, MX, and reverse DNS")},
-		"$.server.domain":                        {yaml.HeadComment(" sending domain used for DKIM, SPF, and DMARC")},
+		"$.server":                               {yaml.HeadComment(" SMTP submission server (send-only; no inbound MX)")},
+		"$.server.hostname":                      {yaml.HeadComment(" public SMTP hostname used for EHLO, TLS, and reverse DNS")},
+		"$.server.domain":                        {yaml.HeadComment(" sending domain used for DKIM, SPF, and DMARC; prefer a dedicated subdomain")},
 		"$.server.max_message_bytes":             {yaml.HeadComment(" maximum accepted message size in bytes")},
 		"$.server.max_recipients":                {yaml.HeadComment(" maximum recipients accepted for one message")},
-		"$.server.max_messages_per_hour":         {yaml.HeadComment(" per-user token-bucket limit for accepted messages")},
-		"$.server.max_recipients_per_hour":       {yaml.HeadComment(" per-user token-bucket limit for accepted recipients")},
+		"$.server.max_messages_per_hour":         {yaml.HeadComment(" per-user hourly message rate")},
+		"$.server.max_recipients_per_hour":       {yaml.HeadComment(" per-user hourly recipient rate")},
+		"$.server.message_burst":                 {yaml.HeadComment(" token-bucket burst for messages (default hourly/60)")},
+		"$.server.recipient_burst":               {yaml.HeadComment(" token-bucket burst for recipients (default hourly/60)")},
+		"$.server.submission_addr":               {yaml.HeadComment(` STARTTLS submission listen address; default ":587"; empty disables`)},
+		"$.server.implicit_tls_addr":             {yaml.HeadComment(` implicit TLS submission listen address; default ":465"; empty disables`)},
+		"$.server.max_connections":               {yaml.HeadComment(" global concurrent submission connections")},
+		"$.server.max_connections_per_ip":        {yaml.HeadComment(" per-IP concurrent submission connections")},
+		"$.server.auth_workers":                  {yaml.HeadComment(" concurrent Argon2id authentications")},
+		"$.server.auth_queue":                    {yaml.HeadComment(" max waiters for an auth worker slot")},
+		"$.server.max_queue_messages":            {yaml.HeadComment(" maximum ready queue message count (0 = unlimited)")},
+		"$.server.max_queue_bytes":               {yaml.HeadComment(" maximum ready queue total bytes (0 = unlimited)")},
+		"$.server.min_free_disk_bytes":           {yaml.HeadComment(" refuse submissions when free disk is below this threshold")},
 		"$.server.include_client_ip_in_received": {yaml.HeadComment(" include the submitting client's IP address in Received headers")},
 		"$.server.read_timeout":                  {yaml.HeadComment(" maximum time spent waiting for an SMTP command")},
 		"$.server.write_timeout":                 {yaml.HeadComment(" maximum time spent writing an SMTP response")},
-		"$.server.data_directory":                {yaml.HeadComment(" generated keys, certificates, DNS instructions and queue data")},
+		"$.server.data_directory":                {yaml.HeadComment(" generated keys, certificates, DNS instructions and queue data; relative to the config file directory")},
 
 		"$.tls":                  {yaml.HeadComment("\n# TLS used by the submission listeners")},
-		"$.tls.mode":             {yaml.HeadComment(` "self_signed" generates a development certificate; use "files" in production`)},
+		"$.tls.mode":             {yaml.HeadComment(` "self_signed" is development-only; use "files" with a publicly trusted certificate in production`)},
 		"$.tls.certificate_file": {yaml.HeadComment(" certificate chain; relative paths are resolved below data_directory")},
 		"$.tls.private_key_file": {yaml.HeadComment(" TLS private key; relative paths are resolved below data_directory")},
 		"$.tls.minimum_version":  {yaml.HeadComment(` minimum accepted TLS version: "1.2" or "1.3"`)},
@@ -555,7 +903,9 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.dkim.headers":          {yaml.HeadComment(" message headers included in the DKIM signature; From is mandatory")},
 
 		"$.delivery":                                  {yaml.HeadComment("\n# outbound SMTP delivery and retry policy")},
-		"$.delivery.tls_mode":                         {yaml.HeadComment(` destination TLS policy: "opportunistic" or "required"`)},
+		"$.delivery.tls_mode":                         {yaml.HeadComment(` destination TLS: "opportunistic", "required", or "opportunistic_insecure"`)},
+		"$.delivery.bind_ipv4":                        {yaml.HeadComment(" optional local IPv4 bind for outbound MX connections (independent of dns.public_ipv4)")},
+		"$.delivery.bind_ipv6":                        {yaml.HeadComment(" optional local IPv6 bind for outbound MX connections")},
 		"$.delivery.max_attempts":                     {yaml.HeadComment(" maximum delivery attempts before moving a message to dead-letter state")},
 		"$.delivery.maximum_lifetime":                 {yaml.HeadComment(" absolute time a message may remain queued before dead-lettering")},
 		"$.delivery.initial_retry_delay":              {yaml.HeadComment(" delay after the first temporary delivery failure")},
@@ -565,13 +915,16 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.delivery.connection_timeout":               {yaml.HeadComment(" timeout while connecting to a destination MX")},
 		"$.delivery.command_timeout":                  {yaml.HeadComment(" timeout while waiting for normal SMTP responses")},
 		"$.delivery.submission_timeout":               {yaml.HeadComment(" timeout while waiting for the response after message data")},
-		"$.delivery.require_valid_mx_tls_certificate": {yaml.HeadComment(" verify destination certificates whenever TLS is negotiated")},
+		"$.delivery.require_valid_mx_tls_certificate": {yaml.HeadComment(" legacy; prefer tls_mode. false with opportunistic enables insecure STARTTLS")},
+		"$.delivery.allow_private_destinations":       {yaml.HeadComment(" permit delivery to private/loopback MX addresses (default false)")},
 
-		"$.dns":                  {yaml.HeadComment("\n# values used to generate dns-records.txt")},
-		"$.dns.public_ipv4":      {yaml.HeadComment(" static public IPv4 address used for outbound delivery")},
-		"$.dns.public_ipv6":      {yaml.HeadComment(" static public IPv6 address; omit until forward and reverse DNS are ready")},
-		"$.dns.dmarc_policy":     {yaml.HeadComment(` "quarantine" is a safe default; move to "reject" once reports look clean`)},
-		"$.dns.dmarc_report_uri": {yaml.HeadComment(" optional external aggregate-report URI, for example mailto:dmarc@example.com")},
+		"$.dns":                  {yaml.HeadComment("\n# values used to generate dns-records.txt (not outbound bind addresses)")},
+		"$.dns.public_ipv4":      {yaml.HeadComment(" static public IPv4 for A/SPF DNS generation")},
+		"$.dns.public_ipv6":      {yaml.HeadComment(" static public IPv6 for AAAA/SPF DNS generation; omit until forward and reverse DNS are ready")},
+		"$.dns.dmarc_policy":     {yaml.HeadComment(` start with "none"; stage to "quarantine" then "reject" after verifying alignment`)},
+		"$.dns.dmarc_report_uri": {yaml.HeadComment(" DMARC aggregate-report URI (rua), for example mailto:dmarc@example.com")},
+		"$.dns.tlsrpt_uri":       {yaml.HeadComment(" SMTP TLS reporting URI (separate from DMARC); not proof of outbound TLS quality")},
+		"$.dns.spf_includes":     {yaml.HeadComment(" additional SPF include: domains for other legitimate senders")},
 		"$.dns.output_file":      {yaml.HeadComment(" generated DNS instructions; relative paths are below data_directory")},
 
 		"$.users": {yaml.HeadComment("\n# SMTP users; password_hash must contain an Argon2id hash, never plaintext")},
@@ -634,4 +987,49 @@ func validateDNSLabel(name, label string) error {
 	}
 
 	return nil
+}
+
+func validateHeaderName(name string) error {
+	if name == "" {
+		return errors.New("empty header name")
+	}
+	for _, r := range name {
+		if r <= 32 || r >= 127 || r == ':' {
+			return fmt.Errorf("invalid header name %q", name)
+		}
+		if unicode.IsControl(r) {
+			return fmt.Errorf("invalid header name %q", name)
+		}
+	}
+	return nil
+}
+
+func validateReportURIList(value string) error {
+	for uri := range strings.SplitSeq(value, ",") {
+		uri = strings.TrimSpace(uri)
+		if uri == "" {
+			continue
+		}
+		if err := validateReportURI(uri); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateReportURI(uri string) error {
+	uri = strings.TrimSpace(uri)
+	lower := strings.ToLower(uri)
+	if strings.HasPrefix(lower, "mailto:") {
+		addr := uri[len("mailto:"):]
+		addr, _, _ = strings.Cut(addr, "!")
+		if _, err := mail.ParseAddress(addr); err != nil {
+			return fmt.Errorf("invalid mailto URI %q", uri)
+		}
+		return nil
+	}
+	if strings.HasPrefix(lower, "https://") {
+		return nil
+	}
+	return fmt.Errorf("unsupported report URI scheme in %q (use mailto: or https:)", uri)
 }

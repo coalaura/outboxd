@@ -20,8 +20,13 @@ func Sync(path string) error {
 	err = directory.Sync()
 
 	if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) {
-		return nil
+		err = nil
 	}
-
-	return err
+	if err != nil {
+		return err
+	}
+	if h := currentHooks(); h.AfterSyncDir != nil {
+		return h.AfterSyncDir(path)
+	}
+	return nil
 }

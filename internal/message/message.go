@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -25,9 +26,13 @@ var (
 	errManyFrom  = errors.New("message has more than one From header")
 	errBinary    = errors.New("message contains a NUL byte")
 	errLongLine  = fmt.Errorf("message contains a line longer than %d octets; use quoted-printable or base64", maxLineLength)
+	errOversized = errors.New("message exceeds size limit")
 
 	crlf = []byte("\r\n")
 )
+
+// ErrOversized is returned when the submission exceeds Options.MaxBytes.
+var ErrOversized = errOversized
 
 // Options carries the trace information added to the message.
 type Options struct {
@@ -35,6 +40,9 @@ type Options struct {
 	Helo     string
 	Remote   string
 	TLS      string
+	// MaxBytes limits the raw submission size. Zero means no limit here
+	// (the SMTP layer may still enforce MaxMessageBytes).
+	MaxBytes int64
 }
 
 // Message is a submission that is ready to be signed and queued.
@@ -42,6 +50,12 @@ type Message struct {
 	Data []byte
 	From string
 	ID   string
+	// NeedsUTF8 is true when envelope-bound header material uses raw UTF-8
+	// (internationalized addresses or non-ASCII header bytes not in encoded-words
+	// alone). Delivery must advertise SMTPUTF8 when this is set.
+	NeedsUTF8 bool
+	// EightBit is true when the body contains octets with the high bit set.
+	EightBit bool
 }
 
 type field struct {
@@ -61,9 +75,23 @@ func (f field) text() string {
 // Prepare normalizes a submitted message and adds the headers a receiving MTA
 // expects to see.
 func Prepare(r io.Reader, opts Options) (*Message, error) {
-	raw, err := io.ReadAll(r)
-	if err != nil {
-		return nil, err
+	var (
+		raw []byte
+		err error
+	)
+	if opts.MaxBytes > 0 {
+		raw, err = io.ReadAll(io.LimitReader(r, opts.MaxBytes+1))
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(raw)) > opts.MaxBytes {
+			return nil, errOversized
+		}
+	} else {
+		raw, err = io.ReadAll(r)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if len(raw) == 0 {
@@ -96,9 +124,15 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 		return nil, errManyFrom
 	}
 
-	var from string
+	var (
+		from      string
+		needsUTF8 bool
+	)
 
 	for _, field := range fields {
+		if fieldHasRawUTF8(field.value) {
+			needsUTF8 = true
+		}
 		if field.name != "from" {
 			continue
 		}
@@ -108,7 +142,11 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 			return nil, fmt.Errorf("invalid From header: %w", err)
 		}
 
-		from = address.Address
+		// Preserve local-part case; only the domain is case-insensitive.
+		from = preserveLocalPartCase(field.text(), address.Address)
+		if needsUTF8Addr(from) {
+			needsUTF8 = true
+		}
 	}
 
 	identifierDomain := opts.Hostname
@@ -136,12 +174,19 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 		time.Now().Format(time.RFC1123Z),
 	)
 
-	if present["date"] == 0 {
+	// Date: inject when missing or unusable.
+	if dateField, ok := firstField(fields, "date"); !ok || !validDate(dateField.text()) {
 		fmt.Fprintf(&out, "Date: %s\r\n", time.Now().Format(time.RFC1123Z))
+		present["date"] = 1
 	}
 
-	if present["message-id"] == 0 {
+	// Message-ID: inject when missing or unusable.
+	msgID := identifier
+	if idField, ok := firstField(fields, "message-id"); ok && validMessageID(idField.text()) {
+		msgID = strings.TrimSpace(idField.text())
+	} else {
 		fmt.Fprintf(&out, "Message-ID: %s\r\n", identifier)
+		present["message-id"] = 1
 	}
 
 	if present["to"] == 0 && present["cc"] == 0 {
@@ -164,11 +209,29 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 		out.WriteString("MIME-Version: 1.0\r\n")
 	}
 
+	rewriteDate := false
+	rewriteMsgID := false
+	if df, ok := firstField(fields, "date"); ok && !validDate(df.text()) {
+		rewriteDate = true
+	}
+	if mf, ok := firstField(fields, "message-id"); ok && !validMessageID(mf.text()) {
+		rewriteMsgID = true
+	}
+
 	for _, field := range fields {
-		// Bcc must never leave the submission server, and Return-Path is set by
-		// the receiving MTA from the envelope.
-		if field.name == "bcc" || field.name == "return-path" {
+		// Bcc / Resent-Bcc must never leave the submission server.
+		// Return-Path is set by the receiving MTA from the envelope.
+		switch field.name {
+		case "bcc", "resent-bcc", "return-path":
 			continue
+		case "date":
+			if rewriteDate {
+				continue
+			}
+		case "message-id":
+			if rewriteMsgID {
+				continue
+			}
 		}
 
 		out.Write(field.value)
@@ -178,10 +241,96 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 	out.Write(body)
 
 	return &Message{
-		Data: out.Bytes(),
-		From: from,
-		ID:   identifier,
+		Data:      out.Bytes(),
+		From:      from,
+		ID:        msgID,
+		NeedsUTF8: needsUTF8,
+		EightBit:  eightBit,
 	}, nil
+}
+
+func firstField(fields []field, name string) (field, bool) {
+	for _, f := range fields {
+		if f.name == name {
+			return f, true
+		}
+	}
+	return field{}, false
+}
+
+func validDate(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	if _, err := mail.ParseDate(value); err != nil {
+		return false
+	}
+	return true
+}
+
+func validMessageID(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) < 5 || value[0] != '<' || value[len(value)-1] != '>' {
+		return false
+	}
+	inner := value[1 : len(value)-1]
+	at := strings.LastIndexByte(inner, '@')
+	if at <= 0 || at == len(inner)-1 {
+		return false
+	}
+	for i := 0; i < len(inner); i++ {
+		c := inner[i]
+		if c <= 32 || c >= 127 {
+			return false
+		}
+	}
+	return true
+}
+
+// preserveLocalPartCase returns addr with the local-part casing taken from the
+// original header text when the addresses match case-insensitively.
+func preserveLocalPartCase(headerText, parsed string) string {
+	// parsed comes from net/mail with a lowercased domain.
+	at := strings.LastIndexByte(parsed, '@')
+	if at < 0 {
+		return parsed
+	}
+	// Pull the raw addr-spec from the header if present.
+	raw := headerText
+	if i := strings.LastIndex(headerText, "<"); i >= 0 {
+		if j := strings.LastIndex(headerText, ">"); j > i {
+			raw = headerText[i+1 : j]
+		}
+	}
+	raw = strings.TrimSpace(raw)
+	rat := strings.LastIndexByte(raw, '@')
+	if rat < 0 {
+		return parsed
+	}
+	if !strings.EqualFold(raw, parsed) && !strings.EqualFold(raw[rat+1:], parsed[at+1:]) {
+		return parsed
+	}
+	// Domain lowercased, local-part as written.
+	return raw[:rat] + "@" + strings.ToLower(raw[rat+1:])
+}
+
+func needsUTF8Addr(addr string) bool {
+	for i := 0; i < len(addr); i++ {
+		if addr[i] >= 0x80 {
+			return true
+		}
+	}
+	return !utf8.ValidString(addr)
+}
+
+func fieldHasRawUTF8(value []byte) bool {
+	for _, b := range value {
+		if b >= 0x80 {
+			return true
+		}
+	}
+	return false
 }
 
 func normalize(raw []byte) ([]byte, error) {
@@ -246,8 +395,17 @@ func scan(header []byte) ([]field, error) {
 		end += offset + 2
 		line := header[offset:end]
 
+		// Folded continuation: must start with SP/HTAB and follow a field.
 		if line[0] == ' ' || line[0] == '\t' {
 			if len(fields) == 0 {
+				return nil, errMalformed
+			}
+			// Bare folding whitespace line (CRLF SP CRLF) is malformed.
+			if len(bytes.TrimSpace(line[:len(line)-2])) == 0 {
+				return nil, errMalformed
+			}
+			// Prohibit NUL already handled; reject other C0 controls in folds.
+			if containsHeaderControls(line[:len(line)-2]) {
 				return nil, errMalformed
 			}
 
@@ -262,12 +420,16 @@ func scan(header []byte) ([]field, error) {
 			return nil, errMalformed
 		}
 
-		name := bytes.TrimRight(line[:colon], " \t")
+		name := line[:colon]
+		// Field-name is 1*ftext (RFC 5322): %d33-57 / %d59-126 (no colon, no space).
+		if !validFieldName(name) {
+			return nil, errMalformed
+		}
 
-		for _, char := range name {
-			if char < 33 || char > 126 {
-				return nil, errMalformed
-			}
+		// Header field body (before CRLF) must not contain bare CR/LF or C0 controls.
+		body := line[colon+1 : len(line)-2]
+		if containsHeaderControls(body) {
+			return nil, errMalformed
 		}
 
 		start = offset
@@ -281,6 +443,29 @@ func scan(header []byte) ([]field, error) {
 	}
 
 	return fields, nil
+}
+
+func validFieldName(name []byte) bool {
+	if len(name) == 0 {
+		return false
+	}
+	for _, c := range name {
+		// ftext = %d33-57 / %d59-126
+		if c < 33 || c > 126 || c == ':' {
+			return false
+		}
+	}
+	return true
+}
+
+func containsHeaderControls(b []byte) bool {
+	for _, c := range b {
+		// Allow HTAB (9) and SP (32). Reject other C0 and DEL.
+		if c == 127 || (c < 32 && c != '\t') {
+			return true
+		}
+	}
+	return false
 }
 
 func traceValue(value string) string {
@@ -314,28 +499,6 @@ func messageID(hostname string) string {
 		strings.ToLower(rand.Text()),
 		hostname,
 	)
-}
-
-func comment(value string) string {
-	const limit = 128
-
-	value = strings.Map(func(char rune) rune {
-		if char < 33 || char > 126 || char == '(' || char == ')' || char == '\\' {
-			return -1
-		}
-
-		return char
-	}, value)
-
-	if value == "" {
-		return "unknown"
-	}
-
-	if len(value) > limit {
-		return value[:limit]
-	}
-
-	return value
 }
 
 func protocol(state string) string {
