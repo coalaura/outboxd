@@ -2,3 +2,4 @@ config.yml
 data
 outboxd
 outboxd.exe
+test.ps1
