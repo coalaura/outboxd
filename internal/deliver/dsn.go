@@ -56,6 +56,21 @@ func (d *Deliverer) ensureDSN(envelope *queue.Envelope) error {
 		domain = strings.ToLower(envelope.Sender[at+1:])
 	}
 
+	needUTF8 := false
+	for i := 0; i < len(envelope.Sender); i++ {
+		if envelope.Sender[i] >= 0x80 {
+			needUTF8 = true
+			break
+		}
+	}
+	eightBit := false
+	for _, b := range msg {
+		if b >= 0x80 {
+			eightBit = true
+			break
+		}
+	}
+
 	now := time.Now()
 	dsnEnv := &queue.Envelope{
 		ID:       dsnID,
@@ -69,6 +84,8 @@ func (d *Deliverer) ensureDSN(envelope *queue.Envelope) error {
 		Created:     now,
 		NextAttempt: now,
 		IsDSN:       true,
+		SMTPUTF8:    needUTF8,
+		EightBit:    eightBit,
 	}
 
 	err = d.queue.Add(dsnEnv, msg)

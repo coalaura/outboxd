@@ -225,7 +225,14 @@ func (s *session) Data(r io.Reader) error {
 	data = append(data, signature...)
 	data = append(data, prepared.Data...)
 
-	useUTF8 := s.smtpUTF8 || prepared.NeedsUTF8
+	// Stored requirement is based on actual envelope/header needs, not client opt-in alone.
+	needUTF8 := prepared.NeedsUTF8 || needsUTF8(s.sender)
+	for _, rcpt := range s.recipients {
+		if needsUTF8(rcpt) {
+			needUTF8 = true
+			break
+		}
+	}
 
 	envelope := &queue.Envelope{
 		ID:          identifier(),
@@ -234,7 +241,7 @@ func (s *session) Data(r io.Reader) error {
 		Recipients:  make([]queue.Recipient, 0, len(s.recipients)),
 		Created:     time.Now(),
 		NextAttempt: time.Now(),
-		SMTPUTF8:    useUTF8,
+		SMTPUTF8:    needUTF8,
 		EightBit:    prepared.EightBit,
 	}
 
@@ -284,8 +291,8 @@ func (s *session) authenticate(username, password string) error {
 
 	// Bound waiters: non-blocking queue, corners out with 451 when saturated.
 	if err := s.server.acquireHashSlot(context.Background()); err != nil {
-		// Release reserve without attributing a password failure.
-		s.server.authLimit.succeeded(ip, username)
+		// Release reserve without attributing a password failure or success.
+		s.server.authLimit.canceled(ip, username)
 		s.server.log.Printf("authentication busy from %s\n", ip)
 		return errAuthBusy
 	}

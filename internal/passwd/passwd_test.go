@@ -9,41 +9,111 @@ import (
 	"golang.org/x/crypto/argon2"
 )
 
-func TestValidatePHCBounds(t *testing.T) {
-	// Valid default-shaped hash
-	ok, err := Hash("secret")
+func TestHashAndVerify(t *testing.T) {
+	pw := "correct-horse-battery-staple"
+	h, err := Hash(pw)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := ValidatePHC(ok); err != nil {
-		t.Fatal(err)
+		t.Fatalf("Hash failed: %v", err)
 	}
 
-	// Huge memory rejected
-	huge := fmt.Sprintf(
-		"$argon2id$v=%d$m=%d,t=2,p=1$AAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-		argon2.Version, (1<<30)+1,
-	)
-	// Fix base64 lengths — salt 12 bytes = 16 raw b64? 16 zero bytes visualized
+	if err := ValidatePHC(h); err != nil {
+		t.Fatalf("ValidatePHC failed on generated hash: %v", err)
+	}
+
+	ok, err := Verify(h, pw)
+	if err != nil || !ok {
+		t.Fatalf("Verify failed: ok=%v err=%v", ok, err)
+	}
+
+	wrongOK, err := Verify(h, "wrong-password")
+	if err != nil {
+		t.Fatalf("Verify with wrong password returned error: %v", err)
+	}
+	if wrongOK {
+		t.Fatal("Verify succeeded with wrong password")
+	}
+}
+
+func TestValidatePHCBounds(t *testing.T) {
 	salt := encoding.EncodeToString(make([]byte, 16))
 	key := encoding.EncodeToString(make([]byte, 32))
-	huge = fmt.Sprintf("$argon2id$v=%d$m=%d,t=2,p=1$%s$%s", argon2.Version, (1<<30)+1, salt, key)
-	if err := ValidatePHC(huge); err == nil {
-		t.Fatal("expected huge memory rejection")
-	} else if !errors.Is(err, ErrInvalidHash) && !strings.Contains(err.Error(), "memory") {
-		t.Fatalf("unexpected error: %v", err)
+
+	// m=1073741824 (1 TiB in KiB) rejected
+	m1TiB := fmt.Sprintf("$argon2id$v=%d$m=1073741824,t=2,p=1$%s$%s", argon2.Version, salt, key)
+	if err := ValidatePHC(m1TiB); err == nil {
+		t.Fatal("expected m=1073741824 to be rejected")
 	}
 
-	// Huge iterations
-	iters := fmt.Sprintf("$argon2id$v=%d$m=19456,t=%d,p=1$%s$%s", argon2.Version, maxIterations+1, salt, key)
-	if err := ValidatePHC(iters); err == nil {
-		t.Fatal("expected iterations rejection")
+	// Memory just above chosen limit (256 * 1024 + 1 = 262145 KiB)
+	mOver := fmt.Sprintf("$argon2id$v=%d$m=%d,t=2,p=1$%s$%s", argon2.Version, 256*1024+1, salt, key)
+	if err := ValidatePHC(mOver); err == nil {
+		t.Fatal("expected memory just above limit to be rejected")
 	}
 
-	// Huge threads
-	thr := fmt.Sprintf("$argon2id$v=%d$m=19456,t=2,p=%d$%s$%s", argon2.Version, maxThreads+1, salt, key)
-	if err := ValidatePHC(thr); err == nil {
-		t.Fatal("expected threads rejection")
+	// Valid limit memory (256 * 1024 KiB)
+	mMax := fmt.Sprintf("$argon2id$v=%d$m=%d,t=2,p=1$%s$%s", argon2.Version, 256*1024, salt, key)
+	if err := ValidatePHC(mMax); err != nil {
+		t.Fatalf("expected m=256*1024 to be valid, got: %v", err)
+	}
+
+	// p=257, p=272 previously wrapped uint8
+	p257 := fmt.Sprintf("$argon2id$v=%d$m=19456,t=2,p=257$%s$%s", argon2.Version, salt, key)
+	if err := ValidatePHC(p257); err == nil {
+		t.Fatal("expected p=257 to be rejected")
+	}
+	p272 := fmt.Sprintf("$argon2id$v=%d$m=19456,t=2,p=272$%s$%s", argon2.Version, salt, key)
+	if err := ValidatePHC(p272); err == nil {
+		t.Fatal("expected p=272 to be rejected")
+	}
+
+	// Duplicate parameters
+	dupM := fmt.Sprintf("$argon2id$v=%d$m=1024,m=1024,t=2,p=1$%s$%s", argon2.Version, salt, key)
+	if err := ValidatePHC(dupM); err == nil {
+		t.Fatal("expected duplicate m to be rejected")
+	}
+
+	// Unknown parameters
+	unknown := fmt.Sprintf("$argon2id$v=%d$m=1024,t=2,p=1,x=10$%s$%s", argon2.Version, salt, key)
+	if err := ValidatePHC(unknown); err == nil {
+		t.Fatal("expected unknown parameter x to be rejected")
+	}
+
+	// Missing parameters
+	missingP := fmt.Sprintf("$argon2id$v=%d$m=1024,t=2$%s$%s", argon2.Version, salt, key)
+	if err := ValidatePHC(missingP); err == nil {
+		t.Fatal("expected missing p to be rejected")
+	}
+
+	// Trailing characters after version (v=19junk)
+	junkV := fmt.Sprintf("$argon2id$v=19junk$m=1024,t=2,p=1$%s$%s", salt, key)
+	if err := ValidatePHC(junkV); err == nil {
+		t.Fatal("expected v=19junk to be rejected")
+	}
+
+	// Oversized salt (>64 bytes decoded -> 65 bytes)
+	salt65 := encoding.EncodeToString(make([]byte, 65))
+	overSalt := fmt.Sprintf("$argon2id$v=%d$m=1024,t=2,p=1$%s$%s", argon2.Version, salt65, key)
+	if err := ValidatePHC(overSalt); err == nil {
+		t.Fatal("expected oversized salt to be rejected")
+	}
+
+	// Oversized output/key (>64 bytes decoded -> 65 bytes)
+	key65 := encoding.EncodeToString(make([]byte, 65))
+	overKey := fmt.Sprintf("$argon2id$v=%d$m=1024,t=2,p=1$%s$%s", argon2.Version, salt, key65)
+	if err := ValidatePHC(overKey); err == nil {
+		t.Fatal("expected oversized key to be rejected")
+	}
+
+	// Invalid base64
+	badB64 := fmt.Sprintf("$argon2id$v=%d$m=1024,t=2,p=1$!!!badb64!!!$%s", argon2.Version, key)
+	if err := ValidatePHC(badB64); err == nil {
+		t.Fatal("expected invalid base64 to be rejected")
+	}
+
+	// Very large decimal values without overflow or panic
+	hugeDec := fmt.Sprintf("$argon2id$v=%d$m=99999999999999999999999,t=2,p=1$%s$%s", argon2.Version, salt, key)
+	if err := ValidatePHC(hugeDec); err == nil {
+		t.Fatal("expected huge decimal m to be rejected without panic")
 	}
 
 	// Bad algorithm
@@ -53,16 +123,19 @@ func TestValidatePHCBounds(t *testing.T) {
 
 	// Empty
 	if err := ValidatePHC(""); err == nil {
-		t.Fatal("empty")
+		t.Fatal("empty string rejected")
 	}
 }
 
 func TestVerifyRejectsHostileBeforeDerive(t *testing.T) {
 	salt := encoding.EncodeToString(make([]byte, 16))
 	key := encoding.EncodeToString(make([]byte, 32))
-	huge := fmt.Sprintf("$argon2id$v=%d$m=%d,t=2,p=1$%s$%s", argon2.Version, (1<<30)+1, salt, key)
+	huge := fmt.Sprintf("$argon2id$v=%d$m=1073741824,t=2,p=1$%s$%s", argon2.Version, salt, key)
 	ok, err := Verify(huge, "pw")
 	if ok || err == nil {
-		t.Fatalf("Verify must reject hostile params, ok=%v err=%v", ok, err)
+		t.Fatalf("Verify must reject hostile params before derive, ok=%v err=%v", ok, err)
+	}
+	if !errors.Is(err, ErrInvalidHash) && !strings.Contains(err.Error(), "memory") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

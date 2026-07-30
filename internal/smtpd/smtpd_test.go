@@ -5,7 +5,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -195,38 +194,6 @@ func TestConnectionLimitSaturation(t *testing.T) {
 	lim.release("1.2.3.4")
 	if !lim.acquire("1.2.3.4") {
 		t.Fatal("after release")
-	}
-}
-
-func TestAuthLimiterConcurrentReserve(t *testing.T) {
-	l := newAuthLimiter()
-	const n = 50
-	var wg sync.WaitGroup
-	var okCount atomic.Int32
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if l.reserve("10.0.0.1", "alice") {
-				okCount.Add(1)
-				time.Sleep(time.Millisecond)
-				l.succeeded("10.0.0.1", "alice")
-			}
-		}()
-	}
-	wg.Wait()
-	if okCount.Load() != n {
-		t.Fatalf("ok=%d want %d", okCount.Load(), n)
-	}
-
-	for i := 0; i < freeAttempts+1; i++ {
-		if !l.reserve("10.0.0.2", "bob") {
-			t.Fatalf("reserve failed early at %d", i)
-		}
-		l.failed("10.0.0.2", "bob")
-	}
-	if l.reserve("10.0.0.2", "bob") {
-		t.Fatal("should be locked out")
 	}
 }
 

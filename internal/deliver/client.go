@@ -123,9 +123,10 @@ func (c *Client) Mail(from string, opts MailOpts) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "MAIL FROM:<%s>", from)
 	if opts.EightBit {
-		if _, ok := c.ext["8BITMIME"]; ok {
-			b.WriteString(" BODY=8BITMIME")
+		if _, ok := c.ext["8BITMIME"]; !ok {
+			return err8BITMIMEUnsupported
 		}
+		b.WriteString(" BODY=8BITMIME")
 	}
 	if opts.Size > 0 {
 		if _, ok := c.ext["SIZE"]; ok {

@@ -81,12 +81,18 @@ func password() (string, bool, error) {
 		return strings.ToLower(rand.Text()), true, nil
 	}
 
-	body, err := io.ReadAll(io.LimitReader(os.Stdin, 1<<10))
+	// maxPasswordBytes is the maximum accepted piped password length.
+	// Read one extra byte so overflow is detected rather than silently truncated.
+	const maxPasswordBytes = 1024
+	body, err := io.ReadAll(io.LimitReader(os.Stdin, maxPasswordBytes+1))
 	if err != nil {
 		return "", false, err
 	}
+	if len(body) > maxPasswordBytes {
+		return "", false, fmt.Errorf("password exceeds maximum length of %d bytes", maxPasswordBytes)
+	}
 
-	supplied := strings.Trim(string(body), "\r\n")
+	supplied := strings.TrimRight(string(body), "\r\n")
 	if supplied == "" {
 		return "", false, errors.New("empty password on stdin")
 	}

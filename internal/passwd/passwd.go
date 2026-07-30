@@ -12,8 +12,9 @@ import (
 	"golang.org/x/crypto/argon2"
 )
 
+// Memory is measured in KiB.
 const (
-	hashMemory  = 19 * 1024
+	hashMemory  = 19 * 1024 // 19 MiB in KiB
 	hashTime    = 2
 	hashThreads = 1
 
@@ -24,6 +25,15 @@ const (
 var ErrInvalidHash = errors.New("malformed argon2id hash")
 
 var encoding = base64.RawStdEncoding
+
+// PHCParams holds strict, validated parameters for Argon2id. Memory is in KiB.
+type PHCParams struct {
+	Memory     uint32
+	Iterations uint32
+	Threads    uint8
+	Salt       []byte
+	Key        []byte
+}
 
 // Hash derives an Argon2id hash in PHC string format.
 func Hash(password string) (string, error) {
@@ -45,40 +55,14 @@ func Hash(password string) (string, error) {
 
 // Verify compares a password against a PHC formatted Argon2id hash.
 func Verify(hash, password string) (bool, error) {
-	parts := strings.Split(hash, "$")
-	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" {
-		return false, ErrInvalidHash
-	}
-
-	var version int
-
-	_, err := fmt.Sscanf(parts[2], "v=%d", &version)
-	if err != nil || version != argon2.Version {
-		return false, ErrInvalidHash
-	}
-
-	if err := ValidatePHC(hash); err != nil {
-		return false, err
-	}
-
-	memory, iterations, threads, err := parameters(parts[3])
+	p, err := parsePHC(hash)
 	if err != nil {
 		return false, err
 	}
 
-	salt, err := encoding.DecodeString(parts[4])
-	if err != nil {
-		return false, ErrInvalidHash
-	}
+	key := argon2.IDKey([]byte(password), p.Salt, p.Iterations, p.Memory, p.Threads, uint32(len(p.Key)))
 
-	expected, err := encoding.DecodeString(parts[5])
-	if err != nil || len(expected) == 0 {
-		return false, ErrInvalidHash
-	}
-
-	key := argon2.IDKey([]byte(password), salt, iterations, memory, threads, uint32(len(expected)))
-
-	return subtle.ConstantTimeCompare(key, expected) == 1, nil
+	return subtle.ConstantTimeCompare(key, p.Key) == 1, nil
 }
 
 // Waste burns a comparable amount of work for unknown users so that response
@@ -87,76 +71,98 @@ func Waste() {
 	argon2.IDKey([]byte("outboxd"), make([]byte, saltLength), hashTime, hashMemory, hashThreads, keyLength)
 }
 
+// Memory bounds: measured in KiB (1 KiB = 1024 bytes).
 const (
-	maxMemory     = 1 << 30 // 1 GiB
+	maxMemory     = 256 * 1024 // 256 MiB in KiB
 	maxIterations = 100
 	maxThreads    = 16
+	minSaltLen    = 8
 	maxSaltLen    = 64
+	minKeyLen     = 16
 	maxKeyLen     = 64
 )
 
 // ValidatePHC checks an Argon2id PHC string without deriving a key, enforcing
 // bounds so hostile parameters cannot exhaust memory at authentication time.
 func ValidatePHC(hash string) error {
-	parts := strings.Split(hash, "$")
-	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" {
-		return ErrInvalidHash
-	}
-	var version int
-	if _, err := fmt.Sscanf(parts[2], "v=%d", &version); err != nil || version != argon2.Version {
-		return ErrInvalidHash
-	}
-	memory, iterations, threads, err := parameters(parts[3])
-	if err != nil {
-		return err
-	}
-	if memory == 0 || memory > maxMemory {
-		return fmt.Errorf("%w: memory out of range", ErrInvalidHash)
-	}
-	if iterations == 0 || iterations > maxIterations {
-		return fmt.Errorf("%w: iterations out of range", ErrInvalidHash)
-	}
-	if threads == 0 || threads > maxThreads {
-		return fmt.Errorf("%w: parallelism out of range", ErrInvalidHash)
-	}
-	salt, err := encoding.DecodeString(parts[4])
-	if err != nil || len(salt) == 0 || len(salt) > maxSaltLen {
-		return fmt.Errorf("%w: salt size", ErrInvalidHash)
-	}
-	expected, err := encoding.DecodeString(parts[5])
-	if err != nil || len(expected) == 0 || len(expected) > maxKeyLen {
-		return fmt.Errorf("%w: output size", ErrInvalidHash)
-	}
-	return nil
+	_, err := parsePHC(hash)
+	return err
 }
 
-func parameters(value string) (memory uint32, iterations uint32, threads uint8, err error) {
-	for pair := range strings.SplitSeq(value, ",") {
+func parsePHC(hash string) (*PHCParams, error) {
+	parts := strings.Split(hash, "$")
+	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" {
+		return nil, ErrInvalidHash
+	}
+
+	expectedVersion := fmt.Sprintf("v=%d", argon2.Version)
+	if parts[2] != expectedVersion {
+		return nil, ErrInvalidHash
+	}
+
+	var (
+		memory     uint32
+		iterations uint32
+		threads    uint8
+		seenM      bool
+		seenT      bool
+		seenP      bool
+	)
+
+	for pair := range strings.SplitSeq(parts[3], ",") {
 		key, raw, ok := strings.Cut(pair, "=")
 		if !ok {
-			return 0, 0, 0, ErrInvalidHash
+			return nil, ErrInvalidHash
 		}
 
-		number, parseErr := strconv.ParseUint(raw, 10, 32)
+		val, parseErr := strconv.ParseUint(raw, 10, 64)
 		if parseErr != nil {
-			return 0, 0, 0, ErrInvalidHash
+			return nil, ErrInvalidHash
 		}
 
 		switch key {
 		case "m":
-			memory = uint32(number)
+			if seenM || val == 0 || val > maxMemory {
+				return nil, fmt.Errorf("%w: memory out of range", ErrInvalidHash)
+			}
+			memory = uint32(val)
+			seenM = true
 		case "t":
-			iterations = uint32(number)
+			if seenT || val == 0 || val > maxIterations {
+				return nil, fmt.Errorf("%w: iterations out of range", ErrInvalidHash)
+			}
+			iterations = uint32(val)
+			seenT = true
 		case "p":
-			threads = uint8(number)
+			if seenP || val == 0 || val > maxThreads {
+				return nil, fmt.Errorf("%w: parallelism out of range", ErrInvalidHash)
+			}
+			threads = uint8(val)
+			seenP = true
 		default:
-			return 0, 0, 0, ErrInvalidHash
+			return nil, ErrInvalidHash
 		}
 	}
 
-	if memory == 0 || iterations == 0 || threads == 0 {
-		return 0, 0, 0, ErrInvalidHash
+	if !seenM || !seenT || !seenP {
+		return nil, ErrInvalidHash
 	}
 
-	return memory, iterations, threads, nil
+	salt, err := encoding.DecodeString(parts[4])
+	if err != nil || len(salt) < minSaltLen || len(salt) > maxSaltLen {
+		return nil, fmt.Errorf("%w: salt size", ErrInvalidHash)
+	}
+
+	expected, err := encoding.DecodeString(parts[5])
+	if err != nil || len(expected) < minKeyLen || len(expected) > maxKeyLen {
+		return nil, fmt.Errorf("%w: output size", ErrInvalidHash)
+	}
+
+	return &PHCParams{
+		Memory:     memory,
+		Iterations: iterations,
+		Threads:    threads,
+		Salt:       salt,
+		Key:        expected,
+	}, nil
 }

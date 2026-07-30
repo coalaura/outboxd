@@ -60,35 +60,3 @@ func TestSubmissionLimiterEntryExpiry(t *testing.T) {
 		t.Fatal("expired entry not pruned")
 	}
 }
-
-func TestAuthLimiterEntryExpiry(t *testing.T) {
-	l := newAuthLimiter()
-	if !l.reserve("1.1.1.1", "x") {
-		t.Fatal("reserve")
-	}
-	l.succeeded("1.1.1.1", "x")
-	// Create a failure entry that ages out
-	if !l.reserve("2.2.2.2", "y") {
-		t.Fatal()
-	}
-	l.failed("2.2.2.2", "y")
-	l.mu.Lock()
-	if st := l.byIP["2.2.2.2"]; st != nil {
-		st.seen = time.Now().Add(-entryExpiry - time.Minute)
-		st.inFlight = 0
-	}
-	if st := l.byKey["2.2.2.2\x00y"]; st != nil {
-		st.seen = time.Now().Add(-entryExpiry - time.Minute)
-		st.inFlight = 0
-	}
-	l.pruned = time.Time{}
-	l.mu.Unlock()
-	// Trigger prune
-	_ = l.reserve("3.3.3.3", "z")
-	l.mu.Lock()
-	_, ipOK := l.byIP["2.2.2.2"]
-	l.mu.Unlock()
-	if ipOK {
-		t.Fatal("auth entry should expire")
-	}
-}

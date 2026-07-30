@@ -130,7 +130,10 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 	)
 
 	for _, field := range fields {
-		if fieldHasRawUTF8(field.value) {
+		if fieldHasHighBit(field.value) {
+			if !utf8.Valid(field.value) {
+				return nil, errors.New("message header contains invalid UTF-8")
+			}
 			needsUTF8 = true
 		}
 		if field.name != "from" {
@@ -324,7 +327,7 @@ func needsUTF8Addr(addr string) bool {
 	return !utf8.ValidString(addr)
 }
 
-func fieldHasRawUTF8(value []byte) bool {
+func fieldHasHighBit(value []byte) bool {
 	for _, b := range value {
 		if b >= 0x80 {
 			return true

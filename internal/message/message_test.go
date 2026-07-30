@@ -53,11 +53,22 @@ func TestEightBitAndUTF8Flags(t *testing.T) {
 	}
 }
 
-func TestRejectsControlInHeader(t *testing.T) {
-	raw := "From: a@b.co\r\nSub\x01ject: x\r\n\r\nbody\r\n"
-	_, err := Prepare(strings.NewReader(raw), Options{Hostname: "h"})
+func TestRejectsInvalidUTF8Header(t *testing.T) {
+	raw := []byte("From: a@b.co\r\nSubject: bad\xff\xfe\r\n\r\nbody\r\n")
+	_, err := Prepare(bytes.NewReader(raw), Options{Hostname: "h"})
 	if err == nil {
-		t.Fatal("expected malformed")
+		t.Fatal("expected invalid UTF-8 rejection")
+	}
+}
+
+func TestEncodedWordDoesNotRequireSMTPUTF8(t *testing.T) {
+	raw := "From: a@b.co\r\nTo: c@d.co\r\nSubject: =?utf-8?q?caf=C3=A9?=\r\n\r\nbody\r\n"
+	msg, err := Prepare(strings.NewReader(raw), Options{Hostname: "h"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.NeedsUTF8 {
+		t.Fatal("ASCII encoded-words must not require SMTPUTF8")
 	}
 }
 

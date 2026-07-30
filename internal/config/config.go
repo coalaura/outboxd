@@ -600,6 +600,12 @@ func (cfg *Config) Validate() error {
 	default:
 		return fmt.Errorf("delivery.tls_mode must be opportunistic, required, or opportunistic_insecure, got %q", cfg.Delivery.TLSMode)
 	}
+	if cfg.Delivery.TLSMode == "required" && cfg.Delivery.AllowPlaintext != nil && *cfg.Delivery.AllowPlaintext {
+		return errors.New("delivery.tls_mode=required cannot be combined with allow_plaintext=true")
+	}
+	if cfg.Delivery.TLSMode == "opportunistic_insecure" && cfg.Delivery.RequireValidMXTLSCert {
+		return errors.New("delivery.tls_mode=opportunistic_insecure contradicts require_valid_mx_tls_certificate=true")
+	}
 
 	if cfg.Delivery.MaxAttempts <= 0 {
 		return errors.New("delivery.max_attempts must be positive")
@@ -720,6 +726,24 @@ func (u *User) Validate() error {
 
 	for i, sender := range u.AllowedSenders {
 		sender = strings.TrimSpace(sender)
+
+		// Wildcard domain policy: *@example.com
+		if strings.HasPrefix(sender, "*@") {
+			domain := strings.TrimSpace(sender[2:])
+			if domain == "" || strings.Contains(domain, "@") {
+				return fmt.Errorf("user %q has invalid sender %q", u.Username, sender)
+			}
+			if err := validateDomain("allowed_senders", strings.ToLower(domain)); err != nil {
+				return fmt.Errorf("user %q has invalid sender %q", u.Username, sender)
+			}
+			canonicalSender := "*@" + strings.ToLower(domain)
+			if _, exists := senders[canonicalSender]; exists {
+				return fmt.Errorf("user %q has duplicate sender %q", u.Username, sender)
+			}
+			senders[canonicalSender] = struct{}{}
+			u.AllowedSenders[i] = canonicalSender
+			continue
+		}
 
 		address, err := mail.ParseAddress(sender)
 		if err != nil || address.Name != "" {
@@ -903,7 +927,8 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.dkim.headers":          {yaml.HeadComment(" message headers included in the DKIM signature; From is mandatory")},
 
 		"$.delivery":                                  {yaml.HeadComment("\n# outbound SMTP delivery and retry policy")},
-		"$.delivery.tls_mode":                         {yaml.HeadComment(` destination TLS: "opportunistic", "required", or "opportunistic_insecure"`)},
+		"$.delivery.tls_mode":                         {yaml.HeadComment(` destination TLS policy (chosen before connect; never verified-then-insecure fallback): "opportunistic" (verify STARTTLS when offered; plaintext only if allow_plaintext), "required" (STARTTLS required, verified), "opportunistic_insecure" (STARTTLS without cert verification — legacy/dev only)`)},
+		"$.delivery.allow_plaintext":                  {yaml.HeadComment(" when true with opportunistic modes, allow destinations that do not advertise STARTTLS; advertised STARTTLS failures never fall back to plaintext")},
 		"$.delivery.bind_ipv4":                        {yaml.HeadComment(" optional local IPv4 bind for outbound MX connections (independent of dns.public_ipv4)")},
 		"$.delivery.bind_ipv6":                        {yaml.HeadComment(" optional local IPv6 bind for outbound MX connections")},
 		"$.delivery.max_attempts":                     {yaml.HeadComment(" maximum delivery attempts before moving a message to dead-letter state")},
@@ -915,7 +940,7 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.delivery.connection_timeout":               {yaml.HeadComment(" timeout while connecting to a destination MX")},
 		"$.delivery.command_timeout":                  {yaml.HeadComment(" timeout while waiting for normal SMTP responses")},
 		"$.delivery.submission_timeout":               {yaml.HeadComment(" timeout while waiting for the response after message data")},
-		"$.delivery.require_valid_mx_tls_certificate": {yaml.HeadComment(" legacy; prefer tls_mode. false with opportunistic enables insecure STARTTLS")},
+		"$.delivery.require_valid_mx_tls_certificate": {yaml.HeadComment(" legacy: when false with tls_mode=opportunistic, STARTTLS uses insecure verification on the first (only) attempt; prefer tls_mode=opportunistic_insecure. Never enables verified-then-insecure reconnect")},
 		"$.delivery.allow_private_destinations":       {yaml.HeadComment(" permit delivery to private/loopback MX addresses (default false)")},
 
 		"$.dns":                  {yaml.HeadComment("\n# values used to generate dns-records.txt (not outbound bind addresses)")},

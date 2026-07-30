@@ -3,6 +3,7 @@ package deliver
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -61,11 +62,36 @@ var (
 	errNullMX              = errors.New("domain does not accept mail (null MX)")
 	errNoSuchDomain        = errors.New("recipient domain does not exist")
 	errSMTPUTF8Unsupported = errors.New("destination does not support SMTPUTF8")
+	err8BITMIMEUnsupported = errors.New("destination does not support 8BITMIME")
 	errTLSRequired         = errors.New("TLS required but STARTTLS not available")
 	errTLSFailed           = errors.New("STARTTLS failed; refusing plaintext downgrade")
 	errNoUsableIP          = errors.New("no usable destination address")
 	errPrivateDestination  = errors.New("destination address is not publicly routable")
 )
+
+// outboundTLS is the effective TLS policy for one dial attempt, computed before connect.
+type outboundTLS struct {
+	// requireSTARTTLS rejects destinations that do not advertise STARTTLS.
+	requireSTARTTLS bool
+	// insecureSkipVerify disables certificate verification on the single STARTTLS attempt.
+	// Used only when the configured policy is explicitly insecure; never as a fallback
+	// after a verified handshake failure.
+	insecureSkipVerify bool
+	// allowPlaintext permits continuing without TLS when STARTTLS is not advertised.
+	// An advertised STARTTLS that fails must never fall back to plaintext.
+	allowPlaintext bool
+}
+
+func (d *Deliverer) effectiveTLS() outboundTLS {
+	mode := d.cfg.Delivery.TLSMode
+	insecure := d.cfg.Delivery.InsecureTLSAllowed()
+	allowPlain := d.cfg.Delivery.PlaintextAllowed()
+	return outboundTLS{
+		requireSTARTTLS:    mode == "required" || !allowPlain,
+		insecureSkipVerify: insecure,
+		allowPlaintext:     allowPlain && mode != "required",
+	}
+}
 
 // Signer produces DKIM-Signature headers for locally generated messages (DSNs).
 type Signer interface {
@@ -81,6 +107,10 @@ type Deliverer struct {
 
 	resolver Resolver
 	dialer   Dialer
+
+	// tlsRootCAs is an optional test/production root pool override for verified STARTTLS.
+	// When nil, Go's system roots are used.
+	tlsRootCAs *x509.CertPool
 
 	// active bounds concurrent attempt goroutines (including domain waiters).
 	active  chan struct{}
@@ -154,6 +184,11 @@ func (d *Deliverer) SetResolver(r Resolver) {
 // SetDialer replaces the dialer (tests).
 func (d *Deliverer) SetDialer(dialer Dialer) {
 	d.dialer = dialer
+}
+
+// SetTLSRootCAs replaces the root cert pool used for verified STARTTLS (tests).
+func (d *Deliverer) SetTLSRootCAs(pool *x509.CertPool) {
+	d.tlsRootCAs = pool
 }
 
 // Run delivers queued messages until ctx is cancelled or a fatal queue error occurs.
@@ -276,7 +311,15 @@ func (d *Deliverer) attempt(ctx context.Context, envelope *queue.Envelope) error
 			recipient := &envelope.Recipients[i]
 			if recipient.Status == queue.StatusPending {
 				recipient.Status = queue.StatusFailed
-				recipient.Detail = "delivery attempts exhausted"
+				// Preserve the most useful diagnostic for DSN/dead-letter.
+				switch {
+				case recipient.Detail != "":
+					// keep capability-specific or prior MX detail
+				case envelope.LastError != "":
+					recipient.Detail = envelope.LastError
+				default:
+					recipient.Detail = "delivery attempts exhausted"
+				}
 			}
 		}
 		d.log.Printf("giving up on %s after %d attempts: %s\n", envelope.ID, envelope.Attempts, envelope.LastError)
@@ -313,13 +356,21 @@ func (d *Deliverer) expire(envelope *queue.Envelope) (bool, error) {
 }
 
 func (d *Deliverer) complete(envelope *queue.Envelope) error {
-	var delivered int
+	var delivered, failed int
 	for i := range envelope.Recipients {
-		if envelope.Recipients[i].Status == queue.StatusSent {
+		switch envelope.Recipients[i].Status {
+		case queue.StatusSent:
 			delivered++
+		case queue.StatusFailed:
+			failed++
 		}
 	}
-	d.log.Printf("completed %s: %d delivered, %d failed\n", envelope.ID, delivered, len(envelope.Recipients)-delivered)
+	d.log.Printf("completed %s: %d delivered, %d failed\n", envelope.ID, delivered, failed)
+
+	// All-recipient permanent failure → dead-letter with preserved diagnostics.
+	if delivered == 0 && failed > 0 {
+		return d.failTerminal(envelope)
+	}
 
 	if err := d.ensureDSN(envelope); err != nil {
 		return fmt.Errorf("dsn %s: %w", envelope.ID, err)
@@ -351,8 +402,9 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 	}
 
 	var (
-		last               error
-		allUTF8Unsupported = len(hosts) > 0
+		last           error
+		capabilityOnly = len(hosts) > 0
+		capabilityErr  error
 	)
 
 	for _, host := range hosts {
@@ -369,13 +421,16 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 		if done {
 			return nil
 		}
-		if errors.Is(err, errSMTPUTF8Unsupported) {
+		if errors.Is(err, errSMTPUTF8Unsupported) || errors.Is(err, err8BITMIMEUnsupported) {
+			if capabilityErr == nil {
+				capabilityErr = err
+			}
 			if last == nil {
 				last = err
 			}
 			continue
 		}
-		allUTF8Unsupported = false
+		capabilityOnly = false
 		if errors.Is(err, errPrivateDestination) {
 			last = err
 			continue
@@ -383,8 +438,8 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 		last = err
 	}
 
-	if allUTF8Unsupported && last != nil {
-		d.reject(envelope, indexes, errSMTPUTF8Unsupported.Error())
+	if capabilityOnly && capabilityErr != nil {
+		d.reject(envelope, indexes, capabilityErr.Error())
 		return nil
 	}
 	if last != nil && errors.Is(last, errPrivateDestination) {
@@ -427,6 +482,13 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 			return false, errSMTPUTF8Unsupported
 		}
 	}
+	if envelope.EightBit {
+		supported, _ := client.Extension("8BITMIME")
+		if !supported {
+			_ = client.Quit()
+			return false, err8BITMIMEUnsupported
+		}
+	}
 
 	err = client.Mail(envelope.Sender, MailOpts{
 		Size:     envelope.Size,
@@ -434,6 +496,10 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 		EightBit: envelope.EightBit,
 	})
 	if err != nil {
+		if errors.Is(err, errSMTPUTF8Unsupported) || errors.Is(err, err8BITMIMEUnsupported) {
+			_ = client.Quit()
+			return false, err
+		}
 		if permanent(err) {
 			d.reject(envelope, indexes, describe(err))
 			return true, nil
@@ -621,6 +687,9 @@ func isRestricted(ip net.IP) bool {
 }
 
 func (d *Deliverer) dialAndSession(ctx context.Context, mxHost string, ip net.IP) (*Client, error) {
+	// Policy is fixed before dialing. Never reconnect with a weaker verification policy.
+	policy := d.effectiveTLS()
+
 	network, local := d.bindFor(ip)
 	addr := net.JoinHostPort(ip.String(), "25")
 
@@ -650,72 +719,17 @@ func (d *Deliverer) dialAndSession(ctx context.Context, mxHost string, ip net.IP
 	}
 
 	hasTLS, _ := client.Extension("STARTTLS")
-	tlsMode := d.cfg.Delivery.TLSMode
-	required := tlsMode == "required"
-	wantInsecure := d.cfg.Delivery.InsecureTLSAllowed()
-	allowPlain := d.cfg.Delivery.PlaintextAllowed()
-
-	if hasTLS {
-		err := d.upgradeTLS(client, mxHost, true)
-		if err != nil && wantInsecure {
-			client.Close()
-			// Reconnect for insecure attempt; STARTTLS failed after advertise must not plaintext-downgrade.
-			return d.dialTLSInsecure(ctx, mxHost, ip, network, local)
-		}
-		if err != nil {
-			client.Close()
-			return nil, fmt.Errorf("%w: %v", errTLSFailed, err)
-		}
-		if err := client.EHLO(d.cfg.Server.Hostname); err != nil {
-			client.Close()
-			return nil, err
-		}
-		return client, nil
-	}
-
-	if required {
-		client.Close()
-		return nil, errTLSRequired
-	}
-	if !allowPlain {
-		client.Close()
-		return nil, errTLSRequired
-	}
-	return client, nil
-}
-
-func (d *Deliverer) dialTLSInsecure(ctx context.Context, mxHost string, ip net.IP, network string, local net.Addr) (*Client, error) {
-	dialer := d.dialer
-	if nd, ok := dialer.(*net.Dialer); ok {
-		cp := *nd
-		cp.Timeout = d.connTO
-		if local != nil {
-			cp.LocalAddr = local
-		}
-		dialer = &cp
-	}
-	conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), "25"))
-	if err != nil {
-		return nil, err
-	}
-	client := NewClient(conn, d.command, d.submission)
-	if err := client.Greet(); err != nil {
-		client.Close()
-		return nil, err
-	}
-	if err := client.EHLO(d.cfg.Server.Hostname); err != nil {
-		client.Close()
-		return nil, err
-	}
-	hasTLS, _ := client.Extension("STARTTLS")
 	if !hasTLS {
-		if d.cfg.Delivery.TLSMode == "required" || !d.cfg.Delivery.PlaintextAllowed() {
+		if policy.requireSTARTTLS || !policy.allowPlaintext {
 			client.Close()
 			return nil, errTLSRequired
 		}
 		return client, nil
 	}
-	if err := d.upgradeTLS(client, mxHost, false); err != nil {
+
+	// STARTTLS is advertised: attempt once with the pre-chosen verification policy.
+	// Failure must not downgrade to plaintext or reconnect insecurely.
+	if err := d.upgradeTLS(client, mxHost, policy); err != nil {
 		client.Close()
 		return nil, fmt.Errorf("%w: %v", errTLSFailed, err)
 	}
@@ -726,11 +740,19 @@ func (d *Deliverer) dialTLSInsecure(ctx context.Context, mxHost string, ip net.I
 	return client, nil
 }
 
-func (d *Deliverer) upgradeTLS(client *Client, mxHost string, verify bool) error {
+func (d *Deliverer) upgradeTLS(client *Client, mxHost string, policy outboundTLS) error {
 	cfg := &tls.Config{
-		ServerName:         mxHost,
-		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: !verify,
+		ServerName: mxHost, // SNI is the MX hostname even when dialing an explicit IP
+		MinVersion: tls.VersionTLS12,
+	}
+	// InsecureSkipVerify is set only when the configured policy is explicitly insecure
+	// (tls_mode=opportunistic_insecure, or legacy require_valid_mx_tls_certificate=false).
+	// It is never used as a second-chance fallback after verified STARTTLS fails.
+	if policy.insecureSkipVerify {
+		cfg.InsecureSkipVerify = true
+	}
+	if d.tlsRootCAs != nil {
+		cfg.RootCAs = d.tlsRootCAs
 	}
 	return client.StartTLS(cfg)
 }
