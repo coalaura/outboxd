@@ -528,3 +528,242 @@ func TestAuthWorkQueueSaturated(t *testing.T) {
 		t.Fatalf("want errAuthBusy, got %v", err)
 	}
 }
+
+func TestAuthLimiterExistingNoFullSweep(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	l := newAuthLimiterSized(100, 100, entryExpiry, entryExpiry)
+	l.clock = func() time.Time { return now }
+	if !l.reserve("1.1.1.1", "alice") {
+		t.Fatal("seed")
+	}
+	l.canceled("1.1.1.1", "alice")
+	// Mark a failure so empty cleanup doesn't delete, and so next reserve is existing.
+	if !l.reserve("1.1.1.1", "alice") {
+		t.Fatal("re-seed")
+	}
+	l.failed("1.1.1.1", "alice")
+	l.mu.Lock()
+	before := l.fullSweeps
+	l.pruned = now // periodic prune not due
+	l.mu.Unlock()
+	if !l.reserve("1.1.1.1", "alice") {
+		t.Fatal("existing reserve")
+	}
+	l.canceled("1.1.1.1", "alice")
+	l.mu.Lock()
+	after := l.fullSweeps
+	l.mu.Unlock()
+	if after != before {
+		t.Fatalf("existing identity reserve triggered sweeps %d -> %d", before, after)
+	}
+	checkAgg(t, l)
+}
+
+func TestAuthLimiterNewBelowCapacityNoFullSweep(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	l := newAuthLimiterSized(100, 100, entryExpiry, entryExpiry)
+	l.clock = func() time.Time { return now }
+	l.mu.Lock()
+	l.pruned = now
+	before := l.fullSweeps
+	l.mu.Unlock()
+	if !l.reserve("2.2.2.2", "new") {
+		t.Fatal("new below cap")
+	}
+	l.canceled("2.2.2.2", "new")
+	l.mu.Lock()
+	after := l.fullSweeps
+	l.mu.Unlock()
+	if after != before {
+		t.Fatalf("new below capacity triggered sweeps %d -> %d", before, after)
+	}
+	checkAgg(t, l)
+}
+
+func TestAuthLimiterCapacitySweepOnceThenReject(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	const capN = 8
+	l := newAuthLimiterSized(capN, capN, entryExpiry, entryExpiry)
+	l.clock = func() time.Time { return now }
+	for i := 0; i < capN; i++ {
+		ip := fmt.Sprintf("10.0.0.%d", i+1)
+		if !l.reserve(ip, "u") {
+			t.Fatalf("fill %d", i)
+		}
+		l.failed(ip, "u")
+	}
+	l.mu.Lock()
+	before := l.fullSweeps
+	l.pruned = now
+	l.mu.Unlock()
+
+	// First at-capacity new identity may sweep once.
+	if l.reserve("203.0.113.1", "attacker0") {
+		t.Fatal("expected reject at capacity with nothing reclaimable")
+	}
+	l.mu.Lock()
+	mid := l.fullSweeps
+	l.mu.Unlock()
+	if mid != before+1 {
+		t.Fatalf("first capacity reject sweeps=%d want %d", mid-before, 1)
+	}
+	// Hundreds more at same logical time: no additional full sweeps.
+	for i := 0; i < 300; i++ {
+		if l.reserve(fmt.Sprintf("198.51.100.%d", i%250+1), fmt.Sprintf("a%d", i)) {
+			t.Fatalf("unexpected accept at %d", i)
+		}
+	}
+	l.mu.Lock()
+	after := l.fullSweeps
+	l.mu.Unlock()
+	if after != mid {
+		t.Fatalf("repeated capacity rejects swept %d more times", after-mid)
+	}
+	// Existing identity still usable.
+	if !l.reserve("10.0.0.1", "u") {
+		t.Fatal("existing must remain usable at capacity")
+	}
+	l.canceled("10.0.0.1", "u")
+	checkAgg(t, l)
+}
+
+func TestAuthLimiterCapacityReclaimsExpired(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	const capN = 4
+	l := newAuthLimiterSized(capN, capN, entryExpiry, entryExpiry)
+	l.clock = func() time.Time { return now }
+	for i := 0; i < capN; i++ {
+		ip := fmt.Sprintf("10.1.0.%d", i+1)
+		if !l.reserve(ip, "u") {
+			t.Fatal("fill")
+		}
+		l.failed(ip, "u")
+	}
+	// Make all expired idle.
+	l.mu.Lock()
+	for _, st := range l.byIP {
+		st.seen = now.Add(-entryExpiry - time.Minute)
+	}
+	for _, st := range l.byKey {
+		st.seen = now.Add(-entryExpiry - time.Minute)
+	}
+	l.pruned = now
+	l.mu.Unlock()
+	now = now.Add(time.Second)
+	if !l.reserve("203.0.113.50", "fresh") {
+		t.Fatal("capacity sweep should reclaim expired idle")
+	}
+	l.canceled("203.0.113.50", "fresh")
+	checkAgg(t, l)
+}
+
+func TestAuthLimiterSmallCapacityConcurrentExact(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	const capN = 10
+	const remaining = 3
+	l := newAuthLimiterSized(capN, capN, entryExpiry, entryExpiry)
+	l.clock = func() time.Time { return now }
+	for i := 0; i < capN-remaining; i++ {
+		ip := fmt.Sprintf("10.2.0.%d", i+1)
+		if !l.reserve(ip, "u") {
+			t.Fatal("prefill")
+		}
+		l.failed(ip, "u")
+	}
+	const attempts = 20
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var ok atomic.Int32
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			if l.reserve(fmt.Sprintf("10.9.0.%d", i+1), "n") {
+				ok.Add(1)
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	if got := ok.Load(); got != int32(remaining) {
+		t.Fatalf("accepted=%d want %d", got, remaining)
+	}
+	l.mu.Lock()
+	if len(l.byIP) > capN || len(l.byKey) > capN {
+		t.Fatalf("over capacity ips=%d keys=%d", len(l.byIP), len(l.byKey))
+	}
+	// No half-created: every key IP has matching IP entry packages.
+	for k := range l.byKey {
+		ip := ipFromKey(k)
+		if _, ok := l.byIP[ip]; !ok {
+			l.mu.Unlock()
+			t.Fatalf("half-created identity without IP %q", k)
+		}
+	}
+	if err := l.assertAggregatesLocked(); err != nil {
+		l.mu.Unlock()
+		t.Fatal(err)
+	}
+	l.mu.Unlock()
+}
+
+func TestAuthLimiterSuccessRemovesEmptyDirectly(t *testing.T) {
+	l := newAuthLimiter()
+	if !l.reserve("30.30.30.30", "s") {
+		t.Fatal("reserve")
+	}
+	l.succeeded("30.30.30.30", "s")
+	l.mu.Lock()
+	_, k := l.byKey["30.30.30.30\x00s"]
+	_, ip := l.byIP["30.30.30.30"]
+	l.mu.Unlock()
+	if k || ip {
+		t.Fatal("success should drop empty identity and IP directly")
+	}
+	checkAgg(t, l)
+}
+
+func TestAuthLimiterPeriodicPruneOnlyWhenDue(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	l := newAuthLimiterSized(50, 50, entryExpiry, entryExpiry)
+	l.clock = func() time.Time { return now }
+	if !l.reserve("40.40.40.40", "p") {
+		t.Fatal("reserve")
+	}
+	l.failed("40.40.40.40", "p")
+	l.mu.Lock()
+	l.byIP["40.40.40.40"].seen = now.Add(-entryExpiry - time.Minute)
+	l.byKey["40.40.40.40\x00p"].seen = now.Add(-entryExpiry - time.Minute)
+	l.pruned = now // not due
+	before := l.fullSweeps
+	l.mu.Unlock()
+	// New reserve remote: periodic not due, capacity not hit → no sweep, stale remains.
+	if !l.reserve("40.40.40.41", "q") {
+		t.Fatal("other")
+	}
+	l.canceled("40.40.40.41", "q")
+	l.mu.Lock()
+	_, still := l.byKey["40.40.40.40\x00p"]
+	mid := l.fullSweeps
+	l.mu.Unlock()
+	if !still {
+		t.Fatal("periodic prune must not run before interval")
+	}
+	if mid != before {
+		t.Fatalf("unexpected sweep")
+	}
+	// Advance past interval on next reserve.
+	now = now.Add(entryExpiry + time.Second)
+	if !l.reserve("40.40.40.42", "r") {
+		t.Fatal("r")
+	}
+	l.canceled("40.40.40.42", "r")
+	l.mu.Lock()
+	_, gone := l.byKey["40.40.40.40\x00p"]
+	l.mu.Unlock()
+	if gone {
+		t.Fatal("expired idle should be pruned when interval elapses")
+	}
+	checkAgg(t, l)
+}

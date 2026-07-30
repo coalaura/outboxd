@@ -80,6 +80,7 @@ func TestEnsureDSNFlagsUTF8Recipient(t *testing.T) {
 			Status: queue.StatusFailed, Detail: "gone",
 		}},
 		Created: now, NextAttempt: now,
+		SMTPUTF8: true,
 	}
 	if err := q.Add(orig, []byte("From: x\r\nTo: y\r\nSubject: t\r\n\r\nHi\r\n")); err != nil {
 		t.Fatal(err)

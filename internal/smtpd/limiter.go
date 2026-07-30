@@ -38,30 +38,72 @@ type attemptState struct {
 //     equal the sum of retained identity contributions for that IP.
 //   - Capacity is enforced separately on byIP and byKey. Existing identities may
 //     still reserve when maps are at capacity; only creation of a new key/IP entry
-//     is rejected after prune.
+//     is rejected after a reclaim sweep when nothing is reclaimable.
+//
+// Complexity:
+//
+//   - Existing identity reserve: expected O(1). Periodic expiry may run a full sweep
+//     only when pruneInterval has elapsed.
+//   - New identity below capacity: expected O(1).
+//   - New identity at capacity: may perform one full expiry/capacity sweep. After a
+//     sweep finds nothing reclaimable at this logical time, further new-identity
+//     rejections at the same time are O(1) without rescanning.
 //
 // Terminal ops:
 //
 //	reserve   — budget check on IP and identity; atomically create needed entries
 //	            and increment in-flight on both.
 //	failed    — convert one matching reservation into one failure on both.
-//	canceled  — release one matching in-flight on both (no failure change).
+//	canceled  — release one matching in-flight on both; drop emptied identity/IP.
 //	succeeded — release one in-flight on both; clear exact-identity failures and
-//	            subtract only that contribution from the IP aggregate.
+//	            subtract only that contribution from the IP aggregate; drop empties.
 type authLimiter struct {
 	mu     sync.Mutex
 	byIP   map[string]*attemptState
 	byKey  map[string]*attemptState
 	pruned time.Time
 	clock  func() time.Time
+
+	maxIP      int
+	maxKey     int
+	expiry     time.Duration
+	pruneEvery time.Duration
+
+	// atCapSweepAt is the last logical time a capacity sweep found nothing reclaimable.
+	// Repeated new identities at the same logical time skip further full sweeps.
+	atCapSweepAt time.Time
+
+	// fullSweeps counts complete map sweeps (tests only).
+	fullSweeps int
 }
 
 func newAuthLimiter() *authLimiter {
+	return newAuthLimiterSized(maxAuthIPEntries, maxAuthKeyEntries, entryExpiry, entryExpiry)
+}
+
+func newAuthLimiterSized(maxIP, maxKey int, expiry, pruneEvery time.Duration) *authLimiter {
+	if maxIP <= 0 {
+		maxIP = maxAuthIPEntries
+	}
+	if maxKey <= 0 {
+		maxKey = maxAuthKeyEntries
+	}
+	if expiry <= 0 {
+		expiry = entryExpiry
+	}
+	if pruneEvery <= 0 {
+		pruneEvery = entryExpiry
+	}
+	now := time.Now()
 	return &authLimiter{
-		byIP:   make(map[string]*attemptState),
-		byKey:  make(map[string]*attemptState),
-		pruned: time.Now(),
-		clock:  time.Now,
+		byIP:       make(map[string]*attemptState),
+		byKey:      make(map[string]*attemptState),
+		pruned:     now,
+		clock:      time.Now,
+		maxIP:      maxIP,
+		maxKey:     maxKey,
+		expiry:     expiry,
+		pruneEvery: pruneEvery,
 	}
 }
 
@@ -104,7 +146,7 @@ func emptyState(st *attemptState, now time.Time) bool {
 }
 
 // safeToPrune: expired idle, or empty. Never prune active reservations or lockouts.
-func safeToPrune(st *attemptState, now time.Time) bool {
+func (l *authLimiter) safeToPrune(st *attemptState, now time.Time) bool {
 	if st == nil {
 		return true
 	}
@@ -114,7 +156,7 @@ func safeToPrune(st *attemptState, now time.Time) bool {
 	if emptyState(st, now) {
 		return true
 	}
-	return now.Sub(st.seen) > entryExpiry
+	return now.Sub(st.seen) > l.expiry
 }
 
 // reserve attempts to reserve an authentication slot for the given IP and username.
@@ -123,8 +165,7 @@ func (l *authLimiter) reserve(ip, username string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	l.prune(now)
-	l.removeEmpty(now)
+	l.maybePeriodicPrune(now)
 
 	ipKey, key := canonicalLimiterKey(ip, username)
 	ipState := l.byIP[ipKey]
@@ -134,19 +175,24 @@ func (l *authLimiter) reserve(ip, username string) bool {
 	needNewKey := keyState == nil
 
 	if needNewIP || needNewKey {
-		// Prune expired entries again before rejecting new identities.
-		l.forcePrune(now)
-		l.removeEmpty(now)
-		ipState = l.byIP[ipKey]
-		keyState = l.byKey[key]
-		needNewIP = ipState == nil
-		needNewKey = keyState == nil
-
-		if needNewIP && len(l.byIP) >= maxAuthIPEntries {
-			return false
-		}
-		if needNewKey && len(l.byKey) >= maxAuthKeyEntries {
-			return false
+		if (needNewIP && len(l.byIP) >= l.maxIP) || (needNewKey && len(l.byKey) >= l.maxKey) {
+			// Capacity may reclaim expired entries once per logical time after a dry sweep.
+			if !l.atCapSweepAt.Equal(now) {
+				reclaimed := l.forcePrune(now)
+				if !reclaimed {
+					l.atCapSweepAt = now
+				}
+				ipState = l.byIP[ipKey]
+				keyState = l.byKey[key]
+				needNewIP = ipState == nil
+				needNewKey = keyState == nil
+			}
+			if needNewIP && len(l.byIP) >= l.maxIP {
+				return false
+			}
+			if needNewKey && len(l.byKey) >= l.maxKey {
+				return false
+			}
 		}
 	}
 
@@ -205,7 +251,7 @@ func (l *authLimiter) canceled(ip, username string) {
 	}
 	l.releaseInFlight(l.byKey, key, now)
 	l.releaseInFlight(l.byIP, ipKey, now)
-	l.removeEmpty(now)
+	l.dropEmpty(key, ipKey, now)
 }
 
 // succeeded clears failures for the exact IP+username identity, subtracting only
@@ -231,7 +277,7 @@ func (l *authLimiter) succeeded(ip, username string) {
 	keyState.failures = 0
 	keyState.until = time.Time{}
 	keyState.seen = now
-	if keyState.inFlight == 0 && keyState.failures == 0 {
+	if emptyState(keyState, now) {
 		delete(l.byKey, key)
 	}
 
@@ -253,6 +299,15 @@ func (l *authLimiter) succeeded(ip, username string) {
 		if emptyState(ipState, now) {
 			delete(l.byIP, ipKey)
 		}
+	}
+}
+
+func (l *authLimiter) dropEmpty(key, ipKey string, now time.Time) {
+	if st := l.byKey[key]; emptyState(st, now) {
+		delete(l.byKey, key)
+	}
+	if st := l.byIP[ipKey]; emptyState(st, now) {
+		delete(l.byIP, ipKey)
 	}
 }
 
@@ -290,28 +345,34 @@ func (l *authLimiter) convertFail(m map[string]*attemptState, key string, now ti
 	st.until = now.Add(min(lockout, lockoutMax))
 }
 
-func (l *authLimiter) prune(now time.Time) {
-	if now.Sub(l.pruned) < entryExpiry {
+func (l *authLimiter) maybePeriodicPrune(now time.Time) {
+	if now.Sub(l.pruned) < l.pruneEvery {
 		return
 	}
 	l.forcePrune(now)
 }
 
-func (l *authLimiter) forcePrune(now time.Time) {
+// forcePrune performs a full expiry sweep. Returns true if any entry was removed.
+func (l *authLimiter) forcePrune(now time.Time) bool {
 	l.pruned = now
+	l.fullSweeps++
+	reclaimed := false
 
 	// Prune identities first so IP aggregates can be adjusted consistently.
 	for k, st := range l.byKey {
-		if !safeToPrune(st, now) {
+		if !l.safeToPrune(st, now) {
 			continue
 		}
 		l.dropIdentityLocked(k, st, now)
+		reclaimed = true
 	}
 	for k, st := range l.byIP {
-		if safeToPrune(st, now) {
+		if l.safeToPrune(st, now) {
 			delete(l.byIP, k)
+			reclaimed = true
 		}
 	}
+	return reclaimed
 }
 
 // dropIdentityLocked removes an identity and subtracts its contributions from the IP aggregate.
@@ -341,19 +402,6 @@ func (l *authLimiter) dropIdentityLocked(key string, st *attemptState, now time.
 		}
 	}
 	delete(l.byKey, key)
-}
-
-func (l *authLimiter) removeEmpty(now time.Time) {
-	for k, st := range l.byKey {
-		if emptyState(st, now) {
-			delete(l.byKey, k)
-		}
-	}
-	for k, st := range l.byIP {
-		if emptyState(st, now) {
-			delete(l.byIP, k)
-		}
-	}
 }
 
 // assertAggregatesLocked verifies IP totals equal the sum of identity contributions.
@@ -389,11 +437,11 @@ func (l *authLimiter) assertAggregatesLocked() error {
 			return fmt.Errorf("missing IP aggregate ip=%q fail=%d inFlight=%d", ip, s.fail, s.inflight)
 		}
 	}
-	if len(l.byIP) > maxAuthIPEntries {
-		return fmt.Errorf("byIP over capacity: %d > %d", len(l.byIP), maxAuthIPEntries)
+	if len(l.byIP) > l.maxIP {
+		return fmt.Errorf("byIP over capacity: %d > %d", len(l.byIP), l.maxIP)
 	}
-	if len(l.byKey) > maxAuthKeyEntries {
-		return fmt.Errorf("byKey over capacity: %d > %d", len(l.byKey), maxAuthKeyEntries)
+	if len(l.byKey) > l.maxKey {
+		return fmt.Errorf("byKey over capacity: %d > %d", len(l.byKey), l.maxKey)
 	}
 	return nil
 }

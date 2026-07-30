@@ -10,9 +10,14 @@ import (
 	"golang.org/x/net/idna"
 )
 
-// Lookup-oriented IDNA profile for DNS routing (A-labels).
+// Strict lookup-oriented IDNA profile for SMTP recipient-domain DNS routing.
+// Options match the pinned golang.org/x/net/idna API for lookup validation plus
+// DNS length and Bidi checks required for safe A-label conversion.
 var idnaProfile = idna.New(
 	idna.MapForLookup(),
+	idna.StrictDomainName(true),
+	idna.ValidateLabels(true),
+	idna.VerifyDNSLength(true),
 	idna.BidiRule(),
 )
 
@@ -36,12 +41,17 @@ func DomainOf(addr string) (string, error) {
 
 // RoutingDomain converts a mailbox domain to a lowercased ASCII A-label suitable
 // for MX/A lookup and concurrency keys. Unicode U-labels are not returned.
+// Leading or trailing whitespace is rejected; input is never silently trimmed.
 func RoutingDomain(domain string) (string, error) {
 	if domain == "" {
 		return "", ErrEmptyDomain
 	}
 	if !utf8.ValidString(domain) {
 		return "", ErrInvalidUTF8
+	}
+	// Whitespace is never accepted or stripped for routing.
+	if strings.TrimSpace(domain) != domain {
+		return "", ErrInvalidDomain
 	}
 	// Reject empty labels before IDNA (including trailing dots).
 	if strings.HasPrefix(domain, ".") || strings.HasSuffix(domain, ".") || strings.Contains(domain, "..") {
@@ -52,7 +62,8 @@ func RoutingDomain(domain string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrInvalidDomain, err)
 	}
-	ascii = strings.ToLower(strings.TrimSpace(ascii))
+	// Profile already lowercases; enforce lowercase ASCII A-labels explicitly.
+	ascii = strings.ToLower(ascii)
 	if ascii == "" {
 		return "", ErrEmptyDomain
 	}

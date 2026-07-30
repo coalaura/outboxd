@@ -175,3 +175,42 @@ func TestVerifyRejectsHostileBeforeDerive(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestValidatePHCMemoryParallelismRelation(t *testing.T) {
+	salt := encoding.EncodeToString(make([]byte, 16))
+	key := encoding.EncodeToString(make([]byte, 32))
+
+	// m >= 8*p accepted at structural edges (no IDKey call for max profile).
+	accept := []struct {
+		m, p int
+	}{
+		{8, 1},
+		{32, 4},
+		{19456, 1},
+	}
+	for _, c := range accept {
+		h := fmt.Sprintf("$argon2id$v=%d$m=%d,t=2,p=%d$%s$%s", argon2.Version, c.m, c.p, salt, key)
+		if err := ValidatePHC(h); err != nil {
+			t.Fatalf("m=%d p=%d should accept: %v", c.m, c.p, err)
+		}
+	}
+	reject := []struct {
+		m, p int
+	}{
+		{7, 1},
+		{31, 4},
+		{1, 4},
+	}
+	for _, c := range reject {
+		h := fmt.Sprintf("$argon2id$v=%d$m=%d,t=2,p=%d$%s$%s", argon2.Version, c.m, c.p, salt, key)
+		if err := ValidatePHC(h); err == nil {
+			t.Fatalf("m=%d p=%d must reject", c.m, c.p)
+		}
+	}
+	// Hostile relationship via Verify: ordinary error, no panic.
+	bad := fmt.Sprintf("$argon2id$v=%d$m=1,t=2,p=4$%s$%s", argon2.Version, salt, key)
+	ok, err := Verify(bad, "x")
+	if ok || err == nil {
+		t.Fatalf("Verify hostile relation ok=%v err=%v", ok, err)
+	}
+}

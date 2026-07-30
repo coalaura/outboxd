@@ -677,3 +677,169 @@ func TestCorruptNeverDeletedSilently(t *testing.T) {
 		}
 	}
 }
+
+func TestSMTPUTF8EnvelopeInvariant(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	now := time.Now().UTC().Truncate(time.Second)
+	body := []byte("From: a@ex.com\r\nTo: b@ex.com\r\nSubject: t\r\n\r\nHi\r\n")
+
+	// UTF-8 sender without flag rejected.
+	err := q.Add(&Envelope{
+		ID: "u1", Username: "u", Sender: "björn@ex.com",
+		Recipients:  []Recipient{{Address: "b@ex.com", Domain: "ex.com", Status: StatusPending}},
+		Created:     now,
+		NextAttempt: now,
+		SMTPUTF8:    false,
+	}, body)
+	if err == nil {
+		t.Fatal("UTF-8 sender without SMTPUTF8 must reject")
+	}
+
+	// UTF-8 recipient without flag rejected.
+	err = q.Add(&Envelope{
+		ID: "u2", Username: "u", Sender: "a@ex.com",
+		Recipients:  []Recipient{{Address: "björn@ex.com", Domain: "ex.com", Status: StatusPending}},
+		Created:     now,
+		NextAttempt: now,
+		SMTPUTF8:    false,
+	}, body)
+	if err == nil {
+		t.Fatal("UTF-8 recipient without SMTPUTF8 must reject")
+	}
+
+	// UTF-8 with flag accepted.
+	if err := q.Add(&Envelope{
+		ID: "u3", Username: "u", Sender: "björn@ex.com",
+		Recipients:  []Recipient{{Address: "åke@ex.com", Domain: "ex.com", Status: StatusPending}},
+		Created:     now,
+		NextAttempt: now,
+		SMTPUTF8:    true,
+	}, body); err != nil {
+		t.Fatal(err)
+	}
+
+	// ASCII with SMTPUTF8 false accepted.
+	if err := q.Add(&Envelope{
+		ID: "uip4", Username: "u", Sender: "a@ex.com",
+		Recipients:  []Recipient{{Address: "b@ex.com", Domain: "ex.com", Status: StatusPending}},
+		Created:     now,
+		NextAttempt: now,
+		SMTPUTF8:    false,
+	}, body); err != nil {
+		t.Fatal(err)
+	}
+
+	// ASCII with SMTPUTF8 true accepted (headers may require it).
+	if err := q.Add(&Envelope{
+		ID: "u5", Username: "u", Sender: "a@ex.com",
+		Recipients:  []Recipient{{Address: "b@ex.com", Domain: "ex.com", Status: StatusPending}},
+		Created:     now,
+		NextAttempt: now,
+		SMTPUTF8:    true,
+	}, body); err != nil {
+		t.Fatal(err)
+	}
+
+	// Null sender DSN with ASCII recipient, no SMTPUTF8.
+	if err := q.Add(&Envelope{
+		ID: "u6", Username: "u", Sender: "", IsDSN: true,
+		Recipients:  []Recipient{{Address: "b@ex.com", Domain: "ex.com", Status: StatusPending}},
+		Created:     now,
+		NextAttempt: now,
+		SMTPUTF8:    false,
+	}, body); err != nil {
+		t.Fatal(err)
+	}
+
+	// Null sender DSN with UTF-8 recipient requires SMTPUTF8.
+	err = q.Add(&Envelope{
+		ID: "u7", Username: "u", Sender: "", IsDSN: true,
+		Recipients:  []Recipient{{Address: "björn@ex.com", Domain: "ex.com", Status: StatusPending}},
+		Created:     now,
+		NextAttempt: now,
+		SMTPUTF8:    false,
+	}, body)
+	if err == nil {
+		t.Fatal("DSN UTF-8 recipient without SMTPUTF8 must reject")
+	}
+	if err := q.Add(&Envelope{
+		ID: "u8", Username: "u", Sender: "", IsDSN: true,
+		Recipients:  []Recipient{{Address: "björn@ex.com", Domain: "ex.com", Status: StatusPending}},
+		Created:     now,
+		NextAttempt: now,
+		SMTPUTF8:    true,
+	}, body); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSMTPUTF8InvariantOpenQuarantine(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	mustOpen(t, root, Limits{})
+	now := time.Now().UTC().Truncate(time.Second)
+	// Write a ready entry that bypasses Add validation.
+	dir := filepath.Join(root, dirReady, "badutf8")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	env := &Envelope{
+		ID: "badutf8", Username: "u", Sender: "björn@ex.com",
+		Recipients:  []Recipient{{Address: "b@ex.com", Domain: "ex.com", Status: StatusPending}},
+		Created:     now,
+		NextAttempt: now,
+		SMTPUTF8:    false,
+	}
+	raw, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, metaName), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, bodyName), []byte("From: x\r\n\r\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	q := mustOpen(t, root, Limits{})
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("violating ready entry must be quarantined on Open")
+	}
+	if len(corruptEntries(t, root)) == 0 && len(q.Corrupt) == 0 {
+		t.Fatal("expected quarantine/corrupt report")
+	}
+	if q.Len() != 0 {
+		t.Fatal("must not schedule violating entry")
+	}
+}
+
+func TestSMTPUTF8InvariantLegacyNotPromoted(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	mustOpen(t, root, Limits{})
+	now := time.Now().UTC().Truncate(time.Second)
+	env := &Envelope{
+		ID: "legutf8", Username: "u", Sender: "a@ex.com",
+		Recipients:  []Recipient{{Address: "björn@ex.com", Domain: "ex.com", Status: StatusPending}},
+		Created:     now,
+		NextAttempt: now,
+		SMTPUTF8:    false,
+	}
+	raw, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "legutf8.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "legutf8.eml"), []byte("msg"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	q := mustOpen(t, root, Limits{})
+	if _, err := os.Stat(filepath.Join(root, dirReady, "legutf8")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("legacy violating entry must not promote to ready")
+	}
+	if q.Len() != 0 {
+		t.Fatal("must not schedule legacy violating entry")
+	}
+}

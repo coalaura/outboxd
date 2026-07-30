@@ -3,7 +3,7 @@ package smtpd
 import (
 	"bufio"
 	"context"
-	"io"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -161,10 +161,6 @@ func TestRunBothExitTogether(t *testing.T) {
 }
 
 func TestGracefulShutdownTimeoutPath(t *testing.T) {
-	prev := shutdownTimeout
-	shutdownTimeout = 80 * time.Millisecond
-	t.Cleanup(func() { shutdownTimeout = prev })
-
 	cfg, k, spool := testServerParts(t)
 	cfg.Server.DisableImplicitTLS = true
 	cfg.Server.ImplicitTLSAddr = ""
@@ -172,6 +168,21 @@ func TestGracefulShutdownTimeoutPath(t *testing.T) {
 	if err := srv.Listen(); err != nil {
 		t.Fatal(err)
 	}
+
+	// Inject a shutdown context that is already past its deadline once the session is held,
+	// so Shutdown must take the deadline path and surface deadline exceeded.
+	arm := make(chan struct{})
+	var armed atomic.Bool
+	srv.shutdownContext = func(parent context.Context) (context.Context, context.CancelFunc) {
+		select {
+		case <-arm:
+		case <-parent.Done():
+			return context.WithCancel(parent)
+		}
+		armed.Store(true)
+		return context.WithDeadline(parent, time.Now().Add(-time.Millisecond))
+	}
+
 	var hook atomic.Int32
 	srv.shutdownHook = func() { hook.Add(1) }
 	entered := waitServeEntered(t, srv)
@@ -187,11 +198,11 @@ func TestGracefulShutdownTimeoutPath(t *testing.T) {
 	}
 	defer conn.Close()
 	br := bufio.NewReader(conn)
-	// Read greeting so the session is established.
 	if _, err := br.ReadString('\n'); err != nil {
 		t.Fatal(err)
 	}
 
+	close(arm)
 	cancel()
 	var runErr error
 	select {
@@ -202,15 +213,16 @@ func TestGracefulShutdownTimeoutPath(t *testing.T) {
 	if hook.Load() != 1 {
 		t.Fatalf("shutdownHook calls=%d want 1", hook.Load())
 	}
-	// Deadline path should surface a shutdown timeout error when a session is held open.
-	if runErr == nil {
-		// Session may have closed quickly; tolerate nil only if hook still ran once.
-		// Prefer asserting error when present.
-	} else if !containsTimeout(runErr) {
-		// Accept any non-nil join error carrying shutdown context.
-		t.Logf("shutdown err=%v", runErr)
+	if !armed.Load() {
+		t.Fatal("shutdown context factory was not used")
 	}
-	_ = io.EOF
+	if runErr == nil {
+		t.Fatal("Run must return deadline/timeout error; got nil")
+	}
+	if !errors.Is(runErr, context.DeadlineExceeded) && !containsFold(runErr.Error(), "deadline") && !containsFold(runErr.Error(), "timeout") {
+		t.Fatalf("expected deadline/timeout in error, got %v", runErr)
+	}
+	_ = conn.Close()
 }
 
 func containsTimeout(err error) bool {

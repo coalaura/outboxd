@@ -97,6 +97,8 @@ type Server struct {
 	shutdownHook func()
 	// serveEntered is invoked once when a Serve loop has started (tests).
 	serveEntered func()
+	// shutdownContext builds the context used for graceful Shutdown (tests may inject).
+	shutdownContext func(parent context.Context) (context.Context, context.CancelFunc)
 }
 
 // New builds the submission server.
@@ -255,7 +257,15 @@ func (s *Server) Run(ctx context.Context) error {
 			}
 			cancelRun()
 
-			shutdownCtx, done := context.WithTimeout(context.Background(), shutdownTimeout)
+			var (
+				shutdownCtx context.Context
+				done        context.CancelFunc
+			)
+			if s.shutdownContext != nil {
+				shutdownCtx, done = s.shutdownContext(context.Background())
+			} else {
+				shutdownCtx, done = context.WithTimeout(context.Background(), shutdownTimeout)
+			}
 			defer done()
 
 			if s.starttls != nil && s.starttlsListener != nil {

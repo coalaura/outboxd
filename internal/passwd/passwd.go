@@ -180,6 +180,11 @@ func parsePHC(hash string) (*PHCParams, error) {
 		return nil, ErrInvalidHash
 	}
 
+	// Argon2 requires memory (KiB) >= 8 * parallelism.
+	if uint64(memory) < 8*uint64(threads) {
+		return nil, fmt.Errorf("%w: memory too small for parallelism", ErrInvalidHash)
+	}
+
 	salt, err := encoding.DecodeString(parts[4])
 	if err != nil || len(salt) < minSaltLen || len(salt) > maxSaltLen {
 		return nil, fmt.Errorf("%w: salt size", ErrInvalidHash)

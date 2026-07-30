@@ -112,6 +112,10 @@ type Deliverer struct {
 	// When nil, Go's system roots are used.
 	tlsRootCAs *x509.CertPool
 
+	// orderIPs optionally reorders resolved candidate addresses before dial attempts.
+	// Production defaults to a light shuffle. Tests may replace it for deterministic order.
+	orderIPs func([]net.IP)
+
 	// active bounds concurrent attempt goroutines (including domain waiters).
 	active  chan struct{}
 	global  chan struct{}
@@ -153,6 +157,7 @@ func NewWithSigner(cfg *config.Config, spool *queue.Queue, log Logger, signer Si
 
 		resolver: netResolver{r: net.DefaultResolver},
 		dialer:   &net.Dialer{Timeout: config.Duration(cfg.Delivery.ConnectionTimeout)},
+		orderIPs: shuffleIPs,
 
 		active:  make(chan struct{}, attemptLimit),
 		global:  make(chan struct{}, cfg.Delivery.GlobalConcurrency),
@@ -402,9 +407,11 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 	}
 
 	var (
-		last           error
-		capabilityOnly = len(hosts) > 0
-		capabilityErr  error
+		last              error
+		sawEligible       bool
+		capabilityOnly    = true
+		sawUTF8CapErr     bool
+		sawEightBitCapErr bool
 	)
 
 	for _, host := range hosts {
@@ -421,15 +428,27 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 		if done {
 			return nil
 		}
-		if errors.Is(err, errSMTPUTF8Unsupported) || errors.Is(err, err8BITMIMEUnsupported) {
-			if capabilityErr == nil {
-				capabilityErr = err
-			}
+		if err == nil {
+			// send returned without completing or failing recipients permanently.
+			capabilityOnly = false
+			continue
+		}
+		sawEligible = true
+		if errors.Is(err, errSMTPUTF8Unsupported) {
+			sawUTF8CapErr = true
 			if last == nil {
 				last = err
 			}
 			continue
 		}
+		if errors.Is(err, err8BITMIMEUnsupported) {
+			sawEightBitCapErr = true
+			if last == nil {
+				last = err
+			}
+			continue
+		}
+		// Any non-capability outcome means this is not a capability-only failure set.
 		capabilityOnly = false
 		if errors.Is(err, errPrivateDestination) {
 			last = err
@@ -438,8 +457,8 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 		last = err
 	}
 
-	if capabilityOnly && capabilityErr != nil {
-		d.reject(envelope, indexes, capabilityErr.Error())
+	if sawEligible && capabilityOnly && (sawUTF8CapErr || sawEightBitCapErr) {
+		d.reject(envelope, indexes, capabilityDetail(sawUTF8CapErr, sawEightBitCapErr))
 		return nil
 	}
 	if last != nil && errors.Is(last, errPrivateDestination) {
@@ -450,6 +469,22 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 		last = errors.New("no usable MX host")
 	}
 	return last
+}
+
+// capabilityDetail builds a permanent capability diagnostic without string-matching
+// transient transport errors. When both requirements failed across candidates, both
+// are reported.
+func capabilityDetail(needUTF8, needEight bool) string {
+	switch {
+	case needUTF8 && needEight:
+		return errSMTPUTF8Unsupported.Error() + "; " + err8BITMIMEUnsupported.Error()
+	case needUTF8:
+		return errSMTPUTF8Unsupported.Error()
+	case needEight:
+		return err8BITMIMEUnsupported.Error()
+	default:
+		return "required SMTP capability missing"
+	}
 }
 
 func (d *Deliverer) acquireGlobal(ctx context.Context) error {
@@ -607,11 +642,17 @@ func (d *Deliverer) lookupHostIPs(ctx context.Context, host string) ([]net.IP, e
 	if err != nil {
 		return nil, err
 	}
-	// Prefer stable order with light shuffle for equal preference multi-A.
+	if d.orderIPs != nil {
+		d.orderIPs(addrs)
+	}
+	return addrs, nil
+}
+
+// shuffleIPs is the production candidate-IP ordering: light shuffle for multi-A.
+func shuffleIPs(addrs []net.IP) {
 	rand.Shuffle(len(addrs), func(i, j int) {
 		addrs[i], addrs[j] = addrs[j], addrs[i]
 	})
-	return addrs, nil
 }
 
 func (d *Deliverer) lookupNetwork() string {

@@ -26,15 +26,28 @@ import (
 	"github.com/coalaura/outboxd/internal/queue"
 )
 
+// sessionSnapshot is an immutable view of one SMTP session for tests.
+type sessionSnapshot struct {
+	Commands  []string
+	MailLine  string
+	RcptLines []string
+	Data      bool
+	DataBody  string
+	TLS       bool
+	SNI       string
+}
+
 // sessionLog records the SMTP conversation for one client connection.
+// All mutable fields are protected by mu; tests must use snapshot().
 type sessionLog struct {
-	mu       sync.Mutex
-	commands []string
-	mailLine string
-	rcptLine string
-	data     bool
-	tls      bool
-	sni      string
+	mu        sync.Mutex
+	commands  []string
+	mailLine  string
+	rcptLines []string
+	data      bool
+	dataBody  strings.Builder
+	tls       bool
+	sni       string
 }
 
 func (s *sessionLog) add(cmd string) {
@@ -43,7 +56,24 @@ func (s *sessionLog) add(cmd string) {
 	s.mu.Unlock()
 }
 
+func (s *sessionLog) snapshot() sessionSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := sessionSnapshot{
+		MailLine: s.mailLine,
+		Data:     s.data,
+		DataBody: s.dataBody.String(),
+		TLS:      s.tls,
+		SNI:      s.sni,
+	}
+	out.Commands = append([]string(nil), s.commands...)
+	out.RcptLines = append([]string(nil), s.rcptLines...)
+	return out
+}
+
 // fakeMX is a deterministic MX, synchronized via readiness / event channels.
+// mx.mu protects only the sessions slice and listener-level counters/flags
+// that are configured before serve. Session fields use sessionLog.mu.
 type fakeMX struct {
 	ln       net.Listener
 	ready    chan struct{}
@@ -55,7 +85,10 @@ type fakeMX struct {
 	dataOnce sync.Once
 	dataDone chan struct{}
 	// sessionDone receives after each connection handler exits.
+	// Buffered enough for test fan-out so completions are never dropped; never nonblocking-select-default.
 	sessionDone chan struct{}
+	// done closed when the accept loop stops.
+	done chan struct{}
 
 	startTLS   bool
 	extUTF8    bool
@@ -63,6 +96,9 @@ type fakeMX struct {
 	cert       tls.Certificate
 	brokenTLS  bool // handshake fails after 220
 	startTLSEr bool // STARTTLS command returns 454
+
+	// captureBody records DATA octets when true.
+	captureBody bool
 }
 
 func startFakeMX(t *testing.T, mx *fakeMX) string {
@@ -74,17 +110,27 @@ func startFakeMX(t *testing.T, mx *fakeMX) string {
 	mx.ln = ln
 	mx.ready = make(chan struct{})
 	mx.dataDone = make(chan struct{})
-	mx.sessionDone = make(chan struct{}, 64)
+	mx.sessionDone = make(chan struct{}, 256)
+	mx.done = make(chan struct{})
 	go mx.serve()
 	close(mx.ready)
-	t.Cleanup(func() { _ = ln.Close() })
+	t.Cleanup(func() {
+		_ = ln.Close()
+		select {
+		case <-mx.done:
+		case <-time.After(5 * time.Second):
+		}
+	})
 	return ln.Addr().String()
 }
 
 func (mx *fakeMX) serve() {
+	defer close(mx.done)
+	var wg sync.WaitGroup
 	for {
 		c, err := mx.ln.Accept()
 		if err != nil {
+			wg.Wait()
 			return
 		}
 		mx.conns.Add(1)
@@ -92,12 +138,11 @@ func (mx *fakeMX) serve() {
 		mx.mu.Lock()
 		mx.sessions = append(mx.sessions, log)
 		mx.mu.Unlock()
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			mx.handle(c, log)
-			select {
-			case mx.sessionDone <- struct{}{}:
-			default:
-			}
+			mx.sessionDone <- struct{}{}
 		}()
 	}
 }
@@ -156,27 +201,41 @@ func (mx *fakeMX) handle(c net.Conn, log *sessionLog) {
 				return
 			}
 			cs := tlsConn.ConnectionState()
+			log.mu.Lock()
 			log.sni = cs.ServerName
 			log.tls = true
+			log.mu.Unlock()
 			rw = tlsConn
 			br = bufio.NewReader(rw)
 			secured = true
 		case strings.HasPrefix(upper, "MAIL FROM:"):
+			log.mu.Lock()
 			log.mailLine = raw
+			log.mu.Unlock()
 			write("250 OK\r\n")
 		case strings.HasPrefix(upper, "RCPT TO:"):
-			log.rcptLine = raw
+			log.mu.Lock()
+			log.rcptLines = append(log.rcptLines, raw)
+			log.mu.Unlock()
 			write("250 OK\r\n")
 		case strings.HasPrefix(upper, "DATA"):
+			log.mu.Lock()
 			log.data = true
+			log.mu.Unlock()
 			write("354 go\r\n")
 			for {
 				l, err := readLine()
 				if err != nil {
 					return
 				}
-				if strings.TrimRight(l, "\r\n") == "." {
+				trimmed := strings.TrimRight(l, "\r\n")
+				if trimmed == "." {
 					break
+				}
+				if mx.captureBody {
+					log.mu.Lock()
+					log.dataBody.WriteString(l)
+					log.mu.Unlock()
 				}
 			}
 			write("250 queued\r\n")
@@ -190,27 +249,38 @@ func (mx *fakeMX) handle(c net.Conn, log *sessionLog) {
 	}
 }
 
-func (mx *fakeMX) mailLines() []string {
+func (mx *fakeMX) snapshots() []sessionSnapshot {
 	mx.mu.Lock()
-	defer mx.mu.Unlock()
+	logs := append([]*sessionLog(nil), mx.sessions...)
+	mx.mu.Unlock()
+	out := make([]sessionSnapshot, 0, len(logs))
+	for _, s := range logs {
+		out = append(out, s.snapshot())
+	}
+	return out
+}
+
+func (mx *fakeMX) mailLines() []string {
 	var out []string
-	for _, s := range mx.sessions {
-		if s.mailLine != "" {
-			out = append(out, s.mailLine)
+	for _, s := range mx.snapshots() {
+		if s.MailLine != "" {
+			out = append(out, s.MailLine)
 		}
 	}
 	return out
 }
 
 func (mx *fakeMX) anyData() bool {
-	mx.mu.Lock()
-	defer mx.mu.Unlock()
-	for _, s := range mx.sessions {
-		if s.data {
+	for _, s := range mx.snapshots() {
+		if s.Data {
 			return true
 		}
 	}
 	return false
+}
+
+func (mx *fakeMX) anyMail() bool {
+	return len(mx.mailLines()) > 0
 }
 
 func mintCert(t *testing.T, cn string) (tls.Certificate, *x509.CertPool, *x509.Certificate) {
@@ -554,12 +624,14 @@ func TestTLSVerifiedTrusted(t *testing.T) {
 	await(t, mx.dataDone, 3*time.Second, "DATA")
 	cancel()
 	<-done
-	mx.mu.Lock()
+	snaps := mx.snapshots()
 	var sni string
 	var ehlos int
-	for _, s := range mx.sessions {
-		sni = s.sni
-		for _, c := range s.commands {
+	for _, s := range snaps {
+		if s.SNI != "" {
+			sni = s.SNI
+		}
+		for _, c := range s.Commands {
 			if strings.HasPrefix(strings.ToUpper(c), "EHLO ") {
 				ehlos++
 				if !strings.Contains(c, "outboxd.test") {
@@ -568,7 +640,6 @@ func TestTLSVerifiedTrusted(t *testing.T) {
 			}
 		}
 	}
-	mx.mu.Unlock()
 	if sni != "mx.ex.com" {
 		t.Fatalf("SNI=%q", sni)
 	}
@@ -686,10 +757,6 @@ func (m mapDialer) DialContext(ctx context.Context, network, address string) (ne
 type errUnmapped string
 
 func (e errUnmapped) Error() string { return "unmapped " + string(e) }
-
-func (mx *fakeMX) anyMail() bool {
-	return len(mx.mailLines()) > 0
-}
 
 func multiMX(t *testing.T, bad, good *fakeMX) (*deliver.Deliverer, *queue.Queue) {
 	t.Helper()
@@ -832,7 +899,8 @@ func TestMultiMXMixedNetworkAndCapability(t *testing.T) {
 	ipCap := net.ParseIP("10.255.201.2")
 	q := openQueue(t)
 	cfg := deliverCfg()
-	cfg.Delivery.MaxAttempts = 1
+	// Multiple attempts so a temporary outcome persists a retry rather than exhausting.
+	cfg.Delivery.MaxAttempts = 5
 	d := deliver.New(cfg, q, memLog{})
 	d.SetResolver(&fakeResolver{
 		mx: map[string][]*net.MX{"ex.com": {
@@ -848,16 +916,24 @@ func TestMultiMXMixedNetworkAndCapability(t *testing.T) {
 		net.JoinHostPort(ipCap.String(), "25"): addrCap,
 	}})
 	addEnvelope(t, q, "mix1", "björn@ex.com", "b@ex.com", "ex.com", true, false, nil)
+	// Single attempt path: pull once via Run briefly until L
+
+	// Deliverer will retry; cancel after first MX hosts have been tried (cap session ended).
 	cancel, done := runDeliverer(t, d)
 	awaitSession(t, mxCap, 3*time.Second)
+	// Give Finish path no permanent reject: wait for retry persistence by cancelling after session.
 	cancel()
 	<-done
 	if mxCap.anyData() {
 		t.Fatal("no DATA")
 	}
 	ids, _ := q.DeadIDs()
-	if len(ids) == 0 {
-		t.Fatal("expected terminal")
+	if len(ids) != 0 {
+		t.Fatalf("must not permanently bury on mixed temporary+capability, dead=%v", ids)
+	}
+	// Message remains pending for retry (not finished).
+	if q.Len() == 0 {
+		t.Fatal("expected message still queued for retry")
 	}
 }
 
@@ -895,8 +971,6 @@ func TestTLSCandidateIPRetryKeepsPolicy(t *testing.T) {
 	cfg.Delivery.RequireValidMXTLSCert = true
 	d := deliver.New(cfg, q, memLog{})
 	d.SetTLSRootCAs(pool)
-	// Single A Rr then map: first dial fails, second succeeds — force order via sequential IPs
-	// where dialer fails the bad IP only.
 	d.SetResolver(&fakeResolver{
 		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com.", Pref: 10}}},
 		ips: map[string][]net.IP{"mx.ex.com": {ipBad, ipGood}},
@@ -919,26 +993,21 @@ func TestTLSCandidateIPRetryKeepsPolicy(t *testing.T) {
 	await(t, mx.dataDone, 4*time.Second, "DATA")
 	cancel()
 	<-done
-	mu.Lock()
-	sawBad, sawGood := false, false
-	for _, a := range dials {
-		if strings.Contains(a, ipBad.String()) {
-			sawBad = true
-		}
-		if strings.Contains(a, ipGood.String()) {
-			sawGood = true
-		}
-	}
-	mu.Unlock()
-	// Shuffle may put good first; require eventual success with at most one conn and verified TLS.
-	if !sawGood {
-		t.Fatalf("expected dial good IP, dials=%v", dials)
-	}
+	// Deterministic dial order is asserted in package deliver TestCandidateIPFallbackOrder.
+	// Here, success pathway: one verified STARTTLS connection, one MAIL/DATA.
 	if mx.conns.Load() != 1 {
 		t.Fatalf("conns=%d", mx.conns.Load())
 	}
-	// If bad was tried, policy stayed constant + resumed on other IP.
-	_ = sawBad
+	snaps := mx.snapshots()
+	if len(snaps) != 1 || !snaps[0].TLS || !snaps[0].Data {
+		t.Fatalf("expected one TLS DATA session, snaps=%+v", snaps)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(dials) == 0 {
+		t.Fatal("expected dials")
+	}
+	_ = dials
 }
 
 func TestIDNARoutingUsesALabel(t *testing.T) {
@@ -986,12 +1055,11 @@ func TestIDNARoutingUsesALabel(t *testing.T) {
 			t.Fatalf("DNS used U-label %q", name)
 		}
 	}
-	mx.mu.Lock()
+	snaps := mx.snapshots()
 	rcptLine := ""
-	if len(mx.sessions) > 0 {
-		rcptLine = mx.sessions[0].rcptLine
+	if len(snaps) > 0 && len(snaps[0].RcptLines) > 0 {
+		rcptLine = snaps[0].RcptLines[0]
 	}
-	mx.mu.Unlock()
 	if !strings.Contains(rcptLine, "User@exämple.com") {
 		t.Fatalf("RCPT must preserve submitted mailbox, got %q", rcptLine)
 	}
@@ -1072,12 +1140,11 @@ func TestASCIIRCPTCasingPreserved(t *testing.T) {
 	await(t, mx.dataDone, 3*time.Second, "DATA")
 	cancel()
 	<-done
-	mx.mu.Lock()
+	snaps := mx.snapshots()
 	rcptLine := ""
-	if len(mx.sessions) > 0 {
-		rcptLine = mx.sessions[0].rcptLine
+	if len(snaps) > 0 && len(snaps[0].RcptLines) > 0 {
+		rcptLine = snaps[0].RcptLines[0]
 	}
-	mx.mu.Unlock()
 	if !strings.Contains(rcptLine, "User.Name@ex.com") {
 		t.Fatalf("RCPT=%q", rcptLine)
 	}

@@ -945,10 +945,17 @@ func validateEnvelope(e *Envelope) error {
 	if e.Size < 0 {
 		return errors.New("negative size")
 	}
+	needUTF8 := false
+	if e.Sender != "" && addressHasNonASCII(e.Sender) {
+		needUTF8 = true
+	}
 	for i := range e.Recipients {
 		r := &e.Recipients[i]
 		if err := validateAddress(r.Address); err != nil {
 			return fmt.Errorf("recipient[%d]: %w", i, err)
+		}
+		if addressHasNonASCII(r.Address) {
+			needUTF8 = true
 		}
 		routing, err := mailbox.DomainOf(r.Address)
 		if err != nil {
@@ -973,7 +980,24 @@ func validateEnvelope(e *Envelope) error {
 			return fmt.Errorf("recipient[%d]: invalid status %q", i, r.Status)
 		}
 	}
+	// Non-ASCII envelope addresses require the SMTPUTF8 flag so outbound MAIL/RCPT
+	// never emit UTF-8 without the SMTPUTF8 MAIL parameter. ASCII envelopes may set
+	// the flag when headers independently require it; the flag is never cleared here.
+	if needUTF8 && !e.SMTPUTF8 {
+		return errors.New("SMTPUTF8 required for non-ASCII envelope address")
+	}
 	return nil
+}
+
+// addressHasNonASCII reports whether addr contains any octet above 0x7F.
+// Addresses must already be valid UTF-8 (enforced by validateAddress).
+func addressHasNonASCII(addr string) bool {
+	for i := 0; i < len(addr); i++ {
+		if addr[i] >= 0x80 {
+			return true
+		}
+	}
+	return false
 }
 
 func validateAddress(addr string) error {
