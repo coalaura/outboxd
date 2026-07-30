@@ -42,6 +42,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/coalaura/outboxd/internal/disk"
+	"github.com/coalaura/outboxd/internal/mailbox"
 )
 
 // Status is the delivery state of a single recipient.
@@ -949,13 +950,21 @@ func validateEnvelope(e *Envelope) error {
 		if err := validateAddress(r.Address); err != nil {
 			return fmt.Errorf("recipient[%d]: %w", i, err)
 		}
-		domain := r.Address[strings.LastIndexByte(r.Address, '@')+1:]
-		if r.Domain == "" {
-			r.Domain = strings.ToLower(domain)
-		} else if !strings.EqualFold(r.Domain, domain) {
-			return fmt.Errorf("recipient[%d]: domain mismatch", i)
+		routing, err := mailbox.DomainOf(r.Address)
+		if err != nil {
+			return fmt.Errorf("recipient[%d]: %w", i, err)
 		}
-		r.Domain = strings.ToLower(r.Domain)
+		if r.Domain == "" {
+			r.Domain = routing
+		} else {
+			// Accept a stored routing domain only when it normalizes to the same A-label.
+			// Unicode routing domains left by older builds are rewritten to the A-label.
+			stored, err := mailbox.RoutingDomain(r.Domain)
+			if err != nil || stored != routing {
+				return fmt.Errorf("recipient[%d]: domain mismatch", i)
+			}
+			r.Domain = routing
+		}
 		switch r.Status {
 		case StatusPending, StatusSent, StatusFailed:
 		case "":

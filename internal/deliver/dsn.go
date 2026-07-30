@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/coalaura/outboxd/internal/mailbox"
 	"github.com/coalaura/outboxd/internal/queue"
 )
 
@@ -50,10 +51,9 @@ func (d *Deliverer) ensureDSN(envelope *queue.Envelope) error {
 		msg = signed
 	}
 
-	at := strings.LastIndexByte(envelope.Sender, '@')
-	domain := ""
-	if at >= 0 {
-		domain = strings.ToLower(envelope.Sender[at+1:])
+	domain, err := mailbox.DomainOf(envelope.Sender)
+	if err != nil {
+		return fmt.Errorf("dsn recipient domain: %w", err)
 	}
 
 	needUTF8 := false
@@ -63,6 +63,8 @@ func (d *Deliverer) ensureDSN(envelope *queue.Envelope) error {
 			break
 		}
 	}
+	// EightBit is required only when transmitted bytes contain high-bit octets,
+	// not merely because a part declares an 8bit transfer encoding.
 	eightBit := false
 	for _, b := range msg {
 		if b >= 0x80 {

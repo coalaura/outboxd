@@ -13,7 +13,7 @@ import (
 	"math/big"
 	"net"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 
@@ -152,11 +152,22 @@ func selfSigned(t *testing.T, cn string) tls.Certificate {
 	return cert
 }
 
-func smtpListener(t *testing.T, startTLS bool, cert tls.Certificate, accepted *atomic.Int64) string {
+// legacyListener wraps a simple SMTP listener with a DATA-accepted channel.
+type legacyListener struct {
+	addr     string
+	accepted chan struct{}
+	once     sync.Once
+}
+
+func smtpListener(t *testing.T, startTLS bool, cert tls.Certificate) *legacyListener {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
+	}
+	l := &legacyListener{
+		addr:     ln.Addr().String(),
+		accepted: make(chan struct{}),
 	}
 	go func() {
 		for {
@@ -164,14 +175,14 @@ func smtpListener(t *testing.T, startTLS bool, cert tls.Certificate, accepted *a
 			if err != nil {
 				return
 			}
-			go serveSMTP(c, startTLS, cert, accepted)
+			go serveSMTP(c, startTLS, cert, l)
 		}
 	}()
 	t.Cleanup(func() { _ = ln.Close() })
-	return ln.Addr().String()
+	return l
 }
 
-func serveSMTP(c net.Conn, startTLS bool, cert tls.Certificate, accepted *atomic.Int64) {
+func serveSMTP(c net.Conn, startTLS bool, cert tls.Certificate, l *legacyListener) {
 	defer c.Close()
 	rw := c
 	write := func(s string) { _, _ = io.WriteString(rw, s) }
@@ -227,15 +238,13 @@ func serveSMTP(c net.Conn, startTLS bool, cert tls.Certificate, accepted *atomic
 		case strings.HasPrefix(upper, "DATA"):
 			write("354 go\r\n")
 			for {
-				l := readLine()
-				if strings.TrimRight(l, "\r\n") == "." {
+				l2 := readLine()
+				if strings.TrimRight(l2, "\r\n") == "." {
 					break
 				}
 			}
 			write("250 queued\r\n")
-			if accepted != nil {
-				accepted.Add(1)
-			}
+			l.once.Do(func() { close(l.accepted) })
 		case strings.HasPrefix(upper, "QUIT"):
 			write("221 bye\r\n")
 			return
@@ -245,22 +254,18 @@ func serveSMTP(c net.Conn, startTLS bool, cert tls.Certificate, accepted *atomic
 	}
 }
 
-func waitAccepted(t *testing.T, n *atomic.Int64, want int64, timeout time.Duration) {
+func awaitAccepted(t *testing.T, l *legacyListener, timeout time.Duration) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if n.Load() >= want {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	select {
+	case <-l.accepted:
+	case <-time.After(timeout):
+		t.Fatal("timeout waiting for DATA accepted")
 	}
-	t.Fatalf("accepted=%d want>=%d", n.Load(), want)
 }
 
 func TestDeliveryOpportunisticTLS(t *testing.T) {
-	var accepted atomic.Int64
 	cert := selfSigned(t, "mx.example.com")
-	addr := smtpListener(t, true, cert, &accepted)
+	ln := smtpListener(t, true, cert)
 
 	q := openQueue(t)
 	cfg := testConfig()
@@ -272,25 +277,24 @@ func TestDeliveryOpportunisticTLS(t *testing.T) {
 	})
 	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
 		var nd net.Dialer
-		return nd.DialContext(ctx, "tcp", addr)
+		return nd.DialContext(ctx, "tcp", ln.addr)
 	}))
 
 	addMsg(t, q, "msg1", "ex.com", "a@ex.com")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- d.Run(ctx) }()
 
-	waitAccepted(t, &accepted, 1, 3*time.Second)
+	awaitAccepted(t, ln, 3*time.Second)
 	cancel()
 	<-done
 }
 
 func TestDeliveryRequiredRejectsPlain(t *testing.T) {
-	var accepted atomic.Int64
 	cert := selfSigned(t, "mx.example.com")
-	addr := smtpListener(t, false, cert, &accepted)
+	ln := smtpListener(t, false, cert)
 
 	q := openQueue(t)
 	cfg := testConfig()
@@ -305,7 +309,7 @@ func TestDeliveryRequiredRejectsPlain(t *testing.T) {
 	})
 	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
 		var nd net.Dialer
-		return nd.DialContext(ctx, "tcp", addr)
+		return nd.DialContext(ctx, "tcp", ln.addr)
 	}))
 
 	addMsg(t, q, "msg2", "ex.com", "a@ex.com")
@@ -314,8 +318,10 @@ func TestDeliveryRequiredRejectsPlain(t *testing.T) {
 	defer cancel()
 	_ = d.Run(ctx)
 
-	if accepted.Load() != 0 {
-		t.Fatalf("required TLS must not deliver over plaintext, accepted=%d", accepted.Load())
+	select {
+	case <-ln.accepted:
+		t.Fatal("required TLS must not deliver over plaintext")
+	default:
 	}
 	ids, err := q.DeadIDs()
 	if err != nil {
@@ -327,9 +333,8 @@ func TestDeliveryRequiredRejectsPlain(t *testing.T) {
 }
 
 func TestDeliveryPlaintextOpportunistic(t *testing.T) {
-	var accepted atomic.Int64
 	cert := selfSigned(t, "mx.example.com")
-	addr := smtpListener(t, false, cert, &accepted)
+	ln := smtpListener(t, false, cert)
 
 	q := openQueue(t)
 	cfg := testConfig()
@@ -341,16 +346,16 @@ func TestDeliveryPlaintextOpportunistic(t *testing.T) {
 	})
 	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
 		var nd net.Dialer
-		return nd.DialContext(ctx, "tcp", addr)
+		return nd.DialContext(ctx, "tcp", ln.addr)
 	}))
 
 	addMsg(t, q, "msg3", "ex.com", "a@ex.com")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- d.Run(ctx) }()
-	waitAccepted(t, &accepted, 1, 3*time.Second)
+	awaitAccepted(t, ln, 3*time.Second)
 	cancel()
 	<-done
 }
@@ -365,9 +370,12 @@ func TestPrivateIPRejection(t *testing.T) {
 		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.example.com.", Pref: 10}}},
 		ips: map[string][]net.IP{"mx.example.com": {net.ParseIP("10.0.0.5")}},
 	})
-	var dialed atomic.Int64
+	dialed := make(chan struct{}, 1)
 	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
-		dialed.Add(1)
+		select {
+		case dialed <- struct{}{}:
+		default:
+		}
 		return nil, net.ErrClosed
 	}))
 
@@ -377,15 +385,16 @@ func TestPrivateIPRejection(t *testing.T) {
 	defer cancel()
 	_ = d.Run(ctx)
 
-	if dialed.Load() != 0 {
-		t.Fatalf("must not dial private destination, dialed=%d", dialed.Load())
+	select {
+	case <-dialed:
+		t.Fatal("must not dial private destination")
+	default:
 	}
 }
 
 func TestPrivateAllowlist(t *testing.T) {
-	var accepted atomic.Int64
 	cert := selfSigned(t, "mx.example.com")
-	addr := smtpListener(t, false, cert, &accepted)
+	ln := smtpListener(t, false, cert)
 
 	q := openQueue(t)
 	cfg := testConfig()
@@ -398,27 +407,23 @@ func TestPrivateAllowlist(t *testing.T) {
 	})
 	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
 		var nd net.Dialer
-		return nd.DialContext(ctx, "tcp", addr)
+		return nd.DialContext(ctx, "tcp", ln.addr)
 	}))
 
 	addMsg(t, q, "msg5", "ex.com", "a@ex.com")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- d.Run(ctx) }()
-	waitAccepted(t, &accepted, 1, 3*time.Second)
+	awaitAccepted(t, ln, 3*time.Second)
 	cancel()
 	<-done
 }
 
 func TestFairnessBlockedDomain(t *testing.T) {
-	var fastAccepted atomic.Int64
-	var blockedDialing atomic.Int64
-	releaseBlocked := make(chan struct{})
-
 	cert := selfSigned(t, "mx.fast.com")
-	fastAddr := smtpListener(t, false, cert, &fastAccepted)
+	fast := smtpListener(t, false, cert)
 
 	q := openQueue(t)
 	cfg := testConfig()
@@ -428,6 +433,8 @@ func TestFairnessBlockedDomain(t *testing.T) {
 
 	blockedIP := net.ParseIP("10.255.0.1")
 	fastIP := net.ParseIP("10.255.0.2")
+	blockedDialing := make(chan struct{}, 1)
+	releaseBlocked := make(chan struct{})
 
 	d.SetResolver(&fakeResolver{
 		mx: map[string][]*net.MX{
@@ -443,7 +450,10 @@ func TestFairnessBlockedDomain(t *testing.T) {
 		host, _, _ := net.SplitHostPort(address)
 		ip := net.ParseIP(host)
 		if ip != nil && ip.Equal(blockedIP) {
-			blockedDialing.Add(1)
+			select {
+			case blockedDialing <- struct{}{}:
+			default:
+			}
 			select {
 			case <-releaseBlocked:
 				return nil, context.Canceled
@@ -452,7 +462,7 @@ func TestFairnessBlockedDomain(t *testing.T) {
 			}
 		}
 		var nd net.Dialer
-		return nd.DialContext(ctx, "tcp", fastAddr)
+		return nd.DialContext(ctx, "tcp", fast.addr)
 	}))
 
 	addMsg(t, q, "blk1", "blocked.com", "a@blocked.com")
@@ -464,17 +474,15 @@ func TestFairnessBlockedDomain(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- d.Run(ctx) }()
 
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && blockedDialing.Load() == 0 {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if blockedDialing.Load() == 0 {
+	select {
+	case <-blockedDialing:
+	case <-time.After(3 * time.Second):
 		cancel()
 		<-done
 		t.Fatal("blocked domain never dialed")
 	}
 
-	waitAccepted(t, &fastAccepted, 1, 3*time.Second)
+	awaitAccepted(t, fast, 3*time.Second)
 	close(releaseBlocked)
 	cancel()
 	<-done

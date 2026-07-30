@@ -95,6 +95,8 @@ type Server struct {
 
 	// shutdownHook is invoked once when shutdown starts (tests).
 	shutdownHook func()
+	// serveEntered is invoked once when a Serve loop has started (tests).
+	serveEntered func()
 }
 
 // New builds the submission server.
@@ -276,6 +278,15 @@ func (s *Server) Run(ctx context.Context) error {
 		})
 	}
 
+	var serveOnce sync.Once
+	notifyServe := func() {
+		serveOnce.Do(func() {
+			if s.serveEntered != nil {
+				s.serveEntered()
+			}
+		})
+	}
+
 	serveOne := func(name string, fn func() error) {
 		active.Add(1)
 		wg.Go(func() {
@@ -284,6 +295,7 @@ func (s *Server) Run(ctx context.Context) error {
 					shutdown()
 				}
 			}()
+			notifyServe()
 			if err := fn(); err != nil {
 				record(fmt.Errorf("%s serve: %w", name, err))
 			}
@@ -369,14 +381,6 @@ func address(value string) (string, error) {
 		return "", errors.New("address contains a display name")
 	}
 	return parsed.Address, nil
-}
-
-func addressDomain(addr string) string {
-	at := strings.LastIndexByte(addr, '@')
-	if at < 0 || at == len(addr)-1 {
-		return ""
-	}
-	return strings.ToLower(addr[at+1:])
 }
 
 func needsUTF8(s string) bool {

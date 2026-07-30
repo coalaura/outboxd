@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/coalaura/outboxd/internal/config"
+	"github.com/coalaura/outboxd/internal/mailbox"
 	"github.com/coalaura/outboxd/internal/message"
 	"github.com/coalaura/outboxd/internal/passwd"
 	"github.com/coalaura/outboxd/internal/queue"
@@ -103,13 +104,16 @@ func (s *session) Rcpt(to string, opts *smtp.RcptOptions) error {
 
 	address, err := address(to)
 
-	var domain string
-
+	var routing string
 	if err == nil {
-		domain = address[strings.LastIndexByte(address, '@')+1:]
+		if strings.HasPrefix(address[strings.LastIndexByte(address, '@')+1:], "[") {
+			err = errors.New("literal address")
+		} else {
+			routing, err = mailbox.DomainOf(address)
+		}
 	}
 
-	if err != nil || !strings.Contains(domain, ".") || strings.HasPrefix(domain, "[") {
+	if err != nil || routing == "" {
 		return &smtp.SMTPError{
 			Code:         501,
 			EnhancedCode: smtp.EnhancedCode{5, 1, 3},
@@ -246,9 +250,17 @@ func (s *session) Data(r io.Reader) error {
 	}
 
 	for _, recipient := range s.recipients {
+		domain, derr := mailbox.DomainOf(recipient)
+		if derr != nil {
+			return &smtp.SMTPError{
+				Code:         501,
+				EnhancedCode: smtp.EnhancedCode{5, 1, 3},
+				Message:      "Invalid recipient address",
+			}
+		}
 		envelope.Recipients = append(envelope.Recipients, queue.Recipient{
 			Address: recipient,
-			Domain:  strings.ToLower(recipient[strings.LastIndexByte(recipient, '@')+1:]),
+			Domain:  domain,
 			Status:  queue.StatusPending,
 		})
 	}

@@ -82,20 +82,61 @@ func password() (string, bool, error) {
 	}
 
 	// maxPasswordBytes is the maximum accepted piped password length.
-	// Read one extra byte so overflow is detected rather than silently truncated.
 	const maxPasswordBytes = 1024
-	body, err := io.ReadAll(io.LimitReader(os.Stdin, maxPasswordBytes+1))
+	supplied, err := readPassword(os.Stdin, maxPasswordBytes)
 	if err != nil {
 		return "", false, err
 	}
-	if len(body) > maxPasswordBytes {
-		return "", false, fmt.Errorf("password exceeds maximum length of %d bytes", maxPasswordBytes)
-	}
-
-	supplied := strings.TrimRight(string(body), "\r\n")
-	if supplied == "" {
-		return "", false, errors.New("empty password on stdin")
-	}
-
 	return supplied, false, nil
+}
+
+// readPassword reads a password from r.
+//
+// The limit applies to the password after removal of one optional line ending.
+// Accepts exactly maxBytes password bytes, optionally followed by a single LF
+// or CRLF. Rejects empty input, additional lines, NUL bytes, and passwords
+// longer than maxBytes. At most one trailing LF or CRLF is removed; a password
+// whose final intended character is '\r' is not over-trimmed.
+func readPassword(r io.Reader, maxBytes int) (string, error) {
+	if maxBytes <= 0 {
+		return "", errors.New("invalid password length limit")
+	}
+	// maxBytes password + optional CRLF + one overflow detector byte.
+	body, err := io.ReadAll(io.LimitReader(r, int64(maxBytes)+3))
+	if err != nil {
+		return "", err
+	}
+
+	pass := body
+	switch {
+	case len(pass) >= 2 && pass[len(pass)-2] == '\r' && pass[len(pass)-1] == '\n':
+		pass = pass[:len(pass)-2]
+	case len(pass) >= 1 && pass[len(pass)-1] == '\n':
+		pass = pass[:len(pass)-1]
+	}
+
+	if len(pass) == 0 {
+		return "", errors.New("empty password on stdin")
+	}
+	if len(pass) > maxBytes {
+		return "", fmt.Errorf("password exceeds maximum length of %d bytes", maxBytes)
+	}
+	// Additional lines after the optional ending, or an embedded newline mid-password.
+	if containsByte(pass, '\n') {
+		return "", errors.New("password must be a single line")
+	}
+	// NUL is rejected; treat passwords as opaque UTF-8/binary otherwise.
+	if containsByte(pass, 0) {
+		return "", errors.New("password contains NUL")
+	}
+	return string(pass), nil
+}
+
+func containsByte(b []byte, c byte) bool {
+	for _, x := range b {
+		if x == c {
+			return true
+		}
+	}
+	return false
 }

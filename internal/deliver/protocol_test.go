@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/coalaura/outboxd/internal/config"
 	"github.com/coalaura/outboxd/internal/deliver"
+	"github.com/coalaura/outboxd/internal/mailbox"
 	"github.com/coalaura/outboxd/internal/queue"
 )
 
@@ -29,6 +31,7 @@ type sessionLog struct {
 	mu       sync.Mutex
 	commands []string
 	mailLine string
+	rcptLine string
 	data     bool
 	tls      bool
 	sni      string
@@ -142,13 +145,14 @@ func (mx *fakeMX) handle(c net.Conn, log *sessionLog) {
 				continue
 			}
 			write("220 ready\r\n")
+			if mx.brokenTLS {
+				// Fail during the handshake, not after a successful one.
+				_, _ = rw.Write([]byte("NOT_TLS_HANDSHAKE"))
+				return
+			}
 			cfg := &tls.Config{Certificates: []tls.Certificate{mx.cert}}
 			tlsConn := tls.Server(rw, cfg)
 			if err := tlsConn.Handshake(); err != nil {
-				return
-			}
-			if mx.brokenTLS {
-				_ = tlsConn.Close()
 				return
 			}
 			cs := tlsConn.ConnectionState()
@@ -161,6 +165,7 @@ func (mx *fakeMX) handle(c net.Conn, log *sessionLog) {
 			log.mailLine = raw
 			write("250 OK\r\n")
 		case strings.HasPrefix(upper, "RCPT TO:"):
+			log.rcptLine = raw
 			write("250 OK\r\n")
 		case strings.HasPrefix(upper, "DATA"):
 			log.data = true
@@ -665,42 +670,415 @@ func TestOrdinaryDeliveryPathRegression(t *testing.T) {
 	}
 }
 
-func TestMultiMXUTF8Fallback(t *testing.T) {
-	mxBad := &fakeMX{extUTF8: false, ext8bit: true}
-	mxGood := &fakeMX{extUTF8: true, ext8bit: true}
-	addrBad := startFakeMX(t, mxBad)
-	addrGood := startFakeMX(t, mxGood)
+type mapDialer struct {
+	m map[string]string // "ip:25" -> local listen addr
+}
 
+func (m mapDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	target, ok := m.m[address]
+	if !ok {
+		return nil, &net.OpError{Op: "dial", Net: network, Err: errUnmapped(address)}
+	}
+	var nd net.Dialer
+	return nd.DialContext(ctx, "tcp", target)
+}
+
+type errUnmapped string
+
+func (e errUnmapped) Error() string { return "unmapped " + string(e) }
+
+func (mx *fakeMX) anyMail() bool {
+	return len(mx.mailLines()) > 0
+}
+
+func multiMX(t *testing.T, bad, good *fakeMX) (*deliver.Deliverer, *queue.Queue) {
+	t.Helper()
+	addrBad := startFakeMX(t, bad)
+	addrGood := startFakeMX(t, good)
+	ipBad := net.ParseIP("10.255.200.1")
+	ipGood := net.ParseIP("10.255.200.2")
 	q := openQueue(t)
 	d := deliver.New(deliverCfg(), q, memLog{})
-	hostBad, _, _ := net.SplitHostPort(addrBad)
-	hostGood, _, _ := net.SplitHostPort(addrGood)
 	d.SetResolver(&fakeResolver{
 		mx: map[string][]*net.MX{"ex.com": {
 			{Host: "mx1.ex.com.", Pref: 10},
 			{Host: "mx2.ex.com.", Pref: 20},
 		}},
 		ips: map[string][]net.IP{
-			"mx1.ex.com": {net.ParseIP(hostBad)},
-			"mx2.ex.com": {net.ParseIP(hostGood)},
+			"mx1.ex.com": {ipBad},
+			"mx2.ex.com": {ipGood},
 		},
 	})
-	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
-		var nd net.Dialer
-		_, port, _ := net.SplitHostPort(address)
-		_, pBad, _ := net.SplitHostPort(addrBad)
-		if port == pBad {
-			return nd.DialContext(ctx, "tcp", addrBad)
-		}
-		return nd.DialContext(ctx, "tcp", addrGood)
-	}))
+	d.SetDialer(mapDialer{m: map[string]string{
+		net.JoinHostPort(ipBad.String(), "25"):  addrBad,
+		net.JoinHostPort(ipGood.String(), "25"): addrGood,
+	}})
+	return d, q
+}
+
+func TestMultiMXUTF8Fallback(t *testing.T) {
+	mxBad := &fakeMX{extUTF8: false, ext8bit: true}
+	mxGood := &fakeMX{extUTF8: true, ext8bit: true}
+	d, q := multiMX(t, mxBad, mxGood)
 	addEnvelope(t, q, "mxf", "björn@ex.com", "b@ex.com", "ex.com", true, false, nil)
 	cancel, done := runDeliverer(t, d)
 	await(t, mxGood.dataDone, 4*time.Second, "good MX DATA")
+	awaitSession(t, mxBad, 3*time.Second)
 	cancel()
 	<-done
-	if mxBad.anyData() {
-		t.Fatal("bad MX must not receive DATA")
+	if mxBad.anyData() || mxBad.anyMail() {
+		t.Fatal("bad MX must not receive MAIL/DATA")
 	}
-	_ = hostGood
+	if mxBad.conns.Load() != 1 || mxGood.conns.Load() != 1 {
+		t.Fatalf("conns bad=%d good=%d", mxBad.conns.Load(), mxGood.conns.Load())
+	}
+	lines := mxGood.mailLines()
+	if len(lines) == 0 || !strings.Contains(lines[0], "SMTPUTF8") {
+		t.Fatalf("good MAIL=%v", lines)
+	}
+}
+
+func TestMultiMX8BitFallback(t *testing.T) {
+	mxBad := &fakeMX{extUTF8: true, ext8bit: false}
+	mxGood := &fakeMX{extUTF8: true, ext8bit: true}
+	d, q := multiMX(t, mxBad, mxGood)
+	body := []byte("From: a@ex.com\r\nTo: b@ex.com\r\nSubject: t\r\n\r\n" + "caf\xc3\xa9\r\n")
+	addEnvelope(t, q, "mx8", "a@ex.com", "b@ex.com", "ex.com", false, true, body)
+	cancel, done := runDeliverer(t, d)
+	await(t, mxGood.dataDone, 4*time.Second, "good DATA")
+	awaitSession(t, mxBad, 3*time.Second)
+	cancel()
+	<-done
+	if mxBad.anyMail() || mxBad.anyData() {
+		t.Fatal("bad MX MAIL/DATA")
+	}
+	if mxBad.conns.Load() != 1 || mxGood.conns.Load() != 1 {
+		t.Fatalf("conns bad=%d good=%d", mxBad.conns.Load(), mxGood.conns.Load())
+	}
+	lines := mxGood.mailLines()
+	if len(lines) == 0 || !strings.Contains(lines[0], "BODY=8BITMIME") {
+		t.Fatalf("MAIL=%v", lines)
+	}
+}
+
+func TestMultiMXBothCapabilities(t *testing.T) {
+	mxPartial := &fakeMX{extUTF8: true, ext8bit: false}
+	mxFull := &fakeMX{extUTF8: true, ext8bit: true}
+	d, q := multiMX(t, mxPartial, mxFull)
+	body := []byte("From: björn@ex.com\r\nTo: b@ex.com\r\nSubject: t\r\n\r\n" + "caf\xc3\xa9\r\n")
+	addEnvelope(t, q, "mxb", "björn@ex.com", "b@ex.com", "ex.com", true, true, body)
+	cancel, done := runDeliverer(t, d)
+	await(t, mxFull.dataDone, 4*time.Second, "full DATA")
+	awaitSession(t, mxPartial, 3*time.Second)
+	cancel()
+	<-done
+	if mxPartial.anyMail() || mxPartial.anyData() {
+		t.Fatal("partial MX must not receive MAIL/DATA")
+	}
+	lines := mxFull.mailLines()
+	if len(lines) != 1 || !strings.Contains(lines[0], "SMTPUTF8") || !strings.Contains(lines[0], "BODY=8BITMIME") {
+		t.Fatalf("MAIL=%v", lines)
+	}
+}
+
+func TestMultiMXAllLackCapability(t *testing.T) {
+	mx1 := &fakeMX{extUTF8: false, ext8bit: true}
+	mx2 := &fakeMX{extUTF8: false, ext8bit: true}
+	addr1 := startFakeMX(t, mx1)
+	addr2 := startFakeMX(t, mx2)
+	ip1 := net.ParseIP("10.255.200.1")
+	ip2 := net.ParseIP("10.255.200.2")
+	q := openQueue(t)
+	cfg := deliverCfg()
+	cfg.Delivery.MaxAttempts = 1
+	d := deliver.New(cfg, q, memLog{})
+	d.SetResolver(&fakeResolver{
+		mx: map[string][]*net.MX{"ex.com": {
+			{Host: "mx1.ex.com.", Pref: 10},
+			{Host: "mx2.ex.com.", Pref: 20},
+		}},
+		ips: map[string][]net.IP{
+			"mx1.ex.com": {ip1},
+			"mx2.ex.com": {ip2},
+		},
+	})
+	d.SetDialer(mapDialer{m: map[string]string{
+		net.JoinHostPort(ip1.String(), "25"): addr1,
+		net.JoinHostPort(ip2.String(), "25"): addr2,
+	}})
+	addEnvelope(t, q, "mxall", "björn@ex.com", "b@ex.com", "ex.com", true, false, nil)
+	cancel, done := runDeliverer(t, d)
+	awaitSession(t, mx1, 3*time.Second)
+	awaitSession(t, mx2, 3*time.Second)
+	cancel()
+	<-done
+	if mx1.anyData() || mx2.anyData() {
+		t.Fatal("no DATA")
+	}
+	ids, _ := q.DeadIDs()
+	if len(ids) == 0 {
+		t.Fatal("expected dead")
+	}
+	env, _ := q.LoadDead(ids[0])
+	if !strings.Contains(env.Recipients[0].Detail, "SMTPUTF8") {
+		t.Fatalf("detail=%q", env.Recipients[0].Detail)
+	}
+}
+
+func TestMultiMXMixedNetworkAndCapability(t *testing.T) {
+	mxCap := &fakeMX{extUTF8: false, ext8bit: true}
+	addrCap := startFakeMX(t, mxCap)
+	ipNet := net.ParseIP("10.255.201.1")
+	ipCap := net.ParseIP("10.255.201.2")
+	q := openQueue(t)
+	cfg := deliverCfg()
+	cfg.Delivery.MaxAttempts = 1
+	d := deliver.New(cfg, q, memLog{})
+	d.SetResolver(&fakeResolver{
+		mx: map[string][]*net.MX{"ex.com": {
+			{Host: "mx-net.ex.com.", Pref: 10},
+			{Host: "mx-cap.ex.com.", Pref: 20},
+		}},
+		ips: map[string][]net.IP{
+			"mx-net.ex.com": {ipNet},
+			"mx-cap.ex.com": {ipCap},
+		},
+	})
+	d.SetDialer(mapDialer{m: map[string]string{
+		net.JoinHostPort(ipCap.String(), "25"): addrCap,
+	}})
+	addEnvelope(t, q, "mix1", "björn@ex.com", "b@ex.com", "ex.com", true, false, nil)
+	cancel, done := runDeliverer(t, d)
+	awaitSession(t, mxCap, 3*time.Second)
+	cancel()
+	<-done
+	if mxCap.anyData() {
+		t.Fatal("no DATA")
+	}
+	ids, _ := q.DeadIDs()
+	if len(ids) == 0 {
+		t.Fatal("expected terminal")
+	}
+}
+
+func TestTLSHandshakeFailure(t *testing.T) {
+	cert, pool, _ := mintCert(t, "mx.ex.com")
+	mx := &fakeMX{startTLS: true, cert: cert, brokenTLS: true, ext8bit: true}
+	addr := startFakeMX(t, mx)
+	q := openQueue(t)
+	cfg := deliverCfg()
+	cfg.Delivery.MaxAttempts = 1
+	d := deliver.New(cfg, q, memLog{})
+	d.SetTLSRootCAs(pool)
+	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+	addEnvelope(t, q, "tls7", "a@ex.com", "b@ex.com", "ex.com", false, false, nil)
+	cancel, done := runDeliverer(t, d)
+	awaitSession(t, mx, 3*time.Second)
+	cancel()
+	<-done
+	if mx.anyData() || mx.anyMail() {
+		t.Fatal("no MAIL/DATA after handshake failure")
+	}
+	if mx.conns.Load() != 1 {
+		t.Fatalf("no policy-changing reconnect, conns=%d", mx.conns.Load())
+	}
+}
+
+func TestTLSCandidateIPRetryKeepsPolicy(t *testing.T) {
+	cert, pool, _ := mintCert(t, "mx.ex.com")
+	mx := &fakeMX{startTLS: true, cert: cert, ext8bit: true}
+	addr := startFakeMX(t, mx)
+	ipBad := net.ParseIP("10.255.202.1")
+	ipGood := net.ParseIP("10.255.202.2")
+	q := openQueue(t)
+	cfg := deliverCfg()
+	cfg.Delivery.RequireValidMXTLSCert = true
+	d := deliver.New(cfg, q, memLog{})
+	d.SetTLSRootCAs(pool)
+	// Single A Rr then map: first dial fails, second succeeds — force order via sequential IPs
+	// where dialer fails the bad IP only.
+	d.SetResolver(&fakeResolver{
+		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com.", Pref: 10}}},
+		ips: map[string][]net.IP{"mx.ex.com": {ipBad, ipGood}},
+	})
+	var dials []string
+	var mu sync.Mutex
+	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
+		mu.Lock()
+		dials = append(dials, address)
+		mu.Unlock()
+		host, _, _ := net.SplitHostPort(address)
+		if host == ipBad.String() {
+			return nil, errors.New("network down")
+		}
+		var nd net.Dialer
+		return nd.DialContext(ctx, "tcp", addr)
+	}))
+	addEnvelope(t, q, "ipfail", "a@ex.com", "b@ex.com", "ex.com", false, false, nil)
+	cancel, done := runDeliverer(t, d)
+	await(t, mx.dataDone, 4*time.Second, "DATA")
+	cancel()
+	<-done
+	mu.Lock()
+	sawBad, sawGood := false, false
+	for _, a := range dials {
+		if strings.Contains(a, ipBad.String()) {
+			sawBad = true
+		}
+		if strings.Contains(a, ipGood.String()) {
+			sawGood = true
+		}
+	}
+	mu.Unlock()
+	// Shuffle may put good first; require eventual success with at most one conn and verified TLS.
+	if !sawGood {
+		t.Fatalf("expected dial good IP, dials=%v", dials)
+	}
+	if mx.conns.Load() != 1 {
+		t.Fatalf("conns=%d", mx.conns.Load())
+	}
+	// If bad was tried, policy stayed constant + resumed on other IP.
+	_ = sawBad
+}
+
+func TestIDNARoutingUsesALabel(t *testing.T) {
+	mx := &fakeMX{extUTF8: true, ext8bit: true}
+	addr := startFakeMX(t, mx)
+	host, _, _ := net.SplitHostPort(addr)
+	q := openQueue(t)
+	d := deliver.New(deliverCfg(), q, memLog{})
+
+	unicodeDomain := "exämple.com"
+	routing, err := mailbox.RoutingDomain(unicodeDomain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if routing == unicodeDomain || strings.Contains(routing, "ä") {
+		t.Fatalf("expected A-label got %q", routing)
+	}
+
+	var lookedMX []string
+	res := &recordingResolver{
+		fakeResolver: fakeResolver{
+			mx:  map[string][]*net.MX{routing: {{Host: "mx." + routing + ".", Pref: 10}}},
+			ips: map[string][]net.IP{"mx." + routing: {net.ParseIP(host)}},
+		},
+		mxLookups: &lookedMX,
+	}
+	d.SetResolver(res)
+	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
+		var nd net.Dialer
+		return nd.DialContext(ctx, "tcp", addr)
+	}))
+
+	rcpt := "User@exämple.com"
+	addEnvelope(t, q, "idna1", "a@ex.com", rcpt, routing, true, false, nil)
+	cancel, done := runDeliverer(t, d)
+	await(t, mx.dataDone, 3*time.Second, "DATA")
+	cancel()
+	<-done
+
+	if len(lookedMX) == 0 || lookedMX[0] != routing {
+		t.Fatalf("MX lookups=%v want first %q", lookedMX, routing)
+	}
+	for _, name := range lookedMX {
+		if strings.Contains(name, "ä") {
+			t.Fatalf("DNS used U-label %q", name)
+		}
+	}
+	mx.mu.Lock()
+	rcptLine := ""
+	if len(mx.sessions) > 0 {
+		rcptLine = mx.sessions[0].rcptLine
+	}
+	mx.mu.Unlock()
+	if !strings.Contains(rcptLine, "User@exämple.com") {
+		t.Fatalf("RCPT must preserve submitted mailbox, got %q", rcptLine)
+	}
+}
+
+type recordingResolver struct {
+	fakeResolver
+	mxLookups *[]string
+}
+
+func (r *recordingResolver) LookupMX(ctx context.Context, name string) ([]*net.MX, error) {
+	*r.mxLookups = append(*r.mxLookups, name)
+	return r.fakeResolver.LookupMX(ctx, name)
+}
+
+func TestQueueDomainMismatchRejected(t *testing.T) {
+	q := openQueue(t)
+	now := time.Now()
+	env := &queue.Envelope{
+		ID: "badmeta", Username: "u", Sender: "a@ex.com",
+		Recipients:  []queue.Recipient{{Address: "b@ex.com", Domain: "other.com", Status: queue.StatusPending}},
+		Created:     now,
+		NextAttempt: now,
+	}
+	if err := q.Add(env, []byte("From: a@ex.com\r\nTo: b@ex.com\r\nSubject: t\r\n\r\nHi\r\n")); err == nil {
+		t.Fatal("expected domain mismatch")
+	}
+}
+
+func TestQueueDomainALabelAccepted(t *testing.T) {
+	q := openQueue(t)
+	now := time.Now()
+	routing, err := mailbox.RoutingDomain("exämple.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := &queue.Envelope{
+		ID: "goodmeta", Username: "u", Sender: "a@ex.com",
+		Recipients:  []queue.Recipient{{Address: "b@exämple.com", Domain: routing, Status: queue.StatusPending}},
+		Created:     now,
+		NextAttempt: now,
+		SMTPUTF8:    true,
+	}
+	if err := q.Add(env, []byte("From: a@ex.com\r\nTo: b@exämple.com\r\nSubject: t\r\n\r\nHi\r\n")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBothParamsRequiredSingleMAIL(t *testing.T) {
+	mx := &fakeMX{extUTF8: true, ext8bit: true}
+	addr := startFakeMX(t, mx)
+	q := openQueue(t)
+	d := deliver.New(deliverCfg(), q, memLog{})
+	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+	body := []byte("From: björn@ex.com\r\nTo: b@ex.com\r\nSubject: t\r\n\r\n" + "caf\xc3\xa9\r\n")
+	addEnvelope(t, q, "bothp", "björn@ex.com", "b@ex.com", "ex.com", true, true, body)
+	cancel, done := runDeliverer(t, d)
+	await(t, mx.dataDone, 3*time.Second, "DATA")
+	cancel()
+	<-done
+	lines := mx.mailLines()
+	if len(lines) != 1 {
+		t.Fatalf("want one MAIL, got %v", lines)
+	}
+	if !strings.Contains(lines[0], "SMTPUTF8") || !strings.Contains(lines[0], "BODY=8BITMIME") {
+		t.Fatalf("MAIL=%s", lines[0])
+	}
+}
+
+func TestASCIIRCPTCasingPreserved(t *testing.T) {
+	mx := &fakeMX{ext8bit: true}
+	addr := startFakeMX(t, mx)
+	q := openQueue(t)
+	d := deliver.New(deliverCfg(), q, memLog{})
+	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+	addEnvelope(t, q, "case2", "a@ex.com", "User.Name@ex.com", "ex.com", false, false, nil)
+	cancel, done := runDeliverer(t, d)
+	await(t, mx.dataDone, 3*time.Second, "DATA")
+	cancel()
+	<-done
+	mx.mu.Lock()
+	rcptLine := ""
+	if len(mx.sessions) > 0 {
+		rcptLine = mx.sessions[0].rcptLine
+	}
+	mx.mu.Unlock()
+	if !strings.Contains(rcptLine, "User.Name@ex.com") {
+		t.Fatalf("RCPT=%q", rcptLine)
+	}
 }
