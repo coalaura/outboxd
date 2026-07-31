@@ -19,6 +19,8 @@ type Hooks struct {
 	AfterRename func(oldpath, newpath string) error
 	// AfterSyncDir is called after a successful directory Sync.
 	AfterSyncDir func(path string) error
+	// BeforeSyncDir is called immediately before syncing a directory.
+	BeforeSyncDir func(path string) error
 	// BeforeRename is called just before rename.
 	BeforeRename func(oldpath, newpath string) error
 }
@@ -173,9 +175,12 @@ func Rename(oldpath, newpath string) error {
 	if err := Sync(filepath.Dir(newpath)); err != nil {
 		return err
 	}
-	// Also sync source parent when different.
+	// A cross-directory rename is durable only after both the destination entry
+	// and the source removal have been persisted.
 	if filepath.Dir(oldpath) != filepath.Dir(newpath) {
-		_ = Sync(filepath.Dir(oldpath))
+		if err := Sync(filepath.Dir(oldpath)); err != nil {
+			return err
+		}
 	}
 	return nil
 }

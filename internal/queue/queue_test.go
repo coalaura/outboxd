@@ -631,6 +631,40 @@ func TestBuryAtomic(t *testing.T) {
 	}
 }
 
+func TestBuryDoesNotHideReadyMarkerError(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("bury-bad-marker")
+	if err := q.Add(env, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Recipients[0].Status = StatusFailed
+	if err := os.WriteFile(filepath.Join(root, dirReady, got.ID, addStateName), []byte("invalid"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, dirDead, got.ID), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := q.Bury(got); err == nil {
+		t.Fatal("Bury should report the invalid ready marker")
+	}
+	if q.Len() != 1 {
+		t.Fatalf("Len=%d want 1", q.Len())
+	}
+	if messages, bytes := q.Stats(); messages != 1 || bytes != 4 {
+		t.Fatalf("Stats=(%d, %d) want (1, 4)", messages, bytes)
+	}
+	if _, err := os.Stat(filepath.Join(root, dirReady, got.ID)); err != nil {
+		t.Fatalf("ready entry removed: %v", err)
+	}
+}
+
 func TestFinishCrashSafeTrash(t *testing.T) {
 	clearHooks(t)
 	root := t.TempDir()
@@ -685,6 +719,287 @@ func TestFinishCrashSafeTrash(t *testing.T) {
 	entries, _ := os.ReadDir(filepath.Join(root, dirTrash))
 	if len(entries) != 0 {
 		t.Fatalf("trash not cleaned: %v", entries)
+	}
+}
+
+func TestFinishIsIdempotentByID(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	a := testEnv("finish-a")
+	b := testEnv("finish-b")
+	a.NextAttempt = time.Now().Add(-time.Minute)
+	b.NextAttempt = time.Now().Add(-time.Second)
+	if err := q.Add(a, []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Add(b, []byte("bbbbb")); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != a.ID {
+		t.Fatalf("Next ID=%s want %s", got.ID, a.ID)
+	}
+	if err := q.Finish(got); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Finish(got); err != nil {
+		t.Fatalf("second Finish: %v", err)
+	}
+	messages, bytes := q.Stats()
+	if messages != 1 || bytes != 5 {
+		t.Fatalf("Stats=(%d, %d) want (1, 5)", messages, bytes)
+	}
+}
+
+func TestTerminalMovesReconcilePostRenameErrors(t *testing.T) {
+	for _, operation := range []string{"finish", "bury"} {
+		for _, failure := range []string{"after_rename", "before_source_sync"} {
+			t.Run(operation+"/"+failure, func(t *testing.T) {
+				clearHooks(t)
+				root := t.TempDir()
+				q := mustOpen(t, root, Limits{})
+				env := testEnv(operation + "-" + failure)
+				if err := q.Add(env, []byte("body")); err != nil {
+					t.Fatal(err)
+				}
+				got, err := q.Next(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				got.Recipients[0].Status = StatusFailed
+
+				destination := dirTrash
+				if operation == "bury" {
+					destination = dirDead
+				}
+				disk.SetHooks(disk.Hooks{
+					AfterRename: func(oldpath, newpath string) error {
+						if failure == "after_rename" && filepath.Base(filepath.Dir(newpath)) == destination {
+							return errors.New("inject after state rename")
+						}
+						return nil
+					},
+					BeforeSyncDir: func(path string) error {
+						if failure == "before_source_sync" && filepath.Clean(path) == filepath.Join(root, dirReady) {
+							return errors.New("inject source sync failure")
+						}
+						return nil
+					},
+				})
+
+				if operation == "finish" {
+					err = q.Finish(got)
+				} else {
+					err = q.Bury(got)
+				}
+				if err == nil {
+					t.Fatal("operation should report the injected durability error")
+				}
+				disk.SetHooks(disk.Hooks{})
+
+				if q.Len() != 0 {
+					t.Fatalf("Len=%d want 0", q.Len())
+				}
+				if messages, bytes := q.Stats(); messages != 0 || bytes != 0 {
+					t.Fatalf("Stats=(%d, %d) want (0, 0)", messages, bytes)
+				}
+				if _, err := os.Stat(filepath.Join(root, dirReady, got.ID)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("ready entry remains: %v", err)
+				}
+				if operation == "bury" {
+					if _, err := os.Stat(filepath.Join(root, dirDead, got.ID, bodyName)); err != nil {
+						t.Fatalf("dead body: %v", err)
+					}
+					if err := q.Bury(got); err != nil {
+						t.Fatalf("idempotent Bury: %v", err)
+					}
+					if q.Len() != 0 {
+						t.Fatalf("idempotent Bury scheduled phantom entry")
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestReviveDeadReservesCapacityAndRollsBack(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{MaxMessages: 1})
+	dead := testEnv("revive-dead")
+	if err := q.Add(dead, []byte("dead")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Recipients[0].Status = StatusFailed
+	got.Recipients[0].Detail = "permanent diagnostic"
+	if err := q.Bury(got); err != nil {
+		t.Fatal(err)
+	}
+	originalPath := filepath.Join(root, dirDead, dead.ID, metaName)
+	original, err := os.ReadFile(originalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := q.Add(testEnv("capacity-holder"), []byte("live")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.ReviveDead(dead.ID); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("ReviveDead want ErrQueueFull, got %v", err)
+	}
+	afterQuota, err := os.ReadFile(originalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterQuota) != string(original) {
+		t.Fatal("quota failure changed dead metadata")
+	}
+
+	holder, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Finish(holder); err != nil {
+		t.Fatal(err)
+	}
+	disk.SetHooks(disk.Hooks{
+		BeforeRename: func(oldpath, newpath string) error {
+			if filepath.Clean(oldpath) == filepath.Join(root, dirDead, dead.ID) &&
+				filepath.Clean(newpath) == filepath.Join(root, dirReady, dead.ID) {
+				return errors.New("inject revive rename failure")
+			}
+			return nil
+		},
+	})
+	if _, err := q.ReviveDead(dead.ID); err == nil {
+		t.Fatal("ReviveDead should report rename failure")
+	}
+	disk.SetHooks(disk.Hooks{})
+	afterRename, err := os.ReadFile(originalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterRename) != string(original) {
+		t.Fatal("rename failure changed dead metadata")
+	}
+	if messages, bytes := q.Stats(); messages != 0 || bytes != 0 {
+		t.Fatalf("Stats=(%d, %d) want (0, 0)", messages, bytes)
+	}
+
+	revived, err := q.ReviveDead(dead.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revived.Recipients[0].Status != StatusPending || revived.LastError != "" {
+		t.Fatalf("unexpected revived envelope: %#v", revived)
+	}
+	if messages, bytes := q.Stats(); messages != 1 || bytes != 4 {
+		t.Fatalf("Stats=(%d, %d) want (1, 4)", messages, bytes)
+	}
+	q2 := mustReopen(t, q, root, Limits{MaxMessages: 1})
+	if q2.Len() != 1 {
+		t.Fatalf("reopened Len=%d want 1", q2.Len())
+	}
+}
+
+func TestOpenCompletesInterruptedRevive(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("revive-crash")
+	if err := q.Add(env, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Recipients[0].Status = StatusFailed
+	got.Recipients[0].Detail = "permanent"
+	got.Attempts = 3
+	got.LastError = "failed"
+	if err := q.Bury(got); err != nil {
+		t.Fatal(err)
+	}
+
+	got.Recipients[0].Status = StatusPending
+	got.Recipients[0].Detail = ""
+	got.Attempts = 0
+	got.LastError = ""
+	deadDir := filepath.Join(root, dirDead, got.ID)
+	if err := q.writeMeta(filepath.Join(deadDir, reviveMetaName), got); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(deadDir, filepath.Join(root, dirReady, got.ID)); err != nil {
+		t.Fatal(err)
+	}
+
+	q2 := mustReopen(t, q, root, Limits{})
+	if q2.Len() != 1 {
+		t.Fatalf("Len=%d want 1", q2.Len())
+	}
+	revived, err := q2.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revived.Recipients[0].Status != StatusPending || revived.Attempts != 0 || revived.LastError != "" {
+		t.Fatalf("interrupted revive not completed: %#v", revived)
+	}
+	if _, err := os.Stat(filepath.Join(root, dirReady, got.ID, reviveMetaName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staged revive metadata remains: %v", err)
+	}
+}
+
+func TestSameIDTransitionHasSingleOwner(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("transition-owner")
+	if err := q.Add(env, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Recipients[0].Status = StatusFailed
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	disk.SetHooks(disk.Hooks{
+		BeforeRename: func(oldpath, newpath string) error {
+			if filepath.Clean(oldpath) == filepath.Join(root, dirReady, got.ID) &&
+				filepath.Clean(newpath) == filepath.Join(root, dirDead, got.ID) {
+				close(entered)
+				<-release
+			}
+			return nil
+		},
+	})
+	done := make(chan error, 1)
+	go func() { done <- q.Bury(got) }()
+	<-entered
+	if err := q.Bury(got); !errors.Is(err, ErrQueueBusy) {
+		t.Fatalf("concurrent Bury want ErrQueueBusy, got %v", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	disk.SetHooks(disk.Hooks{})
+	if q.Len() != 0 {
+		t.Fatalf("Len=%d want 0", q.Len())
+	}
+	if messages, bytes := q.Stats(); messages != 0 || bytes != 0 {
+		t.Fatalf("Stats=(%d, %d) want (0, 0)", messages, bytes)
 	}
 }
 

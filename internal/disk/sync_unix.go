@@ -10,6 +10,11 @@ import (
 
 // Sync flushes a directory entry so renames survive a crash.
 func Sync(path string) error {
+	if h := currentHooks(); h.BeforeSyncDir != nil {
+		if err := h.BeforeSyncDir(path); err != nil {
+			return err
+		}
+	}
 	directory, err := os.Open(path)
 	if err != nil {
 		return err

@@ -55,9 +55,10 @@ const (
 )
 
 const (
-	metaName     = "meta.json"
-	bodyName     = "message.eml"
-	addStateName = "add.state"
+	metaName       = "meta.json"
+	bodyName       = "message.eml"
+	addStateName   = "add.state"
+	reviveMetaName = "revive.json"
 
 	// Equal-length states allow the acceptance transition to update the
 	// already-durable marker in place without another directory mutation.
@@ -130,17 +131,19 @@ type Queue struct {
 	// FreeDisk is optional; when set, Add consults it for MinFreeDisk.
 	FreeDisk func(path string) (int64, error)
 
-	mu       sync.Mutex
-	pending  schedule
-	notify   chan struct{}
-	count    int
-	bytes    int64
-	reserved int   // in-flight Add reservations (count)
-	resBytes int64 // in-flight Add reservations (bytes)
+	mu            sync.Mutex
+	pending       schedule
+	notify        chan struct{}
+	count         int
+	bytes         int64
+	accounted     map[string]int64
+	transitioning map[string]struct{}
+	reserved      int   // in-flight Add reservations (count)
+	resBytes      int64 // in-flight Add reservations (bytes)
 
 	// lock is the exclusive process lock on <root>/.lock (nil for read-only).
 	lock *disk.FileLock
-	// readOnly queues skip migration/recovery/schedule and reject mutations.
+	// readOnly queues skip recovery/scheduling and reject mutations.
 	readOnly bool
 
 	// Corrupt holds reportable quarantine events from Open.
@@ -247,6 +250,8 @@ var (
 	ErrInvalidID = errors.New("invalid queue id")
 	// ErrReadOnly is returned when a mutating method is called on a read-only queue.
 	ErrReadOnly = errors.New("queue opened read-only")
+	// ErrQueueBusy is returned when another operation owns the same queue ID.
+	ErrQueueBusy = errors.New("queue id is busy")
 )
 
 func (q *Queue) rejectReadOnly() error {
@@ -284,6 +289,10 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 	if err := ValidateID(envelope.ID); err != nil {
 		return err
 	}
+	if err := q.beginTransition(envelope.ID); err != nil {
+		return err
+	}
+	defer q.endTransition(envelope.ID)
 	envelope.Size = int64(len(data))
 	if err := validateEnvelope(envelope); err != nil {
 		return err
@@ -348,11 +357,6 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 	if err := disk.Rename(tmpDir, readyDir); err != nil {
 		return err
 	}
-	// disk.Rename persists the destination parent. The source removal must also
-	// be durable before the marker can cross the acceptance point.
-	if err := disk.Sync(q.tmp); err != nil {
-		return err
-	}
 	if err := acceptAdd(filepath.Join(readyDir, addStateName)); err != nil {
 		if abortErr := q.quarantineDir(readyDir, envelope.ID+"-uncommitted"); abortErr == nil {
 			return err
@@ -372,8 +376,7 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 
 	q.mu.Lock()
 	q.releaseReserveLocked(envelope.Size)
-	q.count++
-	q.bytes += envelope.Size
+	q.noteAddedLocked(envelope.ID, envelope.Size)
 	heap.Push(&q.pending, envelope)
 	q.mu.Unlock()
 
@@ -485,6 +488,10 @@ func (q *Queue) Retry(envelope *Envelope) error {
 	if err := ValidateID(envelope.ID); err != nil {
 		return err
 	}
+	if err := q.beginTransition(envelope.ID); err != nil {
+		return err
+	}
+	defer q.endTransition(envelope.ID)
 	if err := validateEnvelope(envelope); err != nil {
 		// Still reschedule so we do not strand.
 		q.schedule(envelope)
@@ -509,23 +516,29 @@ func (q *Queue) Finish(envelope *Envelope) error {
 	if err := ValidateID(envelope.ID); err != nil {
 		return err
 	}
+	if err := q.beginTransition(envelope.ID); err != nil {
+		return err
+	}
+	defer q.endTransition(envelope.ID)
 	src := filepath.Join(q.ready, envelope.ID)
 	dst := filepath.Join(q.trash, envelope.ID+"."+strconv.FormatInt(time.Now().UnixNano(), 10))
 	if err := disk.Mkdir(q.trash); err != nil {
 		return err
 	}
-	if err := disk.Rename(src, dst); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+	moved, err := moveState(src, dst)
+	if err != nil {
+		if moved || errors.Is(err, os.ErrNotExist) {
 			// Already gone — treat as success for idempotence.
-			q.noteRemoved(envelope.Size)
-			return nil
+			q.noteRemoved(envelope.ID)
+			if !moved {
+				return nil
+			}
 		}
 		return err
 	}
 	_ = os.RemoveAll(dst)
 	_ = disk.Sync(q.trash)
-	_ = disk.Sync(q.ready)
-	q.noteRemoved(envelope.Size)
+	q.noteRemoved(envelope.ID)
 	return nil
 }
 
@@ -538,7 +551,23 @@ func (q *Queue) Bury(envelope *Envelope) error {
 	if err := ValidateID(envelope.ID); err != nil {
 		return err
 	}
+	if err := q.beginTransition(envelope.ID); err != nil {
+		return err
+	}
+	defer q.endTransition(envelope.ID)
 	if err := validateEnvelope(envelope); err != nil {
+		return err
+	}
+	src := filepath.Join(q.ready, envelope.ID)
+	dst := filepath.Join(q.dead, envelope.ID)
+	if err := acceptedDir(src); err != nil {
+		if _, srcErr := os.Stat(src); errors.Is(srcErr, os.ErrNotExist) {
+			if _, deadErr := os.Stat(dst); deadErr == nil {
+				q.noteRemoved(envelope.ID)
+				return nil
+			}
+		}
+		q.schedule(envelope)
 		return err
 	}
 	// Persist final status inside ready/ before the rename.
@@ -547,8 +576,6 @@ func (q *Queue) Bury(envelope *Envelope) error {
 		q.schedule(envelope)
 		return err
 	}
-	src := filepath.Join(q.ready, envelope.ID)
-	dst := filepath.Join(q.dead, envelope.ID)
 	// If a previous bury partially created dst, refuse to clobber blindly —
 	// move aside.
 	if _, err := os.Stat(dst); err == nil {
@@ -558,13 +585,16 @@ func (q *Queue) Bury(envelope *Envelope) error {
 			return err
 		}
 	}
-	if err := disk.Rename(src, dst); err != nil {
-		q.schedule(envelope)
+	moved, err := moveState(src, dst)
+	if err != nil {
+		if moved {
+			q.noteRemoved(envelope.ID)
+		} else {
+			q.schedule(envelope)
+		}
 		return err
 	}
-	_ = disk.Sync(q.dead)
-	_ = disk.Sync(q.ready)
-	q.noteRemoved(envelope.Size)
+	q.noteRemoved(envelope.ID)
 	return nil
 }
 
@@ -576,11 +606,35 @@ func (q *Queue) ReviveDead(id string) (*Envelope, error) {
 	if err := ValidateID(id); err != nil {
 		return nil, err
 	}
+	if err := q.beginTransition(id); err != nil {
+		return nil, err
+	}
+	defer q.endTransition(id)
 	src := filepath.Join(q.dead, id)
+	if err := acceptedDir(src); err != nil {
+		return nil, err
+	}
 	env, err := q.loadDir(src, id)
 	if err != nil {
 		return nil, err
 	}
+	q.mu.Lock()
+	if _, exists := q.accounted[id]; exists {
+		q.mu.Unlock()
+		return nil, fmt.Errorf("queue id %s is already ready", id)
+	}
+	if err := q.reserveLocked(env.Size, false); err != nil {
+		q.mu.Unlock()
+		return nil, err
+	}
+	q.mu.Unlock()
+	held := true
+	defer func() {
+		if held {
+			q.ReleaseReserve(env.Size)
+		}
+	}()
+
 	for i := range env.Recipients {
 		if env.Recipients[i].Status == StatusFailed {
 			env.Recipients[i].Status = StatusPending
@@ -593,23 +647,31 @@ func (q *Queue) ReviveDead(id string) (*Envelope, error) {
 	env.NextAttempt = time.Now()
 	env.DSNSent = false
 
-	if err := q.writeMeta(filepath.Join(src, metaName), env); err != nil {
-		return nil, err
+	stagedMeta := filepath.Join(src, reviveMetaName)
+	if err := q.writeMeta(stagedMeta, env); err != nil {
+		return nil, errors.Join(err, removeAndSync(stagedMeta))
 	}
 	dst := filepath.Join(q.ready, id)
-	if err := disk.Rename(src, dst); err != nil {
-		return nil, err
+	moved, moveErr := moveState(src, dst)
+	if moveErr != nil && !moved {
+		return nil, errors.Join(moveErr, removeAndSync(stagedMeta))
 	}
-	_ = disk.Sync(q.ready)
-	_ = disk.Sync(q.dead)
+	activated, activateErr := moveState(filepath.Join(dst, reviveMetaName), filepath.Join(dst, metaName))
+	if activateErr != nil && !activated {
+		return nil, errors.Join(moveErr, activateErr)
+	}
+	if activateErr != nil {
+		moveErr = errors.Join(moveErr, activateErr)
+	}
 
 	q.mu.Lock()
-	q.count++
-	q.bytes += env.Size
+	q.releaseReserveLocked(env.Size)
+	q.noteAddedLocked(env.ID, env.Size)
 	heap.Push(&q.pending, env)
 	q.mu.Unlock()
+	held = false
 	q.signal()
-	return env, nil
+	return env, moveErr
 }
 
 // DeadIDs lists dead-letter entry IDs.
@@ -698,21 +760,82 @@ func (q *Queue) signal() {
 	}
 }
 
-func (q *Queue) noteRemoved(size int64) {
-	q.mu.Lock()
-	if q.count > 0 {
-		q.count--
+func (q *Queue) noteAddedLocked(id string, size int64) {
+	if _, exists := q.accounted[id]; exists {
+		return
 	}
-	q.bytes -= size
-	if q.bytes < 0 {
-		q.bytes = 0
+	q.accounted[id] = size
+	q.count++
+	q.bytes += size
+}
+
+func (q *Queue) beginTransition(id string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if _, exists := q.transitioning[id]; exists {
+		return ErrQueueBusy
+	}
+	q.transitioning[id] = struct{}{}
+	return nil
+}
+
+func (q *Queue) endTransition(id string) {
+	q.mu.Lock()
+	delete(q.transitioning, id)
+	q.mu.Unlock()
+}
+
+func (q *Queue) noteRemoved(id string) {
+	q.mu.Lock()
+	size, exists := q.accounted[id]
+	if exists {
+		delete(q.accounted, id)
+		q.count--
+		q.bytes -= size
 	}
 	q.mu.Unlock()
 }
 
 func (q *Queue) storeReady(envelope *Envelope) error {
-	path := filepath.Join(q.ready, envelope.ID, metaName)
+	dir := filepath.Join(q.ready, envelope.ID)
+	if err := acceptedDir(dir); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, metaName)
 	return q.writeMeta(path, envelope)
+}
+
+func acceptedDir(dir string) error {
+	state, err := os.ReadFile(filepath.Join(dir, addStateName))
+	if err != nil {
+		return err
+	}
+	if string(state) != addAccepted {
+		return errors.New("queue entry is not accepted")
+	}
+	return nil
+}
+
+// moveState reports whether the rename changed the live namespace even when a
+// post-rename hook or parent sync returns an error.
+func moveState(src, dst string) (bool, error) {
+	err := disk.Rename(src, dst)
+	if err == nil {
+		return true, nil
+	}
+	_, srcErr := os.Stat(src)
+	_, dstErr := os.Stat(dst)
+	if errors.Is(srcErr, os.ErrNotExist) && dstErr == nil {
+		return true, err
+	}
+	return false, err
+}
+
+func removeAndSync(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return disk.Sync(filepath.Dir(path))
 }
 
 func (q *Queue) writeMeta(path string, envelope *Envelope) error {
@@ -755,19 +878,21 @@ func (q *Queue) loadDir(dir, expectID string) (*Envelope, error) {
 }
 
 // Open loads an existing spool directory, creating it when needed.
-// Acquires an exclusive lock on <directory>/.lock before any migration,
-// recovery, or scheduling. Call Close to release it.
+// Acquires an exclusive lock on <directory>/.lock before recovery or
+// scheduling. Call Close to release it.
 // Corrupt entries are relocated to corrupt/ and returned via Queue.Corrupt.
 func Open(directory string, limits Limits) (*Queue, error) {
 	q := &Queue{
-		root:   directory,
-		ready:  filepath.Join(directory, dirReady),
-		dead:   filepath.Join(directory, dirDead),
-		tmp:    filepath.Join(directory, dirTmp),
-		corr:   filepath.Join(directory, dirCorrupt),
-		trash:  filepath.Join(directory, dirTrash),
-		limits: limits,
-		notify: make(chan struct{}, 1),
+		root:          directory,
+		ready:         filepath.Join(directory, dirReady),
+		dead:          filepath.Join(directory, dirDead),
+		tmp:           filepath.Join(directory, dirTmp),
+		corr:          filepath.Join(directory, dirCorrupt),
+		trash:         filepath.Join(directory, dirTrash),
+		limits:        limits,
+		notify:        make(chan struct{}, 1),
+		accounted:     make(map[string]int64),
+		transitioning: make(map[string]struct{}),
 	}
 
 	if err := disk.Mkdir(q.root); err != nil {
@@ -810,14 +935,16 @@ func Open(directory string, limits Limits) (*Queue, error) {
 // Mutating methods return ErrReadOnly.
 func OpenReadOnly(directory string) (*Queue, error) {
 	return &Queue{
-		root:     directory,
-		ready:    filepath.Join(directory, dirReady),
-		dead:     filepath.Join(directory, dirDead),
-		tmp:      filepath.Join(directory, dirTmp),
-		corr:     filepath.Join(directory, dirCorrupt),
-		trash:    filepath.Join(directory, dirTrash),
-		notify:   make(chan struct{}, 1),
-		readOnly: true,
+		root:          directory,
+		ready:         filepath.Join(directory, dirReady),
+		dead:          filepath.Join(directory, dirDead),
+		tmp:           filepath.Join(directory, dirTmp),
+		corr:          filepath.Join(directory, dirCorrupt),
+		trash:         filepath.Join(directory, dirTrash),
+		notify:        make(chan struct{}, 1),
+		accounted:     make(map[string]int64),
+		transitioning: make(map[string]struct{}),
+		readOnly:      true,
 	}, nil
 }
 
@@ -907,6 +1034,15 @@ func (q *Queue) loadReady() error {
 			q.Corrupt = append(q.Corrupt, fmt.Errorf("ready %s: uncommitted or invalid add state", id))
 			continue
 		}
+		stagedMeta := filepath.Join(dir, reviveMetaName)
+		if _, err := os.Stat(stagedMeta); err == nil {
+			moved, moveErr := moveState(stagedMeta, filepath.Join(dir, metaName))
+			if moveErr != nil && !moved {
+				return fmt.Errorf("complete revive %s: %w", id, moveErr)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect revive %s: %w", id, err)
+		}
 		env, err := q.loadDir(dir, id)
 		if err != nil {
 			if qerr := q.quarantineDir(dir, id); qerr != nil {
@@ -915,8 +1051,7 @@ func (q *Queue) loadReady() error {
 			q.Corrupt = append(q.Corrupt, fmt.Errorf("ready %s: %w", id, err))
 			continue
 		}
-		q.count++
-		q.bytes += env.Size
+		q.noteAddedLocked(env.ID, env.Size)
 		heap.Push(&q.pending, env)
 	}
 	return nil
