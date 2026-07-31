@@ -9,7 +9,9 @@ import (
 // Hooks provide a narrow fault-injection seam for tests. Production code
 // leaves them nil.
 type Hooks struct {
-	// AfterSyncFile is called after a successful file.Sync during Commit/WriteExclusive.
+	// BeforeSyncFile is called immediately before syncing an open file.
+	BeforeSyncFile func(path string) error
+	// AfterSyncFile is called after a successful file sync.
 	AfterSyncFile func(path string) error
 	// AfterClose is called after a successful file.Close before rename.
 	AfterClose func(path string) error
@@ -37,6 +39,22 @@ func currentHooks() Hooks {
 	hookMu.RLock()
 	defer hookMu.RUnlock()
 	return hooks
+}
+
+// SyncFile flushes an open file and runs the file-sync fault hook.
+func SyncFile(file *os.File) error {
+	if h := currentHooks(); h.BeforeSyncFile != nil {
+		if err := h.BeforeSyncFile(file.Name()); err != nil {
+			return err
+		}
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if h := currentHooks(); h.AfterSyncFile != nil {
+		return h.AfterSyncFile(file.Name())
+	}
+	return nil
 }
 
 // Mkdir creates a directory and its parents with owner-only permissions.
@@ -144,7 +162,7 @@ func Rename(oldpath, newpath string) error {
 			return err
 		}
 	}
-	if err := os.Rename(oldpath, newpath); err != nil {
+	if err := rename(oldpath, newpath); err != nil {
 		return err
 	}
 	if h := currentHooks(); h.AfterRename != nil {
@@ -194,7 +212,7 @@ func commit(file *os.File, temp, path string, mode os.FileMode) error {
 		}
 	}
 
-	err = os.Rename(temp, path)
+	err = rename(temp, path)
 	if err != nil {
 		return err
 	}

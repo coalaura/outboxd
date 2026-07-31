@@ -14,6 +14,7 @@
 //	<root>/
 //	  tmp/<id>/          # under construction (not scheduled)
 //	  ready/<id>/        # durable, eligible for delivery
+//	    add.state         # versioned Add acceptance marker
 //	    meta.json
 //	    message.eml
 //	  dead/<id>/         # permanent failure / exhausted
@@ -22,8 +23,6 @@
 // Queue.Add builds under tmp/ and renames into ready/. Finish moves ready →
 // trash rename-delete. Bury moves ready → dead. Corrupt entries are moved to
 // corrupt/ with a logged error; they are never silently deleted.
-//
-// Legacy flat <id>.json + <id>.eml pairs are migrated into ready/<id>/ on Open.
 package queue
 
 import (
@@ -56,8 +55,14 @@ const (
 )
 
 const (
-	metaName = "meta.json"
-	bodyName = "message.eml"
+	metaName     = "meta.json"
+	bodyName     = "message.eml"
+	addStateName = "add.state"
+
+	// Equal-length states allow the acceptance transition to update the
+	// already-durable marker in place without another directory mutation.
+	addPending  = "outboxd-add-v1:pending \n"
+	addAccepted = "outboxd-add-v1:accepted\n"
 
 	dirReady   = "ready"
 	dirDead    = "dead"
@@ -270,8 +275,8 @@ func ValidateID(id string) error {
 }
 
 // Add durably stores a message and schedules it for immediate delivery.
-// On success the entry is complete under ready/; a crash mid-add leaves either
-// nothing visible to Next, or a tmp/ entry recovered on restart.
+// The accepted marker is the commit point: before it is synced, neither tmp/
+// nor a pending ready/ entry is recoverable as an accepted message.
 func (q *Queue) Add(envelope *Envelope, data []byte) error {
 	if err := q.rejectReadOnly(); err != nil {
 		return err
@@ -316,6 +321,11 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 		}
 	}()
 
+	statePath := filepath.Join(tmpDir, addStateName)
+	if err := disk.Write(statePath, []byte(addPending), 0600); err != nil {
+		return err
+	}
+
 	bodyPath := filepath.Join(tmpDir, bodyName)
 	if err := disk.Write(bodyPath, data, 0600); err != nil {
 		return err
@@ -338,8 +348,23 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 	if err := disk.Rename(tmpDir, readyDir); err != nil {
 		return err
 	}
-	if err := disk.Sync(q.ready); err != nil {
+	// disk.Rename persists the destination parent. The source removal must also
+	// be durable before the marker can cross the acceptance point.
+	if err := disk.Sync(q.tmp); err != nil {
 		return err
+	}
+	if err := acceptAdd(filepath.Join(readyDir, addStateName)); err != nil {
+		if abortErr := q.quarantineDir(readyDir, envelope.ID+"-uncommitted"); abortErr == nil {
+			return err
+		} else {
+			// If quarantine itself fails while an accepted marker is visible,
+			// report success rather than invite a duplicate retry for an entry
+			// that recovery will deliver.
+			state, readErr := os.ReadFile(filepath.Join(readyDir, addStateName))
+			if readErr != nil || string(state) != addAccepted {
+				return errors.Join(err, fmt.Errorf("quarantine failed add: %w", abortErr), readErr)
+			}
+		}
 	}
 
 	success = true
@@ -353,6 +378,54 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 	q.mu.Unlock()
 
 	q.signal()
+	return nil
+}
+
+// acceptAdd performs the sole Add acceptance transition. The marker already
+// has a durable directory entry, so only its fixed-size contents need syncing.
+// No fallible operation is reported after the successful Sync commit point.
+func acceptAdd(path string) error {
+	if len(addPending) != len(addAccepted) {
+		panic("queue Add states must have equal length")
+	}
+
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	if err := writeAddState(file, addAccepted); err != nil {
+		return rollbackAdd(file, err)
+	}
+	if err := disk.SyncFile(file); err != nil {
+		return rollbackAdd(file, err)
+	}
+
+	_ = file.Close()
+	return nil
+}
+
+func rollbackAdd(file *os.File, cause error) error {
+	// A failed commit must not leave accepted bytes recoverable after Add
+	// reports failure. A successful rollback sync restores that invariant.
+	if err := writeAddState(file, addPending); err != nil {
+		return errors.Join(cause, fmt.Errorf("rollback add state: %w", err))
+	}
+	if err := disk.SyncFile(file); err != nil {
+		return errors.Join(cause, fmt.Errorf("sync rolled-back add state: %w", err))
+	}
+	return cause
+}
+
+func writeAddState(file *os.File, state string) error {
+	n, err := file.WriteAt([]byte(state), 0)
+	if err != nil {
+		return err
+	}
+	if n != len(state) {
+		return io.ErrShortWrite
+	}
 	return nil
 }
 
@@ -716,10 +789,6 @@ func Open(directory string, limits Limits) (*Queue, error) {
 		}
 	}
 
-	if err := q.migrateLegacy(); err != nil {
-		_ = q.Close()
-		return nil, err
-	}
 	if err := q.recoverTmp(); err != nil {
 		_ = q.Close()
 		return nil, err
@@ -736,7 +805,7 @@ func Open(directory string, limits Limits) (*Queue, error) {
 }
 
 // OpenReadOnly opens a spool for inspection without taking the exclusive lock
-// and without migration, tmp recovery, trash cleanup, or schedule load.
+// and without tmp recovery, trash cleanup, or schedule load.
 // Supported: DeadIDs, LoadDead, ExportDead, ReadBody, Path, DeadDir.
 // Mutating methods return ErrReadOnly.
 func OpenReadOnly(directory string) (*Queue, error) {
@@ -762,97 +831,9 @@ func (q *Queue) Close() error {
 	return err
 }
 
-// OpenDefault is Open with unlimited quotas (backward compatible helper).
+// OpenDefault is Open with unlimited quotas.
 func OpenDefault(directory string) (*Queue, error) {
 	return Open(directory, Limits{})
-}
-
-func (q *Queue) migrateLegacy() error {
-	entries, err := os.ReadDir(q.root)
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		name := e.Name()
-		if !strings.HasSuffix(name, ".json") {
-			continue
-		}
-		id := strings.TrimSuffix(name, ".json")
-		if err := ValidateID(id); err != nil {
-			if moveErr := q.quarantineFile(filepath.Join(q.root, name), id+"-meta"); moveErr != nil {
-				return moveErr
-			}
-			q.Corrupt = append(q.Corrupt, fmt.Errorf("legacy metadata %s: invalid id: %w", name, err))
-			continue
-		}
-		metaPath := filepath.Join(q.root, name)
-		bodyPath := filepath.Join(q.root, id+".eml")
-		if _, err := os.Stat(bodyPath); err != nil {
-			if moveErr := q.quarantineFile(metaPath, id+"-meta-orphan"); moveErr != nil {
-				return moveErr
-			}
-			q.Corrupt = append(q.Corrupt, fmt.Errorf("legacy metadata %s without body", name))
-			continue
-		}
-		// Build temp dir and rename into ready.
-		env, err := readLegacy(metaPath)
-		if err != nil {
-			_ = q.quarantineFile(metaPath, id+"-meta-bad")
-			_ = q.quarantineFile(bodyPath, id+"-body-bad")
-			q.Corrupt = append(q.Corrupt, fmt.Errorf("legacy %s: %w", id, err))
-			continue
-		}
-		if env.ID != id {
-			_ = q.quarantineFile(metaPath, id+"-meta-mismatch")
-			_ = q.quarantineFile(bodyPath, id+"-body-mismatch")
-			q.Corrupt = append(q.Corrupt, fmt.Errorf("legacy %s: id mismatch %q", id, env.ID))
-			continue
-		}
-		tmpDir := filepath.Join(q.tmp, id)
-		_ = os.RemoveAll(tmpDir)
-		if err := disk.Mkdir(tmpDir); err != nil {
-			return err
-		}
-		body, err := os.ReadFile(bodyPath)
-		if err != nil {
-			return err
-		}
-		if err := disk.Write(filepath.Join(tmpDir, bodyName), body, 0600); err != nil {
-			return err
-		}
-		meta, _ := json.Marshal(env)
-		if err := disk.Write(filepath.Join(tmpDir, metaName), meta, 0600); err != nil {
-			return err
-		}
-		if err := disk.Sync(tmpDir); err != nil {
-			return err
-		}
-		if err := disk.Rename(tmpDir, filepath.Join(q.ready, id)); err != nil {
-			return err
-		}
-		_ = os.Remove(metaPath)
-		_ = os.Remove(bodyPath)
-	}
-
-	// Orphan legacy bodies without metadata.
-	entries, err = os.ReadDir(q.root)
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".eml") {
-			continue
-		}
-		id := strings.TrimSuffix(e.Name(), ".eml")
-		if err := q.quarantineFile(filepath.Join(q.root, e.Name()), id+"-body-orphan"); err != nil {
-			return err
-		}
-		q.Corrupt = append(q.Corrupt, fmt.Errorf("legacy body %s without metadata", e.Name()))
-	}
-	return nil
 }
 
 func (q *Queue) recoverTmp() error {
@@ -867,26 +848,12 @@ func (q *Queue) recoverTmp() error {
 		}
 		id := e.Name()
 		dir := filepath.Join(q.tmp, id)
-		// Complete the add only if both files exist and validate.
-		env, err := q.loadDir(dir, id)
-		if err != nil {
-			if qerr := q.quarantineDir(dir, id); qerr != nil {
-				return qerr
-			}
-			q.Corrupt = append(q.Corrupt, fmt.Errorf("tmp %s incomplete: %w", id, err))
-			continue
+		// tmp entries have not crossed Add's acceptance point. Completeness is
+		// not evidence of acceptance, so preserve them only for diagnosis.
+		if qerr := q.quarantineDir(dir, id+"-uncommitted"); qerr != nil {
+			return qerr
 		}
-		// Promote to ready — durable completion after crash mid-rename.
-		dst := filepath.Join(q.ready, id)
-		if _, err := os.Stat(dst); err == nil {
-			// ready already has it; drop tmp
-			_ = os.RemoveAll(dir)
-			continue
-		}
-		if err := disk.Rename(dir, dst); err != nil {
-			return err
-		}
-		_ = env // scheduled in loadReady
+		q.Corrupt = append(q.Corrupt, fmt.Errorf("tmp %s: interrupted uncommitted add", id))
 	}
 	return disk.Sync(q.tmp)
 }
@@ -925,6 +892,21 @@ func (q *Queue) loadReady() error {
 			q.Corrupt = append(q.Corrupt, fmt.Errorf("ready %s: %w", id, err))
 			continue
 		}
+		state, err := os.ReadFile(filepath.Join(dir, addStateName))
+		if err != nil {
+			if qerr := q.quarantineDir(dir, id); qerr != nil {
+				return qerr
+			}
+			q.Corrupt = append(q.Corrupt, fmt.Errorf("ready %s: read add state: %w", id, err))
+			continue
+		}
+		if string(state) != addAccepted {
+			if qerr := q.quarantineDir(dir, id+"-uncommitted"); qerr != nil {
+				return qerr
+			}
+			q.Corrupt = append(q.Corrupt, fmt.Errorf("ready %s: uncommitted or invalid add state", id))
+			continue
+		}
 		env, err := q.loadDir(dir, id)
 		if err != nil {
 			if qerr := q.quarantineDir(dir, id); qerr != nil {
@@ -949,7 +931,9 @@ func (q *Queue) quarantineDir(src, name string) error {
 		// fallback copy-ish remove
 		return fmt.Errorf("quarantine %s: %w", src, err)
 	}
-	_ = disk.Sync(q.corr)
+	if err := disk.Sync(filepath.Dir(src)); err != nil {
+		return fmt.Errorf("sync quarantine source %s: %w", src, err)
+	}
 	return nil
 }
 
@@ -990,21 +974,6 @@ func sanitize(s string) string {
 		return "x"
 	}
 	return b.String()
-}
-
-func readLegacy(path string) (*Envelope, error) {
-	body, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	env := new(Envelope)
-	if err := json.Unmarshal(body, env); err != nil {
-		return nil, err
-	}
-	if err := validateEnvelope(env); err != nil {
-		return nil, err
-	}
-	return env, nil
 }
 
 func validateEnvelope(e *Envelope) error {

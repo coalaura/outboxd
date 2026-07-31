@@ -74,6 +74,13 @@ func corruptEntries(t *testing.T, root string) []string {
 	return names
 }
 
+func writeAcceptedMarker(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, addStateName), []byte(addAccepted), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAddPersistsAndOpenRecovers(t *testing.T) {
 	clearHooks(t)
 	root := t.TempDir()
@@ -87,11 +94,16 @@ func TestAddPersistsAndOpenRecovers(t *testing.T) {
 
 	metaPath := filepath.Join(root, dirReady, "msg001", metaName)
 	bodyPath := filepath.Join(root, dirReady, "msg001", bodyName)
+	statePath := filepath.Join(root, dirReady, "msg001", addStateName)
 	if _, err := os.Stat(metaPath); err != nil {
 		t.Fatalf("meta missing: %v", err)
 	}
 	if _, err := os.Stat(bodyPath); err != nil {
 		t.Fatalf("body missing: %v", err)
+	}
+	state, err := os.ReadFile(statePath)
+	if err != nil || string(state) != addAccepted {
+		t.Fatalf("accepted state missing: %v %q", err, state)
 	}
 	gotBody, err := os.ReadFile(bodyPath)
 	if err != nil || string(gotBody) != string(body) {
@@ -172,6 +184,58 @@ func TestAddFaultInjectionRecoverable(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "after_ready_sync",
+			hooks: func(id string) disk.Hooks {
+				return disk.Hooks{
+					AfterSyncDir: func(path string) error {
+						if filepath.Base(path) == dirReady {
+							return errors.New("inject after ready sync")
+						}
+						return nil
+					},
+				}
+			},
+		},
+		{
+			name: "after_source_sync",
+			hooks: func(id string) disk.Hooks {
+				return disk.Hooks{
+					AfterSyncDir: func(path string) error {
+						if filepath.Clean(path) == filepath.Join(root, dirTmp) {
+							return errors.New("inject after source sync")
+						}
+						return nil
+					},
+				}
+			},
+		},
+		{
+			name: "before_acceptance_sync",
+			hooks: func(id string) disk.Hooks {
+				return disk.Hooks{
+					BeforeSyncFile: func(path string) error {
+						if filepath.Base(path) == addStateName {
+							return errors.New("inject before acceptance sync")
+						}
+						return nil
+					},
+				}
+			},
+		},
+		{
+			name: "at_acceptance_sync",
+			hooks: func(id string) disk.Hooks {
+				return disk.Hooks{
+					AfterSyncFile: func(path string) error {
+						if filepath.Base(path) == addStateName {
+							return errors.New("inject at acceptance sync")
+						}
+						return nil
+					},
+				}
+			},
+		},
 	}
 
 	for i, tc := range cases {
@@ -186,28 +250,117 @@ func TestAddFaultInjectionRecoverable(t *testing.T) {
 				t.Fatal("expected Add error")
 			}
 
-			// Must not silently finish: either nothing signed off as success
-			// in-memory for a half-written tmp, or ready is recoverable.
 			disk.SetHooks(disk.Hooks{})
 			q2 := mustReopen(t, q, root, Limits{})
-			// After body/meta fail tmp is cleaned or quarantined; after rename
-			// into ready the message may still recover on Open.
-			// Ensure we never drop the only successful case of silent full success
-			// without disk presence when Add reported success — here Add failed.
 			readyPath := filepath.Join(root, dirReady, id)
 			tmpPath := filepath.Join(root, dirTmp, id)
-			if _, err := os.Stat(readyPath); err == nil {
-				// Durable on disk: must surface via schedule or quarantine not delete.
-				if q2.Len() == 0 && len(q2.Corrupt) == 0 {
-					t.Fatal("ready dir present but neither scheduled nor corrupt")
-				}
+			if q2.Len() != 0 {
+				t.Fatalf("Add returned an error but restart scheduled %d message(s)", q2.Len())
 			}
-			// tmp partials must not sit forever as silent garbage without quarantine path on Open.
+			if _, err := os.Stat(readyPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("uncommitted ready entry was not quarantined: %v", err)
+			}
 			if _, err := os.Stat(tmpPath); err == nil {
-				// recoverTmp should have handled it
 				t.Fatal("tmp dir left after Open")
 			}
-			_ = q2
+		})
+	}
+}
+
+func TestRecoverTmpNeverPromotesCompleteUncommittedAdd(t *testing.T) {
+	clearHooks(t)
+	for _, state := range []struct {
+		name string
+		body []byte
+	}{
+		{name: "markerless"},
+		{name: "pending", body: []byte(addPending)},
+		{name: "accepted", body: []byte(addAccepted)},
+	} {
+		t.Run(state.name, func(t *testing.T) {
+			root := t.TempDir()
+			_ = mustOpen(t, root, Limits{}).Close()
+			id := "tmp-" + state.name
+			dir := filepath.Join(root, dirTmp, id)
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			env := testEnv(id)
+			message := []byte("complete body\r\n")
+			env.Size = int64(len(message))
+			meta, err := json.Marshal(env)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, bodyName), message, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, metaName), meta, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if state.body != nil {
+				if err := os.WriteFile(filepath.Join(dir, addStateName), state.body, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			q := mustOpen(t, root, Limits{})
+			if q.Len() != 0 {
+				t.Fatalf("uncommitted tmp entry was scheduled, Len=%d", q.Len())
+			}
+			if _, err := os.Stat(filepath.Join(root, dirReady, id)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("uncommitted tmp entry was promoted: %v", err)
+			}
+			if len(q.Corrupt) == 0 || len(corruptEntries(t, root)) == 0 {
+				t.Fatal("uncommitted tmp entry was not quarantined")
+			}
+		})
+	}
+}
+
+func TestOpenRejectsUncommittedReadyAdd(t *testing.T) {
+	clearHooks(t)
+	for _, state := range []struct {
+		name string
+		body []byte
+	}{
+		{name: "missing"},
+		{name: "pending", body: []byte(addPending)},
+		{name: "malformed", body: []byte("outboxd-add-v1:accept")},
+	} {
+		t.Run(state.name, func(t *testing.T) {
+			root := t.TempDir()
+			_ = mustOpen(t, root, Limits{}).Close()
+			id := "ready-" + state.name
+			dir := filepath.Join(root, dirReady, id)
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			message := []byte("complete body\r\n")
+			env := testEnv(id)
+			env.Size = int64(len(message))
+			meta, err := json.Marshal(env)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for name, body := range map[string][]byte{bodyName: message, metaName: meta} {
+				if err := os.WriteFile(filepath.Join(dir, name), body, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if state.body != nil {
+				if err := os.WriteFile(filepath.Join(dir, addStateName), state.body, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			q := mustOpen(t, root, Limits{})
+			if q.Len() != 0 {
+				t.Fatalf("uncommitted ready entry was scheduled, Len=%d", q.Len())
+			}
+			if len(q.Corrupt) == 0 || len(corruptEntries(t, root)) == 0 {
+				t.Fatal("uncommitted ready entry was not quarantined")
+			}
 		})
 	}
 }
@@ -227,6 +380,7 @@ func TestMetaWithoutBodyQuarantine(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, metaName), raw, 0600); err != nil {
 		t.Fatal(err)
 	}
+	writeAcceptedMarker(t, dir)
 
 	q := mustOpen(t, root, Limits{})
 	if q.Len() != 0 {
@@ -256,6 +410,7 @@ func TestBodyWithoutMetaQuarantine(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, bodyName), []byte("x"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	writeAcceptedMarker(t, dir)
 
 	q := mustOpen(t, root, Limits{})
 	if q.Len() != 0 {
@@ -285,6 +440,7 @@ func TestInvalidJSONQuarantine(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, bodyName), []byte("x"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	writeAcceptedMarker(t, dir)
 
 	q := mustOpen(t, root, Limits{})
 	if q.Len() != 0 {
@@ -313,6 +469,7 @@ func TestIDFilenameMismatchQuarantine(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, bodyName), []byte("x"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	writeAcceptedMarker(t, dir)
 
 	q := mustOpen(t, root, Limits{})
 	if q.Len() != 0 {
@@ -531,39 +688,6 @@ func TestFinishCrashSafeTrash(t *testing.T) {
 	}
 }
 
-func TestLegacyMigration(t *testing.T) {
-	clearHooks(t)
-	root := t.TempDir()
-	// Create layout dirs manually for legacy flat files in root.
-	for _, d := range []string{dirReady, dirDead, dirTmp, dirCorrupt, dirTrash} {
-		if err := os.MkdirAll(filepath.Join(root, d), 0700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	env := testEnv("legacy1")
-	raw, _ := json.Marshal(env)
-	if err := os.WriteFile(filepath.Join(root, "legacy1.json"), raw, 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "legacy1.eml"), []byte("msg"), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	q := mustOpen(t, root, Limits{})
-	if q.Len() != 1 {
-		t.Fatalf("Len=%d", q.Len())
-	}
-	if _, err := os.Stat(filepath.Join(root, dirReady, "legacy1", metaName)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(root, "legacy1.json")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("legacy json should be removed")
-	}
-	if _, err := os.Stat(filepath.Join(root, "legacy1.eml")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("legacy eml should be removed")
-	}
-}
-
 func TestConcurrentAddNext(t *testing.T) {
 	clearHooks(t)
 	root := t.TempDir()
@@ -745,31 +869,6 @@ func TestOpenReadOnlyAlongsideLocked(t *testing.T) {
 	}
 }
 
-func TestOpenReadOnlySkipsMigration(t *testing.T) {
-	clearHooks(t)
-	root := t.TempDir()
-	// Legacy flat pair without any layout dirs.
-	meta := []byte(`{"id":"leg1","username":"u","sender":"a@ex.com","recipients":[{"address":"b@ex.com","domain":"ex.com","status":"pending"}],"size":4,"created":"2020-01-01T00:00:00Z","attempts":0,"next_attempt":"2020-01-01T00:00:00Z"}`)
-	if err := os.WriteFile(filepath.Join(root, "leg1.json"), meta, 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "leg1.eml"), []byte("body"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	ro, err := OpenReadOnly(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Legacy files must remain; no ready/<id>/ promotion.
-	if _, err := os.Stat(filepath.Join(root, "leg1.json")); err != nil {
-		t.Fatalf("legacy json removed: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(root, "ready", "leg1")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("ready/leg1 should not exist, err=%v", err)
-	}
-	_ = ro
-}
-
 func TestCorruptNeverDeletedSilently(t *testing.T) {
 	clearHooks(t)
 	root := t.TempDir()
@@ -793,6 +892,7 @@ func TestCorruptNeverDeletedSilently(t *testing.T) {
 		case 2:
 			_ = os.WriteFile(filepath.Join(dir, bodyName), []byte("only"), 0600)
 		}
+		writeAcceptedMarker(t, dir)
 	}
 
 	q := mustOpen(t, root, Limits{})
@@ -934,6 +1034,7 @@ func TestSMTPUTF8InvariantOpenQuarantine(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, bodyName), []byte("From: x\r\n\r\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	writeAcceptedMarker(t, dir)
 	q := mustOpen(t, root, Limits{})
 	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("violating ready entry must be quarantined on Open")
@@ -943,36 +1044,5 @@ func TestSMTPUTF8InvariantOpenQuarantine(t *testing.T) {
 	}
 	if q.Len() != 0 {
 		t.Fatal("must not schedule violating entry")
-	}
-}
-
-func TestSMTPUTF8InvariantLegacyNotPromoted(t *testing.T) {
-	clearHooks(t)
-	root := t.TempDir()
-	_ = mustOpen(t, root, Limits{}).Close()
-	now := time.Now().UTC().Truncate(time.Second)
-	env := &Envelope{
-		ID: "legutf8", Username: "u", Sender: "a@ex.com",
-		Recipients:  []Recipient{{Address: "björn@ex.com", Domain: "ex.com", Status: StatusPending}},
-		Created:     now,
-		NextAttempt: now,
-		SMTPUTF8:    false,
-	}
-	raw, err := json.Marshal(env)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "legutf8.json"), raw, 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "legutf8.eml"), []byte("msg"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	q := mustOpen(t, root, Limits{})
-	if _, err := os.Stat(filepath.Join(root, dirReady, "legutf8")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("legacy violating entry must not promote to ready")
-	}
-	if q.Len() != 0 {
-		t.Fatal("must not schedule legacy violating entry")
 	}
 }
