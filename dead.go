@@ -22,34 +22,51 @@ func dead(configPath string, arguments []string) error {
 		return err
 	}
 
-	spool, err := queue.Open(cfg.ResolvePath("queue"), queue.Limits{
-		MaxMessages: cfg.Server.MaxQueueMessages,
-		MaxBytes:    cfg.Server.MaxQueueBytes,
-		MinFreeDisk: cfg.Server.MinFreeDiskBytes,
-	})
-	if err != nil {
-		return err
-	}
-	spool.FreeDisk = disk.FreeBytes
+	queueDir := cfg.ResolvePath("queue")
 
 	switch arguments[0] {
 	case "list":
+		spool, err := queue.OpenReadOnly(queueDir)
+		if err != nil {
+			return err
+		}
 		return deadList(spool)
 	case "show":
 		if len(arguments) < 2 {
 			return errors.New("usage: outboxd dead show <id>")
 		}
-		return deadShow(spool, arguments[1])
-	case "retry":
-		if len(arguments) < 2 {
-			return errors.New("usage: outboxd dead retry <id>")
+		spool, err := queue.OpenReadOnly(queueDir)
+		if err != nil {
+			return err
 		}
-		return deadRetry(spool, arguments[1])
+		return deadShow(spool, arguments[1])
 	case "export":
 		if len(arguments) < 2 {
 			return errors.New("usage: outboxd dead export <id>")
 		}
+		spool, err := queue.OpenReadOnly(queueDir)
+		if err != nil {
+			return err
+		}
 		return spool.ExportDead(arguments[1], os.Stdout)
+	case "retry":
+		if len(arguments) < 2 {
+			return errors.New("usage: outboxd dead retry <id>")
+		}
+		spool, err := queue.Open(queueDir, queue.Limits{
+			MaxMessages: cfg.Server.MaxQueueMessages,
+			MaxBytes:    cfg.Server.MaxQueueBytes,
+			MinFreeDisk: cfg.Server.MinFreeDiskBytes,
+		})
+		if err != nil {
+			if errors.Is(err, disk.ErrLocked) {
+				return errors.New("outboxd is running and holds the queue lock; stop it before retrying dead-letter messages")
+			}
+			return err
+		}
+		defer spool.Close()
+		spool.FreeDisk = disk.FreeBytes
+		return deadRetry(spool, arguments[1])
 	default:
 		return fmt.Errorf("unknown dead subcommand %q", arguments[0])
 	}

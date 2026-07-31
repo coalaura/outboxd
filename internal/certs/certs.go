@@ -261,12 +261,9 @@ func validateCertificate(certificate *tls.Certificate, hostname string) error {
 		return fmt.Errorf("tls certificate expired (NotAfter %s)", leaf.NotAfter.Format(time.RFC3339))
 	}
 
-	if leaf.IsCA && len(certificate.Certificate) == 1 {
-		// A pure CA presented as the only cert is not a usable TLS server leaf.
-		// Self-signed leaves must have IsCA=false (see generate). Legacy pairs
-		// with IsCA=true still work if they have ServerAuth and host match.
-	}
-
+	// A pure CA presented as the only cert is not a usable TLS server leaf.
+	// Self-signed leaves must have IsCA=false (see generate). Legacy pairs
+	// with IsCA=true still work if they have ServerAuth and host match.
 	if err := leafHasServerAuth(leaf); err != nil {
 		return err
 	}

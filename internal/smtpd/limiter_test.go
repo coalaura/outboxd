@@ -657,6 +657,66 @@ func TestAuthLimiterCapacityReclaimsExpired(t *testing.T) {
 	checkAgg(t, l)
 }
 
+func TestAuthLimiterCapacityFloodRealClockBoundedSweeps(t *testing.T) {
+	const capN = 16
+	l := newAuthLimiterSized(capN, capN, entryExpiry, entryExpiry)
+	// Fill both maps with non-prunable (recent failure) entries.
+	for i := 0; i < capN; i++ {
+		ip := fmt.Sprintf("10.50.0.%d", i+1)
+		if !l.reserve(ip, "u") {
+			t.Fatalf("fill %d", i)
+		}
+		l.failed(ip, "u")
+	}
+	l.mu.Lock()
+	l.pruned = l.nowTime() // prevent periodic prune
+	before := l.fullSweeps
+	l.mu.Unlock()
+
+	l.clock = time.Now
+	const flood = 2000
+	for i := 0; i < flood; i++ {
+		if l.reserve(fmt.Sprintf("198.51.100.%d", i%250+1), fmt.Sprintf("flood%d", i)) {
+			t.Fatalf("unexpected accept at flood %d", i)
+		}
+	}
+	l.mu.Lock()
+	grew := l.fullSweeps - before
+	l.mu.Unlock()
+	if grew > 2 {
+		t.Fatalf("fullSweeps grew by %d, want at most 2 under real-clock flood", grew)
+	}
+	checkAgg(t, l)
+}
+
+func TestAuthLimiterExistingDuringCapacityFlood(t *testing.T) {
+	const capN = 16
+	l := newAuthLimiterSized(capN, capN, entryExpiry, entryExpiry)
+	for i := 0; i < capN; i++ {
+		ip := fmt.Sprintf("10.51.0.%d", i+1)
+		if !l.reserve(ip, "u") {
+			t.Fatalf("fill %d", i)
+		}
+		l.failed(ip, "u")
+	}
+	l.mu.Lock()
+	l.pruned = l.nowTime()
+	l.mu.Unlock()
+	l.clock = time.Now
+
+	for i := 0; i < 500; i++ {
+		if l.reserve(fmt.Sprintf("203.0.113.%d", i%200+1), fmt.Sprintf("n%d", i)) {
+			t.Fatalf("new identity accepted at capacity i=%d", i)
+		}
+		// Existing seat still reservable during the flood.
+		if !l.reserve("10.51.0.1", "u") {
+			t.Fatalf("existing rejected during flood i=%d", i)
+		}
+		l.canceled("10.51.0.1", "u")
+	}
+	checkAgg(t, l)
+}
+
 func TestAuthLimiterSmallCapacityConcurrentExact(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	const capN = 10

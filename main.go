@@ -42,6 +42,8 @@ func main() {
 		log.MustFail(runCheck(configPath))
 	case "dead":
 		log.MustFail(dead(configPath, args[1:]))
+	case "serve":
+		log.MustFail(serve(configPath))
 	default:
 		log.MustFail(fmt.Errorf("unknown command %q, expected user, dns, check, dead, or serve (default)", args[0]))
 	}
@@ -78,7 +80,7 @@ func serve(configPath string) error {
 
 	log.Println("Ensuring data directory...")
 
-	err = disk.Mkdir(cfg.Server.DataDirectory)
+	err = disk.Mkdir(cfg.ResolvedDataDir())
 	if err != nil {
 		return err
 	}
@@ -135,6 +137,7 @@ func serve(configPath string) error {
 	if err != nil {
 		return err
 	}
+	defer spool.Close()
 	spool.FreeDisk = disk.FreeBytes
 
 	for _, cerr := range spool.Corrupt {

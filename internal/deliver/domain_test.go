@@ -188,6 +188,7 @@ func startMiniMX(t *testing.T, startTLS bool, cert tls.Certificate, utf8, eight 
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 	done := make(chan struct{})
+	var closeDone sync.Once
 	var n atomic.Int32
 	go func() {
 		for {
@@ -247,11 +248,7 @@ func startMiniMX(t *testing.T, startTLS bool, cert tls.Certificate, utf8, eight 
 							}
 						}
 						_, _ = io.WriteString(rw, "250 queued\r\n")
-						select {
-						case <-done:
-						default:
-							close(done)
-						}
+						closeDone.Do(func() { close(done) })
 					case strings.HasPrefix(upper, "QUIT"):
 						_, _ = io.WriteString(rw, "221 bye\r\n")
 						return
@@ -275,6 +272,7 @@ func TestCandidateIPFallbackOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = q.Close() })
 	cfg := testDeliverCfg()
 	d := New(cfg, q, nopLogger{})
 	d.SetTLSRootCAs(pool)
@@ -350,6 +348,7 @@ func TestDomainCapabilityAllSMTPUTF8Missing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = q.Close() })
 	cfg := testDeliverCfg()
 	allow := true
 	cfg.Delivery.AllowPlaintext = &allow
@@ -392,6 +391,7 @@ func TestDomainCapabilityAll8BitMissing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = q.Close() })
 	cfg := testDeliverCfg()
 	allow := true
 	cfg.Delivery.AllowPlaintext = &allow
@@ -440,6 +440,7 @@ func TestDomainMixedCapabilitiesCombined(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = q.Close() })
 	cfg := testDeliverCfg()
 	allow := true
 	cfg.Delivery.AllowPlaintext = &allow
@@ -493,6 +494,7 @@ func TestDomainTempThenCapabilityKeepsPending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = q.Close() })
 	cfg := testDeliverCfg()
 	allow := true
 	cfg.Delivery.AllowPlaintext = &allow
@@ -533,6 +535,97 @@ func TestDomainTempThenCapabilityKeepsPending(t *testing.T) {
 	}
 }
 
+func TestDomainTempThenPrivateKeepsPending(t *testing.T) {
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	cfg := testDeliverCfg()
+	cfg.Delivery.AllowPrivateDestinations = false
+	allow := true
+	cfg.Delivery.AllowPlaintext = &allow
+	cfg.Delivery.RequireValidMXTLSCert = false
+	d := New(cfg, q, nopLogger{})
+	// First MX: publicly-routable IP, unmapped dialer → temporary; second: private.
+	ipPub := net.ParseIP("8.8.8.8")
+	ipPriv := net.ParseIP("10.255.100.2")
+	d.SetResolver(&fixedResolver{
+		mx: map[string][]*net.MX{"ex.com": {
+			{Host: "net.ex.com.", Pref: 10},
+			{Host: "priv.ex.com.", Pref: 20},
+		}},
+		ips: map[string][]net.IP{
+			"net.ex.com":  {ipPub},
+			"priv.ex.com": {ipPriv},
+		},
+	})
+	d.orderIPs = func([]net.IP) {}
+	d.SetDialer(dialMap(map[string]string{})) // unmapped → temp on public MX
+
+	now := time.Now()
+	env := &queue.Envelope{
+		ID: "privmix", Username: "u", Sender: "a@ex.com",
+		Recipients: []queue.Recipient{{Address: "b@ex.com", Domain: "ex.com", Status: queue.StatusPending}},
+		Created:    now, NextAttempt: now,
+	}
+	err = d.domain(context.Background(), env, "ex.com", []int{0})
+	if err == nil {
+		t.Fatal("expected temporary error when any candidate is retryable")
+	}
+	if env.Recipients[0].Status != queue.StatusPending {
+		t.Fatalf("must remain pending, got %s detail=%s", env.Recipients[0].Status, env.Recipients[0].Detail)
+	}
+	if errors.Is(err, errPrivateDestination) {
+		t.Fatalf("must not treat as permanent private-only error, got %v", err)
+	}
+}
+
+func TestDomainPrivateThenTempKeepsPending(t *testing.T) {
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	cfg := testDeliverCfg()
+	cfg.Delivery.AllowPrivateDestinations = false
+	allow := true
+	cfg.Delivery.AllowPlaintext = &allow
+	cfg.Delivery.RequireValidMXTLSCert = false
+	d := New(cfg, q, nopLogger{})
+	ipPriv := net.ParseIP("10.255.101.1")
+	ipPub := net.ParseIP("1.1.1.1")
+	d.SetResolver(&fixedResolver{
+		mx: map[string][]*net.MX{"ex.com": {
+			{Host: "priv.ex.com.", Pref: 10},
+			{Host: "net.ex.com.", Pref: 20},
+		}},
+		ips: map[string][]net.IP{
+			"priv.ex.com": {ipPriv},
+			"net.ex.com":  {ipPub},
+		},
+	})
+	d.orderIPs = func([]net.IP) {}
+	d.SetDialer(dialMap(map[string]string{}))
+
+	now := time.Now()
+	env := &queue.Envelope{
+		ID: "privmix2", Username: "u", Sender: "a@ex.com",
+		Recipients: []queue.Recipient{{Address: "b@ex.com", Domain: "ex.com", Status: queue.StatusPending}},
+		Created:    now, NextAttempt: now,
+	}
+	err = d.domain(context.Background(), env, "ex.com", []int{0})
+	if err == nil {
+		t.Fatal("expected temporary error")
+	}
+	if env.Recipients[0].Status != queue.StatusPending {
+		t.Fatalf("must remain pending, got %s", env.Recipients[0].Status)
+	}
+	if errors.Is(err, errPrivateDestination) {
+		t.Fatalf("must not treat as permanent private-only error, got %v", err)
+	}
+}
+
 func TestDomainCapabilityThenTempKeepsPending(t *testing.T) {
 	lnCap, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -545,6 +638,7 @@ func TestDomainCapabilityThenTempKeepsPending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = q.Close() })
 	cfg := testDeliverCfg()
 	allow := true
 	cfg.Delivery.AllowPlaintext = &allow

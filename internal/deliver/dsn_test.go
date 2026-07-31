@@ -35,6 +35,7 @@ func TestEnsureDSNFlagsASCII(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = q.Close() })
 	d := New(&config.Config{Server: config.Server{Hostname: "mail.test", Domain: "test"}}, q, nopLog{})
 
 	now := time.Now()
@@ -71,6 +72,7 @@ func TestEnsureDSNFlagsUTF8Recipient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = q.Close() })
 	d := New(&config.Config{Server: config.Server{Hostname: "mail.test"}}, q, nopLog{})
 	now := time.Now()
 	orig := &queue.Envelope{
@@ -100,6 +102,7 @@ func TestEnsureDSNEightBitFromHighOctets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = q.Close() })
 	d := New(&config.Config{Server: config.Server{Hostname: "mail.test"}}, q, nopLog{})
 	now := time.Now()
 	orig := &queue.Envelope{

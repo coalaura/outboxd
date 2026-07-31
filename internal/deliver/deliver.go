@@ -200,11 +200,12 @@ func (d *Deliverer) SetTLSRootCAs(pool *x509.CertPool) {
 func (d *Deliverer) Run(ctx context.Context) error {
 	d.log.Printf("Delivery started with %d queued message(s)\n", d.queue.Len())
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
+	// Registered first so it runs last: cancel() must fire before we wait.
 	var wg sync.WaitGroup
 	defer wg.Wait()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	for {
 		if err := d.fatalErr(); err != nil {
@@ -409,6 +410,7 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 	var (
 		last              error
 		sawEligible       bool
+		sawRetryable      bool
 		capabilityOnly    = true
 		sawUTF8CapErr     bool
 		sawEightBitCapErr bool
@@ -431,6 +433,7 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 		if err == nil {
 			// send returned without completing or failing recipients permanently.
 			capabilityOnly = false
+			sawRetryable = true
 			continue
 		}
 		sawEligible = true
@@ -451,9 +454,14 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 		// Any non-capability outcome means this is not a capability-only failure set.
 		capabilityOnly = false
 		if errors.Is(err, errPrivateDestination) {
-			last = err
+			// Do not overwrite a prior retryable diagnostic with a private-destination
+			// error; mixed outcomes must stay temporary (same class as capability mix).
+			if last == nil {
+				last = err
+			}
 			continue
 		}
+		sawRetryable = true
 		last = err
 	}
 
@@ -461,7 +469,7 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 		d.reject(envelope, indexes, capabilityDetail(sawUTF8CapErr, sawEightBitCapErr))
 		return nil
 	}
-	if last != nil && errors.Is(last, errPrivateDestination) {
+	if last != nil && !sawRetryable && errors.Is(last, errPrivateDestination) {
 		d.reject(envelope, indexes, last.Error())
 		return nil
 	}
@@ -497,10 +505,8 @@ func (d *Deliverer) acquireGlobal(ctx context.Context) error {
 }
 
 func (d *Deliverer) releaseGlobal() {
-	select {
-	case <-d.global:
-	default:
-	}
+	// Called only after a successful acquireGlobal.
+	<-d.global
 }
 
 func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host string, indexes []int) (bool, error) {

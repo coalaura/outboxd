@@ -110,6 +110,15 @@ func ensureKey(path string) (*rsa.PrivateKey, bool, error) {
 	}), 0600)
 
 	if err != nil {
+		// Another process may have won the create race; adopt their key.
+		if errors.Is(err, os.ErrExist) {
+			body, readErr := os.ReadFile(path)
+			if readErr != nil {
+				return nil, false, readErr
+			}
+			parsed, parseErr := parseKey(body)
+			return parsed, false, parseErr
+		}
 		return nil, false, err
 	}
 

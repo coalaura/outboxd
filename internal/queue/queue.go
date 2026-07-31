@@ -36,6 +36,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -132,6 +133,11 @@ type Queue struct {
 	reserved int   // in-flight Add reservations (count)
 	resBytes int64 // in-flight Add reservations (bytes)
 
+	// lock is the exclusive process lock on <root>/.lock (nil for read-only).
+	lock *disk.FileLock
+	// readOnly queues skip migration/recovery/schedule and reject mutations.
+	readOnly bool
+
 	// Corrupt holds reportable quarantine events from Open.
 	Corrupt []error
 }
@@ -175,17 +181,26 @@ func (q *Queue) Stats() (messages int, bytes int64) {
 // Reserve holds capacity for an in-progress Add so concurrent submissions
 // cannot overshoot quotas. Release with ReleaseReserve if Add is abandoned.
 func (q *Queue) Reserve(size int64) error {
+	if err := q.rejectReadOnly(); err != nil {
+		return err
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return q.reserveLocked(size)
+	return q.reserveLocked(size, false)
 }
 
-func (q *Queue) reserveLocked(size int64) error {
-	if q.limits.MaxMessages > 0 && q.count+q.reserved+1 > q.limits.MaxMessages {
-		return ErrQueueFull
-	}
-	if q.limits.MaxBytes > 0 && q.bytes+q.resBytes+size > q.limits.MaxBytes {
-		return ErrQueueFull
+// reserveLocked checks quotas. When exempt is true (DSN envelopes), MaxMessages
+// and MaxBytes are skipped: a DSN is only enqueued while its originating message
+// is being removed, so it cannot grow the durable queue. MinFreeDisk still applies
+// for everyone — writing with no disk left must fail.
+func (q *Queue) reserveLocked(size int64, exempt bool) error {
+	if !exempt {
+		if q.limits.MaxMessages > 0 && q.count+q.reserved+1 > q.limits.MaxMessages {
+			return ErrQueueFull
+		}
+		if q.limits.MaxBytes > 0 && q.bytes+q.resBytes+size > q.limits.MaxBytes {
+			return ErrQueueFull
+		}
 	}
 	if q.limits.MinFreeDisk > 0 && q.FreeDisk != nil {
 		free, err := q.FreeDisk(q.root)
@@ -225,7 +240,16 @@ var (
 	ErrInsufficientDisk = errors.New("insufficient free disk space")
 	// ErrInvalidID is returned for unusable queue identifiers.
 	ErrInvalidID = errors.New("invalid queue id")
+	// ErrReadOnly is returned when a mutating method is called on a read-only queue.
+	ErrReadOnly = errors.New("queue opened read-only")
 )
+
+func (q *Queue) rejectReadOnly() error {
+	if q.readOnly {
+		return ErrReadOnly
+	}
+	return nil
+}
 
 // ValidateID rejects path traversal and malformed identifiers.
 func ValidateID(id string) error {
@@ -249,6 +273,9 @@ func ValidateID(id string) error {
 // On success the entry is complete under ready/; a crash mid-add leaves either
 // nothing visible to Next, or a tmp/ entry recovered on restart.
 func (q *Queue) Add(envelope *Envelope, data []byte) error {
+	if err := q.rejectReadOnly(); err != nil {
+		return err
+	}
 	if err := ValidateID(envelope.ID); err != nil {
 		return err
 	}
@@ -259,7 +286,7 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 
 	// Capacity check accounts for concurrent in-progress connections via reserved.
 	q.mu.Lock()
-	if err := q.reserveLocked(envelope.Size); err != nil {
+	if err := q.reserveLocked(envelope.Size, envelope.IsDSN); err != nil {
 		q.mu.Unlock()
 		return err
 	}
@@ -379,6 +406,9 @@ func (q *Queue) Requeue(envelope *Envelope) {
 // it remains under ready/ and is returned to the schedule so a subsequent
 // Open recovers it. The error is returned to the caller.
 func (q *Queue) Retry(envelope *Envelope) error {
+	if err := q.rejectReadOnly(); err != nil {
+		return err
+	}
 	if err := ValidateID(envelope.ID); err != nil {
 		return err
 	}
@@ -388,7 +418,7 @@ func (q *Queue) Retry(envelope *Envelope) error {
 		return err
 	}
 	if err := q.storeReady(envelope); err != nil {
-		// Leave bytes on disk; put leaveit schedulable.
+		// Leave bytes on disk; keep it schedulable.
 		q.schedule(envelope)
 		return err
 	}
@@ -400,11 +430,14 @@ func (q *Queue) Retry(envelope *Envelope) error {
 // directory is renamed into trash/ then removed. A crash after rename leaves
 // a trash entry cleaned on Open.
 func (q *Queue) Finish(envelope *Envelope) error {
+	if err := q.rejectReadOnly(); err != nil {
+		return err
+	}
 	if err := ValidateID(envelope.ID); err != nil {
 		return err
 	}
 	src := filepath.Join(q.ready, envelope.ID)
-	dst := filepath.Join(q.trash, envelope.ID+"."+fmt.Sprintf("%d", time.Now().UnixNano()))
+	dst := filepath.Join(q.trash, envelope.ID+"."+strconv.FormatInt(time.Now().UnixNano(), 10))
 	if err := disk.Mkdir(q.trash); err != nil {
 		return err
 	}
@@ -426,6 +459,9 @@ func (q *Queue) Finish(envelope *Envelope) error {
 // Bury moves an undeliverable message into the dead-letter directory atomically
 // (single directory rename). Metadata is written first inside ready/.
 func (q *Queue) Bury(envelope *Envelope) error {
+	if err := q.rejectReadOnly(); err != nil {
+		return err
+	}
 	if err := ValidateID(envelope.ID); err != nil {
 		return err
 	}
@@ -443,7 +479,7 @@ func (q *Queue) Bury(envelope *Envelope) error {
 	// If a previous bury partially created dst, refuse to clobber blindly —
 	// move aside.
 	if _, err := os.Stat(dst); err == nil {
-		backup := dst + ".bak." + fmt.Sprintf("%d", time.Now().UnixNano())
+		backup := dst + ".bak." + strconv.FormatInt(time.Now().UnixNano(), 10)
 		if err := disk.Rename(dst, backup); err != nil {
 			q.schedule(envelope)
 			return err
@@ -461,6 +497,9 @@ func (q *Queue) Bury(envelope *Envelope) error {
 
 // ReviveDead moves a dead-letter item back to ready and schedules it.
 func (q *Queue) ReviveDead(id string) (*Envelope, error) {
+	if err := q.rejectReadOnly(); err != nil {
+		return nil, err
+	}
 	if err := ValidateID(id); err != nil {
 		return nil, err
 	}
@@ -509,6 +548,10 @@ func (q *Queue) DeadIDs() ([]string, error) {
 	ids := make([]string, 0, len(entries))
 	for _, e := range entries {
 		if !e.IsDir() {
+			continue
+		}
+		// Bury may leave `<id>.bak.<nano>` sidecars; skip them so list stays clean.
+		if strings.Contains(e.Name(), ".bak.") {
 			continue
 		}
 		if err := ValidateID(e.Name()); err != nil {
@@ -639,6 +682,8 @@ func (q *Queue) loadDir(dir, expectID string) (*Envelope, error) {
 }
 
 // Open loads an existing spool directory, creating it when needed.
+// Acquires an exclusive lock on <directory>/.lock before any migration,
+// recovery, or scheduling. Call Close to release it.
 // Corrupt entries are relocated to corrupt/ and returned via Queue.Corrupt.
 func Open(directory string, limits Limits) (*Queue, error) {
 	q := &Queue{
@@ -652,25 +697,69 @@ func Open(directory string, limits Limits) (*Queue, error) {
 		notify: make(chan struct{}, 1),
 	}
 
-	for _, d := range []string{q.root, q.ready, q.dead, q.tmp, q.corr, q.trash} {
+	if err := disk.Mkdir(q.root); err != nil {
+		return nil, err
+	}
+	lock, err := disk.Lock(filepath.Join(q.root, ".lock"))
+	if err != nil {
+		if errors.Is(err, disk.ErrLocked) {
+			return nil, fmt.Errorf("spool %s: %w: another outboxd process holds the queue lock", directory, disk.ErrLocked)
+		}
+		return nil, err
+	}
+	q.lock = lock
+
+	for _, d := range []string{q.ready, q.dead, q.tmp, q.corr, q.trash} {
 		if err := disk.Mkdir(d); err != nil {
+			_ = q.Close()
 			return nil, err
 		}
 	}
 
 	if err := q.migrateLegacy(); err != nil {
+		_ = q.Close()
 		return nil, err
 	}
 	if err := q.recoverTmp(); err != nil {
+		_ = q.Close()
 		return nil, err
 	}
 	if err := q.cleanTrash(); err != nil {
+		_ = q.Close()
 		return nil, err
 	}
 	if err := q.loadReady(); err != nil {
+		_ = q.Close()
 		return nil, err
 	}
 	return q, nil
+}
+
+// OpenReadOnly opens a spool for inspection without taking the exclusive lock
+// and without migration, tmp recovery, trash cleanup, or schedule load.
+// Supported: DeadIDs, LoadDead, ExportDead, ReadBody, Path, DeadDir.
+// Mutating methods return ErrReadOnly.
+func OpenReadOnly(directory string) (*Queue, error) {
+	return &Queue{
+		root:     directory,
+		ready:    filepath.Join(directory, dirReady),
+		dead:     filepath.Join(directory, dirDead),
+		tmp:      filepath.Join(directory, dirTmp),
+		corr:     filepath.Join(directory, dirCorrupt),
+		trash:    filepath.Join(directory, dirTrash),
+		notify:   make(chan struct{}, 1),
+		readOnly: true,
+	}, nil
+}
+
+// Close releases the exclusive spool lock.
+func (q *Queue) Close() error {
+	if q == nil || q.lock == nil {
+		return nil
+	}
+	err := q.lock.Close()
+	q.lock = nil
+	return err
 }
 
 // OpenDefault is Open with unlimited quotas (backward compatible helper).
@@ -855,7 +944,7 @@ func (q *Queue) quarantineDir(src, name string) error {
 	if err := disk.Mkdir(q.corr); err != nil {
 		return err
 	}
-	dst := filepath.Join(q.corr, name+"."+fmt.Sprintf("%d", time.Now().UnixNano()))
+	dst := filepath.Join(q.corr, name+"."+strconv.FormatInt(time.Now().UnixNano(), 10))
 	if err := disk.Rename(src, dst); err != nil {
 		// fallback copy-ish remove
 		return fmt.Errorf("quarantine %s: %w", src, err)
@@ -868,7 +957,7 @@ func (q *Queue) quarantineFile(src, name string) error {
 	if err := disk.Mkdir(q.corr); err != nil {
 		return err
 	}
-	dstDir := filepath.Join(q.corr, name+"."+fmt.Sprintf("%d", time.Now().UnixNano()))
+	dstDir := filepath.Join(q.corr, name+"."+strconv.FormatInt(time.Now().UnixNano(), 10))
 	if err := disk.Mkdir(dstDir); err != nil {
 		return err
 	}

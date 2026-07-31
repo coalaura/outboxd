@@ -112,6 +112,7 @@ func testServerWithUser(t *testing.T, password string) (*Server, *config.Config,
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = spool.Close() })
 	srv := New(cfg, k, signer, spool, testLog{})
 	if err := srv.Listen(); err != nil {
 		t.Fatal(err)

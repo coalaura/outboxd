@@ -55,6 +55,7 @@ func testServerParts(t *testing.T) (*config.Config, *certs.Keeper, *queue.Queue)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = spool.Close() })
 	return cfg, k, spool
 }
 

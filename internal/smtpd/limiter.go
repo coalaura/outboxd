@@ -12,6 +12,9 @@ const (
 	lockoutBase  = 2 * time.Second
 	lockoutMax   = 5 * time.Minute
 	entryExpiry  = 30 * time.Minute
+	// Instant equality is useless with time.Now (no two calls share an instant).
+	// Bound capacity sweeps by wall elapsed time instead.
+	capSweepInterval = time.Second
 
 	// Separate caps so filling one map cannot masquerade as capacity for the other.
 	maxAuthIPEntries  = 10000
@@ -45,9 +48,8 @@ type attemptState struct {
 //   - Existing identity reserve: expected O(1). Periodic expiry may run a full sweep
 //     only when pruneInterval has elapsed.
 //   - New identity below capacity: expected O(1).
-//   - New identity at capacity: may perform one full expiry/capacity sweep. After a
-//     sweep finds nothing reclaimable at this logical time, further new-identity
-//     rejections at the same time are O(1) without rescanning.
+//   - New identity at capacity: may perform one full expiry/capacity sweep at most
+//     once per capSweepInterval so a flood of new identities stays O(1) amortized.
 //
 // Terminal ops:
 //
@@ -69,9 +71,11 @@ type authLimiter struct {
 	expiry     time.Duration
 	pruneEvery time.Duration
 
-	// atCapSweepAt is the last logical time a capacity sweep found nothing reclaimable.
-	// Repeated new identities at the same logical time skip further full sweeps.
-	atCapSweepAt time.Time
+	// lastCapSweep is when we last paid for a full capacity sweep. Do not gate on
+	// time.Time equality: with time.Now every reservation has a distinct instant,
+	// so equality would run an O(n) sweep on every at-capacity reserve (DoS under
+	// new-identity flood). Use elapsed-time (capSweepInterval) instead.
+	lastCapSweep time.Time
 
 	// fullSweeps counts complete map sweeps (tests only).
 	fullSweeps int
@@ -176,16 +180,16 @@ func (l *authLimiter) reserve(ip, username string) bool {
 
 	if needNewIP || needNewKey {
 		if (needNewIP && len(l.byIP) >= l.maxIP) || (needNewKey && len(l.byKey) >= l.maxKey) {
-			// Capacity may reclaim expired entries once per logical time after a dry sweep.
-			if !l.atCapSweepAt.Equal(now) {
-				reclaimed := l.forcePrune(now)
-				if !reclaimed {
-					l.atCapSweepAt = now
+			// A sweep is O(n); pay for it at most once per capSweepInterval so a flood of
+			// new identities at capacity stays O(1) amortized.
+			if now.Sub(l.lastCapSweep) >= capSweepInterval {
+				l.lastCapSweep = now
+				if l.forcePrune(now) {
+					ipState = l.byIP[ipKey]
+					keyState = l.byKey[key]
+					needNewIP = ipState == nil
+					needNewKey = keyState == nil
 				}
-				ipState = l.byIP[ipKey]
-				keyState = l.byKey[key]
-				needNewIP = ipState == nil
-				needNewKey = keyState == nil
 			}
 			if needNewIP && len(l.byIP) >= l.maxIP {
 				return false

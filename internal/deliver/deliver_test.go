@@ -9,9 +9,13 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"net"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -96,6 +100,7 @@ func openQueue(t *testing.T) *queue.Queue {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = q.Close() })
 	return q
 }
 
@@ -486,4 +491,145 @@ func TestFairnessBlockedDomain(t *testing.T) {
 	close(releaseBlocked)
 	cancel()
 	<-done
+}
+
+func TestRunCancelUnblocksBlockedDial(t *testing.T) {
+	// Regression: defer wg.Wait before cancel hung Run until attempt timeouts.
+	q := openQueue(t)
+	cfg := testConfig()
+	cfg.Delivery.MaxAttempts = 5
+	cfg.Delivery.SubmissionTimeout = "30s"
+	cfg.Delivery.ConnectionTimeout = "30s"
+	d := deliver.New(cfg, q, memLog{})
+	started := make(chan struct{})
+	var once sync.Once
+	d.SetResolver(&fakeResolver{
+		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com.", Pref: 10}}},
+		ips: map[string][]net.IP{"mx.ex.com": {net.ParseIP("127.0.0.1")}},
+	})
+	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
+		once.Do(func() { close(started) })
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}))
+	addMsg(t, q, "hang1", "ex.com", "r@ex.com")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("dial never started")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run hung after cancel; defer order likely wrong")
+	}
+}
+
+func TestRunDSNAtFullQueueNotFatal(t *testing.T) {
+	// A DSN enqueued while the origin still occupies MaxMessages must not kill Run.
+	root := t.TempDir()
+	q, err := queue.Open(root, queue.Limits{MaxMessages: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+
+	cfg := testConfig()
+	cfg.Delivery.MaxAttempts = 1
+	cfg.Delivery.AllowPrivateDestinations = false
+	cfg.Delivery.InitialRetryDelay = "1ms"
+	cfg.Delivery.MaximumRetryDelay = "1ms"
+	d := deliver.New(cfg, q, memLog{})
+	// Hang the DSN recipient domain so Run cannot Finish the DSN before we assert.
+	dsnHold := make(chan struct{})
+	t.Cleanup(func() { close(dsnHold) })
+	d.SetResolver(&hangResolver{
+		fakeResolver: fakeResolver{
+			mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com.", Pref: 10}}},
+			ips: map[string][]net.IP{"mx.ex.com": {net.ParseIP("10.0.0.1")}},
+		},
+		hangDomain: "example.com",
+		hold:       dsnHold,
+	})
+	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
+		return nil, &net.OpError{Op: "dial", Net: network, Err: errors.New("should not dial private")}
+	}))
+
+	now := time.Now()
+	env := &queue.Envelope{
+		ID: "full1", Username: "user", Sender: "sender@example.com",
+		Recipients: []queue.Recipient{{
+			Address: "r@ex.com", Domain: "ex.com", Status: queue.StatusPending,
+		}},
+		Created: now, NextAttempt: now,
+	}
+	body := []byte("From: sender@example.com\r\nTo: r@ex.com\r\nSubject: t\r\n\r\nHi\r\n")
+	if err := q.Add(env, body); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case err := <-done:
+			t.Fatalf("Run returned early: %v", err)
+		case <-deadline:
+			cancel()
+			if err := <-done; err != nil {
+				t.Fatalf("Run fatal after deadline: %v", err)
+			}
+			t.Fatal("message never buried")
+		default:
+			_, deadErr := os.Stat(filepath.Join(root, "dead", "full1"))
+			_, dsnErr := os.Stat(filepath.Join(root, "ready", "dsn.full1"))
+			if deadErr == nil && dsnErr == nil {
+				goto buried
+			}
+			runtime.Gosched()
+		}
+	}
+buried:
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run after bury returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not exit after cancel")
+	}
+}
+
+// hangResolver is fakeResolver but LookupMX blocks on hangDomain until hold is closed or ctx ends.
+type hangResolver struct {
+	fakeResolver
+	hangDomain string
+	hold       <-chan struct{}
+}
+
+func (h *hangResolver) LookupMX(ctx context.Context, name string) ([]*net.MX, error) {
+	if name == h.hangDomain {
+		select {
+		case <-h.hold:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return h.fakeResolver.LookupMX(ctx, name)
 }

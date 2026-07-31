@@ -42,7 +42,19 @@ func mustOpen(t *testing.T, dir string, limits Limits) *Queue {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	t.Cleanup(func() { _ = q.Close() })
 	return q
+}
+
+// mustReopen closes prev then opens dir again (exclusive lock).
+func mustReopen(t *testing.T, prev *Queue, dir string, limits Limits) *Queue {
+	t.Helper()
+	if prev != nil {
+		if err := prev.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}
+	return mustOpen(t, dir, limits)
 }
 
 func corruptEntries(t *testing.T, root string) []string {
@@ -87,7 +99,7 @@ func TestAddPersistsAndOpenRecovers(t *testing.T) {
 	}
 
 	// Restart: new Open recovers the message.
-	q2 := mustOpen(t, root, Limits{})
+	q2 := mustReopen(t, q, root, Limits{})
 	if q2.Len() != 1 {
 		t.Fatalf("Len=%d want 1", q2.Len())
 	}
@@ -177,7 +189,7 @@ func TestAddFaultInjectionRecoverable(t *testing.T) {
 			// Must not silently finish: either nothing signed off as success
 			// in-memory for a half-written tmp, or ready is recoverable.
 			disk.SetHooks(disk.Hooks{})
-			q2 := mustOpen(t, root, Limits{})
+			q2 := mustReopen(t, q, root, Limits{})
 			// After body/meta fail tmp is cleaned or quarantined; after rename
 			// into ready the message may still recover on Open.
 			// Ensure we never drop the only successful case of silent full success
@@ -203,7 +215,7 @@ func TestAddFaultInjectionRecoverable(t *testing.T) {
 func TestMetaWithoutBodyQuarantine(t *testing.T) {
 	clearHooks(t)
 	root := t.TempDir()
-	mustOpen(t, root, Limits{}) // create layout
+	_ = mustOpen(t, root, Limits{}).Close() // create layout
 
 	id := "orphanmeta"
 	dir := filepath.Join(root, dirReady, id)
@@ -234,7 +246,7 @@ func TestMetaWithoutBodyQuarantine(t *testing.T) {
 func TestBodyWithoutMetaQuarantine(t *testing.T) {
 	clearHooks(t)
 	root := t.TempDir()
-	mustOpen(t, root, Limits{})
+	_ = mustOpen(t, root, Limits{}).Close()
 
 	id := "orphanbody"
 	dir := filepath.Join(root, dirReady, id)
@@ -260,7 +272,7 @@ func TestBodyWithoutMetaQuarantine(t *testing.T) {
 func TestInvalidJSONQuarantine(t *testing.T) {
 	clearHooks(t)
 	root := t.TempDir()
-	mustOpen(t, root, Limits{})
+	_ = mustOpen(t, root, Limits{}).Close()
 
 	id := "badjson"
 	dir := filepath.Join(root, dirReady, id)
@@ -286,7 +298,7 @@ func TestInvalidJSONQuarantine(t *testing.T) {
 func TestIDFilenameMismatchQuarantine(t *testing.T) {
 	clearHooks(t)
 	root := t.TempDir()
-	mustOpen(t, root, Limits{})
+	_ = mustOpen(t, root, Limits{}).Close()
 
 	id := "dirid1"
 	dir := filepath.Join(root, dirReady, id)
@@ -387,7 +399,7 @@ func TestRetryPersistenceFailureStillRecoverable(t *testing.T) {
 		t.Fatalf("expected rescheduled Len=1 got %d", q.Len())
 	}
 	disk.SetHooks(disk.Hooks{})
-	q2 := mustOpen(t, root, Limits{})
+	q2 := mustReopen(t, q, root, Limits{})
 	if q2.Len() != 1 {
 		t.Fatalf("Open recover Len=%d", q2.Len())
 	}
@@ -443,7 +455,7 @@ func TestBuryAtomic(t *testing.T) {
 		t.Fatal("expected bury error")
 	}
 	disk.SetHooks(disk.Hooks{})
-	q2 := mustOpen(t, root, Limits{})
+	q2 := mustReopen(t, q, root, Limits{})
 	found := false
 	for q2.Len() > 0 {
 		e, err := q2.Next(ctx)
@@ -505,7 +517,7 @@ func TestFinishCrashSafeTrash(t *testing.T) {
 			t.Fatal("still in ready after trash rename")
 		}
 	}
-	q2 := mustOpen(t, root, Limits{})
+	q2 := mustReopen(t, q, root, Limits{})
 	if q2.Len() != 0 {
 		// Only if Finish never renamed
 		if trashDst != "" {
@@ -637,10 +649,131 @@ func TestQuotaLimits(t *testing.T) {
 	}
 }
 
+func TestDSNExemptFromMessageQuota(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{MaxMessages: 1})
+	if err := q.Add(testEnv("ord1"), []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	dsn := testEnv("dsn1")
+	dsn.IsDSN = true
+	dsn.Sender = ""
+	if err := q.Add(dsn, []byte("dsn-body")); err != nil {
+		t.Fatalf("DSN Add must succeed at MaxMessages: %v", err)
+	}
+	if err := q.Add(testEnv("ord2"), []byte("b")); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("ordinary Add want ErrQueueFull got %v", err)
+	}
+}
+
+func TestDSNStillSubjectToMinFreeDisk(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{MinFreeDisk: 1 << 30})
+	q.FreeDisk = func(string) (int64, error) { return 100, nil }
+	dsn := testEnv("dsn-disk")
+	dsn.IsDSN = true
+	dsn.Sender = ""
+	if err := q.Add(dsn, []byte("x")); !errors.Is(err, ErrInsufficientDisk) {
+		t.Fatalf("want ErrInsufficientDisk got %v", err)
+	}
+}
+
+func TestOpenExclusiveLock(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q1 := mustOpen(t, root, Limits{})
+	_, err := Open(root, Limits{})
+	if !errors.Is(err, disk.ErrLocked) {
+		t.Fatalf("second Open want ErrLocked got %v", err)
+	}
+	if err := q1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	q2, err := Open(root, Limits{})
+	if err != nil {
+		t.Fatalf("Open after Close: %v", err)
+	}
+	t.Cleanup(func() { _ = q2.Close() })
+}
+
+func TestOpenReadOnlyAlongsideLocked(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	// Seed a dead-letter entry.
+	now := time.Now().UTC().Truncate(time.Second)
+	env := testEnv("dead1")
+	body := []byte("From: a\r\nTo: b\r\n\r\nbody\r\n")
+	if err := q.Add(env, body); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Recipients[0].Status = StatusFailed
+	got.Recipients[0].Detail = "gone"
+	got.LastError = "gone"
+	got.Created = now
+	if err := q.Bury(got); err != nil {
+		t.Fatal(err)
+	}
+
+	ro, err := OpenReadOnly(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := ro.DeadIDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 || ids[0] != "dead1" {
+		t.Fatalf("DeadIDs=%v", ids)
+	}
+	loaded, err := ro.LoadDead("dead1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ID != "dead1" {
+		t.Fatalf("LoadDead id=%s", loaded.ID)
+	}
+	if err := ro.Add(testEnv("x"), []byte("y")); !errors.Is(err, ErrReadOnly) {
+		t.Fatalf("Add want ErrReadOnly got %v", err)
+	}
+	if err := ro.Reserve(1); !errors.Is(err, ErrReadOnly) {
+		t.Fatalf("Reserve want ErrReadOnly got %v", err)
+	}
+}
+
+func TestOpenReadOnlySkipsMigration(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	// Legacy flat pair without any layout dirs.
+	meta := []byte(`{"id":"leg1","username":"u","sender":"a@ex.com","recipients":[{"address":"b@ex.com","domain":"ex.com","status":"pending"}],"size":4,"created":"2020-01-01T00:00:00Z","attempts":0,"next_attempt":"2020-01-01T00:00:00Z"}`)
+	if err := os.WriteFile(filepath.Join(root, "leg1.json"), meta, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "leg1.eml"), []byte("body"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ro, err := OpenReadOnly(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Legacy files must remain; no ready/<id>/ promotion.
+	if _, err := os.Stat(filepath.Join(root, "leg1.json")); err != nil {
+		t.Fatalf("legacy json removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "ready", "leg1")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ready/leg1 should not exist, err=%v", err)
+	}
+	_ = ro
+}
+
 func TestCorruptNeverDeletedSilently(t *testing.T) {
 	clearHooks(t)
 	root := t.TempDir()
-	mustOpen(t, root, Limits{})
+	_ = mustOpen(t, root, Limits{}).Close()
 
 	// Seed several corrupt ready dirs.
 	for i, name := range []string{"c1", "c2", "c3"} {
@@ -777,7 +910,7 @@ func TestSMTPUTF8EnvelopeInvariant(t *testing.T) {
 func TestSMTPUTF8InvariantOpenQuarantine(t *testing.T) {
 	clearHooks(t)
 	root := t.TempDir()
-	mustOpen(t, root, Limits{})
+	_ = mustOpen(t, root, Limits{}).Close()
 	now := time.Now().UTC().Truncate(time.Second)
 	// Write a ready entry that bypasses Add validation.
 	dir := filepath.Join(root, dirReady, "badutf8")
@@ -816,7 +949,7 @@ func TestSMTPUTF8InvariantOpenQuarantine(t *testing.T) {
 func TestSMTPUTF8InvariantLegacyNotPromoted(t *testing.T) {
 	clearHooks(t)
 	root := t.TempDir()
-	mustOpen(t, root, Limits{})
+	_ = mustOpen(t, root, Limits{}).Close()
 	now := time.Now().UTC().Truncate(time.Second)
 	env := &Envelope{
 		ID: "legutf8", Username: "u", Sender: "a@ex.com",
