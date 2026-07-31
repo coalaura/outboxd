@@ -1,7 +1,6 @@
 package config
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -166,34 +165,18 @@ func TestInvalidDurationRelationships(t *testing.T) {
 
 func TestHostilePHCRejected(t *testing.T) {
 	dir := t.TempDir()
-	salt := passwdEncoding()
-	// reuse validate path via config
-	hostile := "$argon2id$v=19$m=2147483648,t=2,p=1$" + salt + "$" + salt + salt
-	body := minimalYAML(filepath.Join(dir, "d"), hostile)
-	// fix hash - Build larger key
-	key := strings.Repeat("A", 43) // 32 bytes b64 raw
-	_ = key
-	// Use passwd package properly
-	// Construct via fmt with valid b64 of correct size then patch m=
-	good, _ := passwd.Hash("x")
-	// swap m= to huge
+	good, err := passwd.Hash("x")
+	if err != nil {
+		t.Fatal(err)
+	}
 	parts := strings.Split(good, "$")
-	// $ argon2id v= m=,t=,p= salt key
-	params := parts[3]
-	params = "m=2147483648,t=2,p=1"
-	hostile = "$" + parts[1] + "$" + parts[2] + "$" + params + "$" + parts[4] + "$" + parts[5]
-	body = minimalYAML(filepath.Join(dir, "d"), hostile)
+	// $ argon2id v= m=,t=,p= salt key — inflate memory cost
+	hostile := "$" + parts[1] + "$" + parts[2] + "$m=2147483648,t=2,p=1$" + parts[4] + "$" + parts[5]
+	body := minimalYAML(filepath.Join(dir, "d"), hostile)
 	path := writeYAML(t, dir, "hostile.yml", body)
 	if _, err := LoadFile(path); err == nil {
 		t.Fatal("hostile PHC must fail Validate")
 	}
-}
-
-// passwdEncoding helper — salt from a real hash
-func passwdEncoding() string {
-	h, _ := passwd.Hash("z")
-	parts := strings.Split(h, "$")
-	return parts[4]
 }
 
 func TestIsReadyRequiresEnabledUser(t *testing.T) {
@@ -303,5 +286,3 @@ func TestValidatePHCViaUser(t *testing.T) {
 		t.Fatal(err)
 	}
 }
-
-var _ = errors.New

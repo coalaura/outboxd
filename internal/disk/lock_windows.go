@@ -32,7 +32,7 @@ func Lock(path string) (*FileLock, error) {
 		}
 		return nil, fmt.Errorf("LockFileEx %s: %w", path, err)
 	}
-	return &FileLock{path: path, impl: &winFileLock{f: f}}, nil
+	return &FileLock{impl: &winFileLock{f: f}}, nil
 }
 
 type winFileLock struct {

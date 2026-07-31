@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -220,49 +221,12 @@ func TestGracefulShutdownTimeoutPath(t *testing.T) {
 	if runErr == nil {
 		t.Fatal("Run must return deadline/timeout error; got nil")
 	}
-	if !errors.Is(runErr, context.DeadlineExceeded) && !containsFold(runErr.Error(), "deadline") && !containsFold(runErr.Error(), "timeout") {
+	low := strings.ToLower(runErr.Error())
+	if !errors.Is(runErr, context.DeadlineExceeded) &&
+		!strings.Contains(low, "deadline") && !strings.Contains(low, "timeout") {
 		t.Fatalf("expected deadline/timeout in error, got %v", runErr)
 	}
 	_ = conn.Close()
-}
-
-func containsTimeout(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := err.Error()
-	return containsFold(s, "timeout") || containsFold(s, "deadline") || containsFold(s, "shutdown")
-}
-
-func containsFold(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || len(sub) == 0 ||
-		(func() bool {
-			for i := 0; i+len(sub) <= len(s); i++ {
-				if equalFoldASCII(s[i:i+len(sub)], sub) {
-					return true
-				}
-			}
-			return false
-		})())
-}
-
-func equalFoldASCII(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := 0; i < len(a); i++ {
-		ca, cb := a[i], b[i]
-		if ca >= 'A' && ca <= 'Z' {
-			ca += 'a' - 'A'
-		}
-		if cb >= 'A' && cb <= 'Z' {
-			cb += 'a' - 'A'
-		}
-		if ca != cb {
-			return false
-		}
-	}
-	return true
 }
 
 func TestNoLeakedWaiterOnListenerFail(t *testing.T) {

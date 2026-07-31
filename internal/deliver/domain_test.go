@@ -676,3 +676,84 @@ func TestDomainCapabilityThenTempKeepsPending(t *testing.T) {
 		t.Fatalf("must remain pending, got %s", env.Recipients[0].Status)
 	}
 }
+
+func TestRunQueueErrorCancelsAttemptsBeforeWait(t *testing.T) {
+	// Queue Next error must cancel in-flight attempts before wg.Wait (defer order).
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+
+	cfg := testDeliverCfg()
+	cfg.Delivery.MaxAttempts = 5
+	cfg.Delivery.ConnectionTimeout = "30s"
+	cfg.Delivery.SubmissionTimeout = "30s"
+	d := New(cfg, q, nopLogger{})
+
+	dialStarted := make(chan struct{})
+	dialCanceled := make(chan struct{})
+	var startOnce, cancelOnce sync.Once
+	d.SetResolver(&fixedResolver{
+		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com.", Pref: 10}}},
+		ips: map[string][]net.IP{"mx.ex.com": {net.ParseIP("127.0.0.1")}},
+	})
+	d.SetDialer(dialFn(func(ctx context.Context, network, address string) (net.Conn, error) {
+		startOnce.Do(func() { close(dialStarted) })
+		<-ctx.Done()
+		cancelOnce.Do(func() { close(dialCanceled) })
+		return nil, ctx.Err()
+	}))
+
+	now := time.Now()
+	env := &queue.Envelope{
+		ID: "hang-q", Username: "user", Sender: "sender@example.com",
+		Recipients: []queue.Recipient{{
+			Address: "r@ex.com", Domain: "ex.com", Status: queue.StatusPending,
+		}},
+		Created: now, NextAttempt: now,
+	}
+	body := []byte("From: sender@example.com\r\nTo: r@ex.com\r\nSubject: t\r\n\r\nHi\r\n")
+	if err := q.Add(env, body); err != nil {
+		t.Fatal(err)
+	}
+
+	sentinel := errors.New("queue next failed")
+	var calls atomic.Int32
+	realNext := q.Next
+	d.next = func(ctx context.Context) (*queue.Envelope, error) {
+		if calls.Add(1) == 1 {
+			return realNext(ctx)
+		}
+		<-dialStarted
+		return nil, sentinel
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("Run want sentinel, got %v", err)
+		}
+		select {
+		case <-dialCanceled:
+		default:
+			t.Fatal("dialer did not observe cancel before Run returned")
+		}
+	case <-time.After(2 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("Run hung after queue error; cancel must run before wg.Wait")
+	}
+}
+
+type dialFn func(ctx context.Context, network, address string) (net.Conn, error)
+
+func (f dialFn) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return f(ctx, network, address)
+}

@@ -916,7 +916,6 @@ func TestMultiMXMixedNetworkAndCapability(t *testing.T) {
 		net.JoinHostPort(ipCap.String(), "25"): addrCap,
 	}})
 	addEnvelope(t, q, "mix1", "björn@ex.com", "b@ex.com", "ex.com", true, false, nil)
-	// Single attempt path: pull once via Run briefly until L
 
 	// Deliverer will retry; cancel after first MX hosts have been tried (cap session ended).
 	cancel, done := runDeliverer(t, d)

@@ -147,6 +147,7 @@ func (c *Client) Rcpt(to string) error {
 	c.conn.SetDeadline(time.Now().Add(c.command))
 	defer c.conn.SetDeadline(time.Time{})
 
+	// c.cmd(25, ...) accepts the 250 reply class (exact code may vary, e.g. 250/251).
 	return c.cmd(25, "RCPT TO:<%s>", to)
 }
 

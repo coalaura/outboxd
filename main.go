@@ -98,6 +98,22 @@ func serve(configPath string) error {
 		return err
 	}
 
+	// Exclusive spool lock is daemon ownership: hold it before writing keys/certs.
+	spool, err := queue.Open(cfg.ResolvePath("queue"), queue.Limits{
+		MaxMessages: cfg.Server.MaxQueueMessages,
+		MaxBytes:    cfg.Server.MaxQueueBytes,
+		MinFreeDisk: cfg.Server.MinFreeDiskBytes,
+	})
+	if err != nil {
+		return err
+	}
+	defer spool.Close()
+	spool.FreeDisk = disk.FreeBytes
+
+	for _, cerr := range spool.Corrupt {
+		log.Warnln("corrupt queue entry:", cerr)
+	}
+
 	log.Println("Ensuring DKIM keys...")
 
 	signer, generated, err := sign.Ensure(cfg)
@@ -128,21 +144,6 @@ func serve(configPath string) error {
 	}
 
 	log.Printf("Wrote DNS instructions to %s\n", path)
-
-	spool, err := queue.Open(cfg.ResolvePath("queue"), queue.Limits{
-		MaxMessages: cfg.Server.MaxQueueMessages,
-		MaxBytes:    cfg.Server.MaxQueueBytes,
-		MinFreeDisk: cfg.Server.MinFreeDiskBytes,
-	})
-	if err != nil {
-		return err
-	}
-	defer spool.Close()
-	spool.FreeDisk = disk.FreeBytes
-
-	for _, cerr := range spool.Corrupt {
-		log.Warnln("corrupt queue entry:", cerr)
-	}
 
 	log.Println("Starting server...")
 

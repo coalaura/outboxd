@@ -23,7 +23,7 @@ func Lock(path string) (*FileLock, error) {
 		}
 		return nil, fmt.Errorf("flock %s: %w", path, err)
 	}
-	return &FileLock{path: path, impl: &unixFileLock{f: f}}, nil
+	return &FileLock{impl: &unixFileLock{f: f}}, nil
 }
 
 type unixFileLock struct {

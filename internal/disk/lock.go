@@ -9,7 +9,6 @@ var ErrLocked = errors.New("resource locked")
 // FileLock is an exclusive file lock held for the process lifetime of the open
 // file descriptor. Close releases the lock.
 type FileLock struct {
-	path string
 	impl fileLockImpl
 }
 

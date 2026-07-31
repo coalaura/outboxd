@@ -130,6 +130,9 @@ type Deliverer struct {
 
 	allowlist map[string]struct{}
 
+	// next pulls the next due envelope. Nil means use queue.Next (tests may override).
+	next func(context.Context) (*queue.Envelope, error)
+
 	// fatal signals Run to stop on queue persistence failure
 	mu    sync.Mutex
 	fatal error
@@ -158,6 +161,7 @@ func NewWithSigner(cfg *config.Config, spool *queue.Queue, log Logger, signer Si
 		resolver: netResolver{r: net.DefaultResolver},
 		dialer:   &net.Dialer{Timeout: config.Duration(cfg.Delivery.ConnectionTimeout)},
 		orderIPs: shuffleIPs,
+		next:     spool.Next,
 
 		active:  make(chan struct{}, attemptLimit),
 		global:  make(chan struct{}, cfg.Delivery.GlobalConcurrency),
@@ -207,6 +211,11 @@ func (d *Deliverer) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	next := d.next
+	if next == nil {
+		next = d.queue.Next
+	}
+
 	for {
 		if err := d.fatalErr(); err != nil {
 			cancel()
@@ -214,7 +223,7 @@ func (d *Deliverer) Run(ctx context.Context) error {
 			return err
 		}
 
-		envelope, err := d.queue.Next(ctx)
+		envelope, err := next(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				if ferr := d.fatalErr(); ferr != nil {

@@ -272,7 +272,7 @@ func dmarc(cfg *config.Config) string {
 
 	var builder strings.Builder
 
-	// Microwave default is p=none (monitor). Stage to quarantine/reject after verifying alignment.
+	// DMARC default is p=none (monitor). Stage to quarantine/reject after verifying alignment.
 	fmt.Fprintf(&builder, "v=DMARC1; p=%s; sp=%s; adkim=r; aspf=r", policy, policy)
 
 	rua := strings.TrimSpace(cfg.DNS.ReportURI)
