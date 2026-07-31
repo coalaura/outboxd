@@ -391,6 +391,10 @@ func (d *Deliverer) complete(envelope *queue.Envelope) error {
 		return fmt.Errorf("dsn %s: %w", envelope.ID, err)
 	}
 	if err := d.queue.Finish(envelope); err != nil {
+		if errors.Is(err, queue.ErrCleanup) {
+			d.log.Printf("finished %s with deferred cleanup: %s\n", envelope.ID, err)
+			return nil
+		}
 		return fmt.Errorf("finish %s: %w", envelope.ID, err)
 	}
 	return nil

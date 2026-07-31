@@ -113,6 +113,9 @@ func serve(configPath string) error {
 	for _, cerr := range spool.Corrupt {
 		log.Warnln("corrupt queue entry:", cerr)
 	}
+	for _, warning := range spool.Warnings {
+		log.Warnln("queue maintenance warning:", warning)
+	}
 
 	log.Println("Ensuring DKIM keys...")
 

@@ -166,6 +166,8 @@ type Queue struct {
 
 	// Corrupt holds reportable quarantine events from Open.
 	Corrupt []error
+	// Warnings holds nonfatal startup maintenance errors.
+	Warnings []error
 
 	// afterPublish is a test seam invoked after publication is signaled but
 	// before the publishing operation returns.
@@ -275,6 +277,8 @@ var (
 	ErrQueueBusy = errors.New("queue id is busy")
 	// ErrIDConflict is returned when an ID names a different durable queue item.
 	ErrIDConflict = errors.New("queue id conflict")
+	// ErrCleanup reports that terminal state committed but garbage cleanup did not.
+	ErrCleanup = errors.New("queue cleanup incomplete")
 )
 
 func (q *Queue) rejectReadOnly() error {
@@ -871,9 +875,10 @@ func (q *Queue) Finish(envelope *Envelope) error {
 		}
 		return err
 	}
-	_ = os.RemoveAll(dst)
-	_ = disk.Sync(q.trash)
 	q.noteRemoved(envelope.ID)
+	if err := q.removeTrash(dst); err != nil {
+		return fmt.Errorf("%w: %w", ErrCleanup, err)
+	}
 	return nil
 }
 
@@ -916,14 +921,28 @@ func (q *Queue) Bury(envelope *Envelope) error {
 	dst := filepath.Join(q.dead, envelope.ID)
 	if err := q.matchReady(envelope); err != nil {
 		if _, srcErr := os.Stat(src); errors.Is(srcErr, os.ErrNotExist) {
-			if _, deadErr := os.Stat(dst); deadErr == nil {
+			dead, deadErr := q.loadAcceptedDir(dst, envelope.ID)
+			if deadErr == nil {
+				if dead.Incarnation != envelope.Incarnation || dead.Revision != envelope.Revision {
+					return fmt.Errorf("%w: dead-letter identity changed", ErrIDConflict)
+				}
 				q.noteRemoved(envelope.ID)
 				return nil
+			}
+			if !errors.Is(deadErr, os.ErrNotExist) {
+				return deadErr
 			}
 		}
 		if !errors.Is(err, ErrIDConflict) {
 			reschedule()
 		}
+		return err
+	}
+	if _, err := os.Stat(dst); err == nil {
+		reschedule()
+		return fmt.Errorf("%w: dead-letter id %s already exists", ErrIDConflict, envelope.ID)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		reschedule()
 		return err
 	}
 	// Persist final status inside ready/ before the rename.
@@ -933,15 +952,6 @@ func (q *Queue) Bury(envelope *Envelope) error {
 			reschedule()
 		}
 		return err
-	}
-	// If a previous bury partially created dst, refuse to clobber blindly —
-	// move aside.
-	if _, err := os.Stat(dst); err == nil {
-		backup := dst + ".bak." + strconv.FormatInt(time.Now().UnixNano(), 10)
-		if err := disk.Rename(dst, backup); err != nil {
-			reschedule()
-			return err
-		}
 	}
 	moved, err := moveState(src, dst)
 	if err != nil {
@@ -1071,10 +1081,6 @@ func (q *Queue) DeadIDs() ([]string, error) {
 		if !e.IsDir() {
 			continue
 		}
-		// Bury may leave `<id>.bak.<nano>` sidecars; skip them so list stays clean.
-		if strings.Contains(e.Name(), ".bak.") {
-			continue
-		}
 		if err := ValidateID(e.Name()); err != nil {
 			continue
 		}
@@ -1088,12 +1094,15 @@ func (q *Queue) LoadDead(id string) (*Envelope, error) {
 	if err := ValidateID(id); err != nil {
 		return nil, err
 	}
-	return q.loadDir(filepath.Join(q.dead, id), id)
+	return q.loadAcceptedDir(filepath.Join(q.dead, id), id)
 }
 
 // ExportDead copies the original message to w.
 func (q *Queue) ExportDead(id string, w io.Writer) error {
 	if err := ValidateID(id); err != nil {
+		return err
+	}
+	if _, err := q.loadAcceptedDir(filepath.Join(q.dead, id), id); err != nil {
 		return err
 	}
 	f, err := os.Open(filepath.Join(q.dead, id, bodyName))
@@ -1110,6 +1119,9 @@ func (q *Queue) Reader(id string) (*os.File, error) {
 	if err := ValidateID(id); err != nil {
 		return nil, err
 	}
+	if _, err := q.loadAcceptedDir(filepath.Join(q.ready, id), id); err != nil {
+		return nil, err
+	}
 	return os.OpenFile(filepath.Join(q.ready, id, bodyName), os.O_RDONLY, 0)
 }
 
@@ -1118,12 +1130,17 @@ func (q *Queue) ReadBody(id string) ([]byte, error) {
 	if err := ValidateID(id); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(q.ready, id, bodyName)
-	body, err := os.ReadFile(path)
-	if err == nil {
-		return body, nil
+	ready := filepath.Join(q.ready, id)
+	if _, err := q.loadAcceptedDir(ready, id); err == nil {
+		return os.ReadFile(filepath.Join(ready, bodyName))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
 	}
-	return os.ReadFile(filepath.Join(q.dead, id, bodyName))
+	dead := filepath.Join(q.dead, id)
+	if _, err := q.loadAcceptedDir(dead, id); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(filepath.Join(dead, bodyName))
 }
 
 // Path returns the spool root.
@@ -1345,12 +1362,15 @@ func (q *Queue) loadDir(dir, expectID string) (*Envelope, error) {
 	if err := validateEnvelope(env); err != nil {
 		return nil, err
 	}
-	st, err := os.Stat(bodyPath)
+	st, err := os.Lstat(bodyPath)
 	if err != nil {
 		return nil, fmt.Errorf("missing body: %w", err)
 	}
-	if env.Size == 0 {
-		env.Size = st.Size()
+	if !st.Mode().IsRegular() {
+		return nil, errors.New("body is not a regular file")
+	}
+	if env.Size != st.Size() {
+		return nil, fmt.Errorf("body size mismatch: metadata=%d actual=%d", env.Size, st.Size())
 	}
 	return env, nil
 }
@@ -1376,7 +1396,7 @@ func Open(directory string, limits Limits) (*Queue, error) {
 		requeues:      make(map[string][]*Envelope),
 	}
 
-	if err := disk.Mkdir(q.root); err != nil {
+	if err := disk.MkdirDurable(q.root); err != nil {
 		return nil, err
 	}
 	lock, err := disk.Lock(filepath.Join(q.root, ".lock"))
@@ -1389,7 +1409,7 @@ func Open(directory string, limits Limits) (*Queue, error) {
 	q.lock = lock
 
 	for _, d := range []string{q.ready, q.dead, q.tmp, q.dsn, q.corr, q.trash} {
-		if err := disk.Mkdir(d); err != nil {
+		if err := disk.MkdirDurable(d); err != nil {
 			_ = q.Close()
 			return nil, err
 		}
@@ -1400,8 +1420,7 @@ func Open(directory string, limits Limits) (*Queue, error) {
 		return nil, err
 	}
 	if err := q.cleanTrash(); err != nil {
-		_ = q.Close()
-		return nil, err
+		q.Warnings = append(q.Warnings, fmt.Errorf("trash cleanup: %w", err))
 	}
 	if err := q.recoverDSN(); err != nil {
 		_ = q.Close()
@@ -1478,10 +1497,16 @@ func (q *Queue) cleanTrash() error {
 	if err != nil {
 		return err
 	}
+	var errs []error
 	for _, e := range entries {
-		_ = os.RemoveAll(filepath.Join(q.trash, e.Name()))
+		if err := disk.RemoveAll(filepath.Join(q.trash, e.Name())); err != nil {
+			errs = append(errs, fmt.Errorf("remove trash %s: %w", e.Name(), err))
+		}
 	}
-	return nil
+	if err := disk.Sync(q.trash); err != nil {
+		errs = append(errs, fmt.Errorf("sync trash: %w", err))
+	}
+	return errors.Join(errs...)
 }
 
 func (q *Queue) recoverDSN() error {
@@ -1634,10 +1659,48 @@ func (q *Queue) loadReady() error {
 			q.Corrupt = append(q.Corrupt, fmt.Errorf("ready %s: %w", id, err))
 			continue
 		}
+		deadDir := filepath.Join(q.dead, id)
+		dead, deadErr := q.loadAcceptedDir(deadDir, id)
+		if deadErr == nil {
+			if dead.Incarnation != env.Incarnation || dead.Revision != env.Revision {
+				return fmt.Errorf("%w: ready and dead entries differ for %s", ErrIDConflict, id)
+			}
+			if qerr := q.quarantineDir(dir, id+"-dead-duplicate"); qerr != nil {
+				return qerr
+			}
+			q.Corrupt = append(q.Corrupt, fmt.Errorf("ready %s: duplicate dead-letter entry", id))
+			continue
+		}
+		if !errors.Is(deadErr, os.ErrNotExist) {
+			if qerr := q.quarantineDir(deadDir, id+"-invalid-dead"); qerr != nil {
+				return qerr
+			}
+			q.Corrupt = append(q.Corrupt, fmt.Errorf("dead %s: %w", id, deadErr))
+		}
 		q.noteAddedLocked(env)
 		q.scheduleLocked(env)
 	}
 	return nil
+}
+
+func (q *Queue) loadAcceptedDir(dir, expectID string) (*Envelope, error) {
+	if err := acceptedDir(dir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			if _, statErr := os.Stat(dir); statErr == nil {
+				return nil, errors.New("queue entry is missing accepted state")
+			} else {
+				return nil, statErr
+			}
+		}
+		return nil, err
+	}
+	return q.loadDir(dir, expectID)
+}
+
+func (q *Queue) removeTrash(path string) error {
+	removeErr := disk.RemoveAll(path)
+	syncErr := disk.Sync(q.trash)
+	return errors.Join(removeErr, syncErr)
 }
 
 func (q *Queue) quarantineDir(src, name string) error {

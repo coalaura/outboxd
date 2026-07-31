@@ -9,6 +9,8 @@ import (
 // Hooks provide a narrow fault-injection seam for tests. Production code
 // leaves them nil.
 type Hooks struct {
+	// BeforeRemoveAll is called immediately before recursively removing a path.
+	BeforeRemoveAll func(path string) error
 	// BeforeSyncFile is called immediately before syncing an open file.
 	BeforeSyncFile func(path string) error
 	// AfterSyncFile is called after a successful file sync.
@@ -62,6 +64,78 @@ func SyncFile(file *os.File) error {
 // Mkdir creates a directory and its parents with owner-only permissions.
 func Mkdir(path string) error {
 	return os.MkdirAll(path, 0700)
+}
+
+// MkdirDurable creates each missing directory component and syncs its parent.
+func MkdirDurable(path string) error {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	missing := make([]string, 0, 4)
+	for current := abs; ; current = filepath.Dir(current) {
+		info, statErr := os.Stat(current)
+		if statErr == nil {
+			if !info.IsDir() {
+				return &os.PathError{Op: "mkdir", Path: current, Err: os.ErrExist}
+			}
+			break
+		}
+		if !os.IsNotExist(statErr) {
+			return statErr
+		}
+		missing = append(missing, current)
+		if parent := filepath.Dir(current); parent == current {
+			return statErr
+		}
+	}
+	if len(missing) == 0 {
+		// Repair a prior attempt that created a component but could not confirm
+		// its parent sync. Walk all ancestors because the failed component is
+		// not knowable on retry.
+		for current := abs; ; current = filepath.Dir(current) {
+			parent := filepath.Dir(current)
+			if parent == current {
+				break
+			}
+			if err := Sync(parent); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for i := len(missing) - 1; i >= 0; i-- {
+		created, err := mkdirDurableComponent(missing[i])
+		if err != nil {
+			if !os.IsExist(err) {
+				return err
+			}
+			info, statErr := os.Stat(missing[i])
+			if statErr != nil {
+				return statErr
+			}
+			if !info.IsDir() {
+				return &os.PathError{Op: "mkdir", Path: missing[i], Err: os.ErrExist}
+			}
+		}
+		if err := Sync(filepath.Dir(missing[i])); err != nil {
+			if created {
+				_ = os.Remove(missing[i])
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// RemoveAll recursively removes path through the test fault seam.
+func RemoveAll(path string) error {
+	if h := currentHooks(); h.BeforeRemoveAll != nil {
+		if err := h.BeforeRemoveAll(path); err != nil {
+			return err
+		}
+	}
+	return os.RemoveAll(path)
 }
 
 // Temp creates a temporary file inside the target directory of path.

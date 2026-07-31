@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -90,6 +92,26 @@ func writeAcceptedMarker(t *testing.T, dir string) {
 	if err := os.WriteFile(filepath.Join(dir, addStateName), []byte(addAccepted), 0600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func writeQueueEntry(t *testing.T, root, namespace string, env *Envelope, body []byte) string {
+	t.Helper()
+	dir := filepath.Join(root, namespace, env.ID)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, metaName), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, bodyName), body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	writeAcceptedMarker(t, dir)
+	return dir
 }
 
 func TestAddPersistsAndOpenRecovers(t *testing.T) {
@@ -2228,5 +2250,508 @@ func TestSMTPUTF8InvariantOpenQuarantine(t *testing.T) {
 	}
 	if q.Len() != 0 {
 		t.Fatal("must not schedule violating entry")
+	}
+}
+
+func TestOpenQuarantinesBodySizeMismatch(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		metadata int64
+		body     []byte
+	}{
+		{name: "smaller", metadata: 1, body: []byte("body")},
+		{name: "larger", metadata: 10, body: []byte("body")},
+		{name: "zero", metadata: 0, body: []byte("body")},
+		{name: "nonzero_empty", metadata: 1, body: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearHooks(t)
+			root := t.TempDir()
+			_ = mustOpen(t, root, Limits{}).Close()
+			env := testEnv("size-" + tc.name)
+			env.Size = tc.metadata
+			dir := writeQueueEntry(t, root, dirReady, env, tc.body)
+
+			q := mustOpen(t, root, Limits{})
+			if q.Len() != 0 {
+				t.Fatalf("Len=%d want 0", q.Len())
+			}
+			if messages, bytes := q.Stats(); messages != 0 || bytes != 0 {
+				t.Fatalf("Stats=(%d, %d) want (0, 0)", messages, bytes)
+			}
+			if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("mismatched entry remains ready: %v", err)
+			}
+			if len(q.Corrupt) == 0 || len(corruptEntries(t, root)) == 0 {
+				t.Fatal("size mismatch was not reported and quarantined")
+			}
+		})
+	}
+}
+
+func TestDeadBodySizeMismatchIsRejected(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("dead-size-mismatch")
+	env.Size = 1
+	writeQueueEntry(t, root, dirDead, env, []byte("body"))
+	if _, err := q.LoadDead(env.ID); err == nil || !strings.Contains(err.Error(), "body size mismatch") {
+		t.Fatalf("LoadDead error=%v", err)
+	}
+	if _, err := q.ReviveDead(env.ID); err == nil || !strings.Contains(err.Error(), "body size mismatch") {
+		t.Fatalf("ReviveDead error=%v", err)
+	}
+	if err := q.ExportDead(env.ID, io.Discard); err == nil || !strings.Contains(err.Error(), "body size mismatch") {
+		t.Fatalf("ExportDead error=%v", err)
+	}
+	if _, err := q.ReadBody(env.ID); err == nil || !strings.Contains(err.Error(), "body size mismatch") {
+		t.Fatalf("ReadBody error=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, dirDead, env.ID, bodyName)); err != nil {
+		t.Fatalf("dead entry changed: %v", err)
+	}
+}
+
+func TestAddAccountsActualBodySize(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	env := testEnv("actual-size")
+	env.Size = 999
+	body := []byte("actual")
+	if err := q.Add(env, body); err != nil {
+		t.Fatal(err)
+	}
+	if env.Size != int64(len(body)) {
+		t.Fatalf("Size=%d want %d", env.Size, len(body))
+	}
+	if messages, bytes := q.Stats(); messages != 1 || bytes != int64(len(body)) {
+		t.Fatalf("Stats=(%d, %d)", messages, bytes)
+	}
+}
+
+func TestBuryRejectsDeadIDCollisionWithoutMutation(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("bury-collision")
+	if err := q.Add(env, []byte("ready body")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Recipients[0].Status = StatusFailed
+	dead := testEnv(got.ID)
+	dead.Incarnation = strings.Repeat("1", 32)
+	dead.Size = int64(len("dead body"))
+	deadDir := writeQueueEntry(t, root, dirDead, dead, []byte("dead body"))
+	beforeMeta, err := os.ReadFile(filepath.Join(deadDir, metaName))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := q.Bury(got); !errors.Is(err, ErrIDConflict) {
+		t.Fatalf("Bury error=%v want ErrIDConflict", err)
+	}
+	readyBody, err := os.ReadFile(filepath.Join(root, dirReady, got.ID, bodyName))
+	if err != nil || string(readyBody) != "ready body" {
+		t.Fatalf("ready body=%q err=%v", readyBody, err)
+	}
+	afterMeta, err := os.ReadFile(filepath.Join(deadDir, metaName))
+	if err != nil || string(afterMeta) != string(beforeMeta) {
+		t.Fatalf("dead metadata changed: %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, dirDead))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != got.ID {
+		t.Fatalf("dead entries=%v", entries)
+	}
+	if q.Len() != 1 {
+		t.Fatalf("ready item was not rescheduled, Len=%d", q.Len())
+	}
+}
+
+func TestBuryMissingReadyRequiresMatchingDeadIdentity(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	dead := testEnv("bury-stale")
+	dead.Size = 4
+	writeQueueEntry(t, root, dirDead, dead, []byte("body"))
+	stale := *dead
+	stale.Incarnation = strings.Repeat("2", 32)
+	if err := q.Bury(&stale); !errors.Is(err, ErrIDConflict) {
+		t.Fatalf("Bury error=%v want ErrIDConflict", err)
+	}
+}
+
+func TestOpenQuarantinesReadyDeadCollision(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	ready := testEnv("open-dead-collision")
+	if err := q.Add(ready, []byte("ready")); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dead := testEnv(ready.ID)
+	dead.Incarnation = strings.Repeat("3", 32)
+	dead.Size = 4
+	deadDir := writeQueueEntry(t, root, dirDead, dead, []byte("dead"))
+
+	if _, err := Open(root, Limits{}); !errors.Is(err, ErrIDConflict) {
+		t.Fatalf("Open error=%v want ErrIDConflict", err)
+	}
+	if _, err := os.Stat(deadDir); err != nil {
+		t.Fatalf("dead entry changed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, dirReady, ready.ID)); err != nil {
+		t.Fatalf("ready entry changed: %v", err)
+	}
+}
+
+func TestOpenQuarantinesInvalidDeadCollisionAndLoadsReady(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("invalid-dead-collision")
+	if err := q.Add(env, []byte("ready")); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deadDir := filepath.Join(root, dirDead, env.ID)
+	if err := os.Mkdir(deadDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deadDir, metaName), []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	q2 := mustOpen(t, root, Limits{})
+	if q2.Len() != 1 {
+		t.Fatalf("Len=%d want 1", q2.Len())
+	}
+	if len(q2.Corrupt) == 0 || len(corruptEntries(t, root)) == 0 {
+		t.Fatal("invalid dead entry was not quarantined")
+	}
+}
+
+func TestDeadIDsAllowsBakSubstring(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	if err := os.Mkdir(filepath.Join(root, dirDead, "real.bak.id"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := q.DeadIDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 || ids[0] != "real.bak.id" {
+		t.Fatalf("DeadIDs=%v", ids)
+	}
+}
+
+func TestTrashCleanupReportsAndRetriesFailure(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	trashEntry := filepath.Join(root, dirTrash, "leftover")
+	if err := os.Mkdir(trashEntry, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("remove trash")
+	syncAttempted := false
+	disk.SetHooks(disk.Hooks{BeforeRemoveAll: func(path string) error {
+		if filepath.Clean(path) == filepath.Clean(trashEntry) {
+			return wantErr
+		}
+		return nil
+	}, BeforeSyncDir: func(path string) error {
+		if filepath.Clean(path) == filepath.Join(root, dirTrash) {
+			syncAttempted = true
+		}
+		return nil
+	}})
+	q2, err := Open(root, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(q2.Warnings) != 1 || !errors.Is(q2.Warnings[0], wantErr) {
+		t.Fatalf("Warnings=%v want %v", q2.Warnings, wantErr)
+	}
+	if !syncAttempted {
+		t.Fatal("trash directory was not synced after removal failure")
+	}
+	if _, err := os.Stat(trashEntry); err != nil {
+		t.Fatalf("failed trash entry removed: %v", err)
+	}
+	if err := q2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	disk.SetHooks(disk.Hooks{})
+	q3 := mustOpen(t, root, Limits{})
+	if entries, err := os.ReadDir(q3.trash); err != nil || len(entries) != 0 {
+		t.Fatalf("trash entries=%v err=%v", entries, err)
+	}
+}
+
+func TestFinishReportsTrashSyncFailureAfterRemoval(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("finish-sync-error")
+	if err := q.Add(env, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("sync trash")
+	trash := filepath.Join(root, dirTrash)
+	seenRemoval := false
+	disk.SetHooks(disk.Hooks{
+		BeforeRemoveAll: func(string) error { seenRemoval = true; return nil },
+		BeforeSyncDir: func(path string) error {
+			if seenRemoval && filepath.Clean(path) == filepath.Clean(trash) {
+				return wantErr
+			}
+			return nil
+		},
+	})
+	if err := q.Finish(got); !errors.Is(err, ErrCleanup) || !errors.Is(err, wantErr) {
+		t.Fatalf("Finish error=%v want %v", err, wantErr)
+	}
+	if entries, err := os.ReadDir(trash); err != nil || len(entries) != 0 {
+		t.Fatalf("trash=%v err=%v", entries, err)
+	}
+	if messages, bytes := q.Stats(); messages != 0 || bytes != 0 {
+		t.Fatalf("Stats=(%d, %d) want (0, 0)", messages, bytes)
+	}
+}
+
+func TestFinishAccountsRemovalBeforeTrashCleanupError(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("finish-cleanup-error")
+	if err := q.Add(env, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("remove trash")
+	disk.SetHooks(disk.Hooks{BeforeRemoveAll: func(path string) error { return wantErr }})
+	if err := q.Finish(got); !errors.Is(err, ErrCleanup) || !errors.Is(err, wantErr) {
+		t.Fatalf("Finish error=%v want %v", err, wantErr)
+	}
+	if q.Len() != 0 {
+		t.Fatalf("Len=%d want 0", q.Len())
+	}
+	if messages, bytes := q.Stats(); messages != 0 || bytes != 0 {
+		t.Fatalf("Stats=(%d, %d) want (0, 0)", messages, bytes)
+	}
+	disk.SetHooks(disk.Hooks{})
+	q2 := mustReopen(t, q, root, Limits{})
+	if q2.Len() != 0 {
+		t.Fatalf("reopened Len=%d want 0", q2.Len())
+	}
+}
+
+func TestOpenDurablyCreatesFreshTopology(t *testing.T) {
+	clearHooks(t)
+	base := t.TempDir()
+	root := filepath.Join(base, "one", "two", "spool")
+	var synced []string
+	disk.SetHooks(disk.Hooks{AfterSyncDir: func(path string) error {
+		synced = append(synced, filepath.Clean(path))
+		return nil
+	}})
+	q, err := Open(root, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	for _, expected := range []string{base, filepath.Join(base, "one"), filepath.Join(base, "one", "two"), root} {
+		count := 0
+		for _, path := range synced {
+			if filepath.Clean(expected) == path {
+				count++
+			}
+		}
+		if count == 0 {
+			t.Fatalf("parent %s was not synced; calls=%v", expected, synced)
+		}
+	}
+	rootSyncs := 0
+	for _, path := range synced {
+		if path == filepath.Clean(root) {
+			rootSyncs++
+		}
+	}
+	if rootSyncs < 6 { // each of the six state directories
+		t.Fatalf("root sync count=%d want at least 6; calls=%v", rootSyncs, synced)
+	}
+	for _, name := range []string{dirReady, dirDead, dirTmp, dirDSN, dirCorrupt, dirTrash} {
+		if info, err := os.Stat(filepath.Join(root, name)); err != nil || !info.IsDir() {
+			t.Fatalf("topology %s: info=%v err=%v", name, info, err)
+		}
+	}
+}
+
+const queueCrashExitCode = 86
+
+func TestQueueCrashHelper(t *testing.T) {
+	scenario := os.Getenv("OUTBOXD_QUEUE_CRASH_SCENARIO")
+	if scenario == "" {
+		return
+	}
+	root := os.Getenv("OUTBOXD_QUEUE_CRASH_ROOT")
+	q, err := Open(root, Limits{})
+	if err != nil {
+		os.Exit(87)
+	}
+	crash := func() error { os.Exit(queueCrashExitCode); return nil }
+	switch scenario {
+	case "add-after-rename":
+		disk.SetHooks(disk.Hooks{AfterRename: func(oldpath, newpath string) error {
+			if filepath.Clean(oldpath) == filepath.Join(root, dirTmp, "crash-add") && filepath.Clean(newpath) == filepath.Join(root, dirReady, "crash-add") {
+				return crash()
+			}
+			return nil
+		}})
+		_ = q.Add(testEnv("crash-add"), []byte("body"))
+	case "add-after-accept-sync":
+		state := filepath.Join(root, dirReady, "crash-accepted", addStateName)
+		disk.SetHooks(disk.Hooks{AfterSyncFile: func(path string) error {
+			if filepath.Clean(path) == filepath.Clean(state) {
+				return crash()
+			}
+			return nil
+		}})
+		_ = q.Add(testEnv("crash-accepted"), []byte("body"))
+	case "retry-after-meta-rename":
+		env, nextErr := q.Next(context.Background())
+		if nextErr != nil {
+			os.Exit(87)
+		}
+		env.NextAttempt = env.NextAttempt.Add(time.Hour)
+		meta := filepath.Join(root, dirReady, env.ID, metaName)
+		disk.SetHooks(disk.Hooks{AfterRename: func(_, newpath string) error {
+			if filepath.Clean(newpath) == filepath.Clean(meta) {
+				return crash()
+			}
+			return nil
+		}})
+		_ = q.Retry(env)
+	case "finish-before-source-sync", "finish-after-source-sync":
+		env, nextErr := q.Next(context.Background())
+		if nextErr != nil {
+			os.Exit(87)
+		}
+		disk.SetHooks(disk.Hooks{
+			BeforeSyncDir: func(path string) error {
+				if scenario == "finish-before-source-sync" && filepath.Clean(path) == filepath.Join(root, dirReady) {
+					return crash()
+				}
+				return nil
+			},
+			AfterSyncDir: func(path string) error {
+				if scenario == "finish-after-source-sync" && filepath.Clean(path) == filepath.Join(root, dirReady) {
+					return crash()
+				}
+				return nil
+			},
+		})
+		_ = q.Finish(env)
+	default:
+		os.Exit(87)
+	}
+	os.Exit(88)
+}
+
+func runQueueCrash(t *testing.T, root, scenario string) {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, executable, "-test.run=^TestQueueCrashHelper$")
+	cmd.Env = append(os.Environ(), "OUTBOXD_QUEUE_CRASH_ROOT="+root, "OUTBOXD_QUEUE_CRASH_SCENARIO="+scenario)
+	err = cmd.Run()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("crash helper %s timed out", scenario)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != queueCrashExitCode {
+		t.Fatalf("crash helper %s error=%v", scenario, err)
+	}
+}
+
+func TestQueueSubprocessCrashRecovery(t *testing.T) {
+	for _, scenario := range []string{"add-after-rename", "add-after-accept-sync", "retry-after-meta-rename", "finish-before-source-sync", "finish-after-source-sync"} {
+		t.Run(scenario, func(t *testing.T) {
+			clearHooks(t)
+			root := t.TempDir()
+			q := mustOpen(t, root, Limits{})
+			if strings.HasPrefix(scenario, "retry-") {
+				if err := q.Add(testEnv("crash-retry"), []byte("body")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if strings.HasPrefix(scenario, "finish-") {
+				if err := q.Add(testEnv("crash-finish"), []byte("body")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := q.Close(); err != nil {
+				t.Fatal(err)
+			}
+			runQueueCrash(t, root, scenario)
+
+			reopened := mustOpen(t, root, Limits{})
+			switch scenario {
+			case "add-after-rename":
+				if reopened.Len() != 0 || len(reopened.Corrupt) == 0 {
+					t.Fatalf("Len=%d Corrupt=%v", reopened.Len(), reopened.Corrupt)
+				}
+			case "add-after-accept-sync":
+				if reopened.Len() != 1 {
+					t.Fatalf("Len=%d want 1", reopened.Len())
+				}
+			case "retry-after-meta-rename":
+				if reopened.Len() != 1 {
+					t.Fatalf("Len=%d want 1", reopened.Len())
+				}
+				env, err := reopened.loadDir(filepath.Join(root, dirReady, "crash-retry"), "crash-retry")
+				if err != nil || env.Revision != 2 || !env.NextAttempt.After(time.Now().Add(30*time.Minute)) {
+					t.Fatalf("stored envelope=%#v err=%v", env, err)
+				}
+			default:
+				if reopened.Len() != 0 {
+					t.Fatalf("finished message recovered, Len=%d", reopened.Len())
+				}
+				entries, err := os.ReadDir(filepath.Join(root, dirTrash))
+				if err != nil || len(entries) != 0 {
+					t.Fatalf("trash=%v err=%v", entries, err)
+				}
+			}
+		})
 	}
 }

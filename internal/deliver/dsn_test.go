@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/coalaura/outboxd/internal/config"
+	"github.com/coalaura/outboxd/internal/disk"
 	"github.com/coalaura/outboxd/internal/queue"
 )
 
@@ -28,6 +29,47 @@ func loadReadyEnvelope(t *testing.T, root, id string) *queue.Envelope {
 		t.Fatal(err)
 	}
 	return env
+}
+
+func TestCompleteIgnoresDeferredTrashCleanup(t *testing.T) {
+	disk.SetHooks(disk.Hooks{})
+	t.Cleanup(func() { disk.SetHooks(disk.Hooks{}) })
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	now := time.Now()
+	env := &queue.Envelope{
+		ID:       "cleanup-warning",
+		Username: "user",
+		Sender:   "sender@example.test",
+		Recipients: []queue.Recipient{{
+			Address: "recipient@example.test",
+			Domain:  "example.test",
+			Status:  queue.StatusPending,
+		}},
+		Created:     now,
+		NextAttempt: now,
+	}
+	if err := q.Add(env, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Recipients[0].Status = queue.StatusSent
+	disk.SetHooks(disk.Hooks{BeforeRemoveAll: func(string) error {
+		return os.ErrPermission
+	}})
+	d := New(&config.Config{Server: config.Server{Hostname: "mail.test"}}, q, nopLog{})
+	if err := d.complete(got); err != nil {
+		t.Fatalf("complete returned cleanup warning: %v", err)
+	}
+	if messages, bytes := q.Stats(); messages != 0 || bytes != 0 {
+		t.Fatalf("Stats=(%d, %d) want (0, 0)", messages, bytes)
+	}
 }
 
 func TestEnsureDSNFlagsASCII(t *testing.T) {

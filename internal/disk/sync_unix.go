@@ -3,9 +3,7 @@
 package disk
 
 import (
-	"errors"
 	"os"
-	"syscall"
 )
 
 // Sync flushes a directory entry so renames survive a crash.
@@ -24,9 +22,6 @@ func Sync(path string) error {
 
 	err = directory.Sync()
 
-	if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) {
-		err = nil
-	}
 	if err != nil {
 		return err
 	}
