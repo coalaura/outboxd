@@ -25,15 +25,26 @@ func clearHooks(t *testing.T) {
 func testEnv(id string) *Envelope {
 	now := time.Now().UTC().Truncate(time.Second)
 	return &Envelope{
-		ID:       id,
-		Username: "alice",
-		Sender:   "alice@example.com",
+		ID:          id,
+		Incarnation: strings.Repeat("0", 32),
+		Revision:    1,
+		Username:    "alice",
+		Sender:      "alice@example.com",
 		Recipients: []Recipient{
 			{Address: "bob@example.com", Domain: "example.com", Status: StatusPending},
 		},
 		Created:     now,
 		NextAttempt: now,
 	}
+}
+
+func testDSN(source *Envelope) *Envelope {
+	env := testEnv(DSNID(source.ID, source.Incarnation, source.DSNGeneration))
+	env.Sender = ""
+	env.DSNSourceID = source.ID
+	env.DSNSourceIncarnation = source.Incarnation
+	env.DSNGeneration = source.DSNGeneration
+	return env
 }
 
 func mustOpen(t *testing.T, dir string, limits Limits) *Queue {
@@ -562,6 +573,78 @@ func TestRetryPersistenceFailureStillRecoverable(t *testing.T) {
 	}
 }
 
+func TestRetryReconcilesPostRenameMetadataError(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("retry-post-rename")
+	if err := q.Add(env, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Attempts++
+	priorRevision := got.Revision
+	wantErr := errors.New("inject post-rename metadata error")
+	disk.SetHooks(disk.Hooks{AfterRename: func(oldpath, newpath string) error {
+		if filepath.Clean(newpath) == filepath.Join(root, dirReady, got.ID, metaName) {
+			return wantErr
+		}
+		return nil
+	}})
+	if err := q.Retry(got); !errors.Is(err, wantErr) {
+		t.Fatalf("Retry error=%v, want %v", err, wantErr)
+	}
+	disk.SetHooks(disk.Hooks{})
+	if got.Revision != priorRevision+1 {
+		t.Fatalf("Revision=%d want %d", got.Revision, priorRevision+1)
+	}
+	retried, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Finish(retried); err != nil {
+		t.Fatalf("finish reconciled retry: %v", err)
+	}
+}
+
+func TestRetryReleasesOwnershipBeforeScheduling(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	env := testEnv("retry-consumer-handoff")
+	if err := q.Add(env, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	published := make(chan struct{})
+	release := make(chan struct{})
+	q.afterPublish = func() {
+		close(published)
+		<-release
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- q.Retry(got)
+	}()
+	<-published
+	retried, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Finish(retried); err != nil {
+		t.Fatalf("immediate retried-message consumer: %v", err)
+	}
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBuryAtomic(t *testing.T) {
 	clearHooks(t)
 	root := t.TempDir()
@@ -901,12 +984,169 @@ func TestReviveDeadReservesCapacityAndRollsBack(t *testing.T) {
 	if revived.Recipients[0].Status != StatusPending || revived.LastError != "" {
 		t.Fatalf("unexpected revived envelope: %#v", revived)
 	}
+	if revived.DSNGeneration != 1 {
+		t.Fatalf("revived DSN generation=%d want 1", revived.DSNGeneration)
+	}
+	if DSNID(revived.ID, revived.Incarnation, revived.DSNGeneration) == DSNID(revived.ID, revived.Incarnation, 0) {
+		t.Fatal("revived message retained its prior DSN identity")
+	}
 	if messages, bytes := q.Stats(); messages != 1 || bytes != 4 {
 		t.Fatalf("Stats=(%d, %d) want (1, 4)", messages, bytes)
 	}
 	q2 := mustReopen(t, q, root, Limits{MaxMessages: 1})
 	if q2.Len() != 1 {
 		t.Fatalf("reopened Len=%d want 1", q2.Len())
+	}
+}
+
+func TestReviveDeadRollsBackActivationFailure(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("revive-activation-failure")
+	if err := q.Add(env, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Recipients[0].Status = StatusFailed
+	got.Recipients[0].Detail = "permanent diagnostic"
+	if err := q.Bury(got); err != nil {
+		t.Fatal(err)
+	}
+	deadDir := filepath.Join(root, dirDead, got.ID)
+	original, err := os.ReadFile(filepath.Join(deadDir, metaName))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantErr := errors.New("inject revive activation failure")
+	disk.SetHooks(disk.Hooks{BeforeRename: func(oldpath, newpath string) error {
+		if filepath.Clean(oldpath) == filepath.Join(root, dirReady, got.ID, reviveMetaName) &&
+			filepath.Clean(newpath) == filepath.Join(root, dirReady, got.ID, metaName) {
+			return wantErr
+		}
+		return nil
+	}})
+	if _, err := q.ReviveDead(got.ID); !errors.Is(err, wantErr) {
+		t.Fatalf("ReviveDead error=%v, want %v", err, wantErr)
+	}
+	disk.SetHooks(disk.Hooks{})
+
+	after, err := os.ReadFile(filepath.Join(deadDir, metaName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(original) {
+		t.Fatal("activation failure changed dead metadata")
+	}
+	if _, err := os.Stat(filepath.Join(deadDir, reviveMetaName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staged revive metadata remains: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, dirReady, got.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ready entry remains after rollback: %v", err)
+	}
+	if messages, bytes := q.Stats(); messages != 0 || bytes != 0 {
+		t.Fatalf("Stats=(%d, %d) want (0, 0)", messages, bytes)
+	}
+	if _, err := q.ReviveDead(got.ID); err != nil {
+		t.Fatalf("retry ReviveDead: %v", err)
+	}
+}
+
+func TestReviveDeadReconcilesFailedActivationRollback(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("revive-rollback-failure")
+	if err := q.Add(env, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Recipients[0].Status = StatusFailed
+	if err := q.Bury(got); err != nil {
+		t.Fatal(err)
+	}
+
+	activationErr := errors.New("inject activation failure")
+	rollbackErr := errors.New("inject rollback failure")
+	disk.SetHooks(disk.Hooks{BeforeRename: func(oldpath, newpath string) error {
+		switch {
+		case filepath.Clean(oldpath) == filepath.Join(root, dirReady, got.ID, reviveMetaName):
+			return activationErr
+		case filepath.Clean(oldpath) == filepath.Join(root, dirReady, got.ID) &&
+			filepath.Clean(newpath) == filepath.Join(root, dirDead, got.ID):
+			return rollbackErr
+		default:
+			return nil
+		}
+	}})
+	revived, err := q.ReviveDead(got.ID)
+	if !errors.Is(err, activationErr) || !errors.Is(err, rollbackErr) {
+		t.Fatalf("ReviveDead error=%v, want activation and rollback errors", err)
+	}
+	disk.SetHooks(disk.Hooks{})
+	if revived == nil {
+		t.Fatal("ReviveDead did not report the reconciled live envelope")
+	}
+	if q.Len() != 1 {
+		t.Fatalf("Len=%d want 1", q.Len())
+	}
+	if messages, bytes := q.Stats(); messages != 1 || bytes != 4 {
+		t.Fatalf("Stats=(%d, %d) want (1, 4)", messages, bytes)
+	}
+	queued, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Finish(queued); err != nil {
+		t.Fatalf("finish reconciled revive: %v", err)
+	}
+}
+
+func TestReviveDeadReleasesOwnershipBeforeScheduling(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	env := testEnv("revive-consumer-handoff")
+	if err := q.Add(env, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Recipients[0].Status = StatusFailed
+	if err := q.Bury(got); err != nil {
+		t.Fatal(err)
+	}
+
+	published := make(chan struct{})
+	release := make(chan struct{})
+	q.afterPublish = func() {
+		close(published)
+		<-release
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := q.ReviveDead(got.ID)
+		result <- err
+	}()
+	<-published
+	revived, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Finish(revived); err != nil {
+		t.Fatalf("immediate revived-message consumer: %v", err)
+	}
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1091,13 +1331,12 @@ func TestQuotaLimits(t *testing.T) {
 func TestDSNExemptFromMessageQuota(t *testing.T) {
 	clearHooks(t)
 	q := mustOpen(t, t.TempDir(), Limits{MaxMessages: 1})
-	if err := q.Add(testEnv("ord1"), []byte("a")); err != nil {
+	source := testEnv("ord1")
+	if err := q.Add(source, []byte("a")); err != nil {
 		t.Fatal(err)
 	}
-	dsn := testEnv("dsn1")
-	dsn.IsDSN = true
-	dsn.Sender = ""
-	if err := q.Add(dsn, []byte("dsn-body")); err != nil {
+	dsn := testDSN(source)
+	if err := q.AddDSN(source, dsn, []byte("dsn-body")); err != nil {
 		t.Fatalf("DSN Add must succeed at MaxMessages: %v", err)
 	}
 	if err := q.Add(testEnv("ord2"), []byte("b")); !errors.Is(err, ErrQueueFull) {
@@ -1108,12 +1347,630 @@ func TestDSNExemptFromMessageQuota(t *testing.T) {
 func TestDSNStillSubjectToMinFreeDisk(t *testing.T) {
 	clearHooks(t)
 	q := mustOpen(t, t.TempDir(), Limits{MinFreeDisk: 1 << 30})
+	source := testEnv("dsn-disk-source")
+	if err := q.Add(source, []byte("source")); err != nil {
+		t.Fatal(err)
+	}
 	q.FreeDisk = func(string) (int64, error) { return 100, nil }
-	dsn := testEnv("dsn-disk")
-	dsn.IsDSN = true
-	dsn.Sender = ""
-	if err := q.Add(dsn, []byte("x")); !errors.Is(err, ErrInsufficientDisk) {
+	dsn := testDSN(source)
+	if err := q.AddDSN(source, dsn, []byte("x")); !errors.Is(err, ErrInsufficientDisk) {
 		t.Fatalf("want ErrInsufficientDisk got %v", err)
+	}
+}
+
+func TestDSNIDUsesCompleteSourceIdentity(t *testing.T) {
+	prefix := strings.Repeat("a", 180)
+	first := prefix + "-first"
+	second := prefix + "-second"
+	incarnation := strings.Repeat("1", 32)
+	firstID := DSNID(first, incarnation, 0)
+	secondID := DSNID(second, incarnation, 0)
+	if firstID == secondID {
+		t.Fatal("long source IDs produced the same DSN ID")
+	}
+	if firstID == DSNID(first, incarnation, 1) {
+		t.Fatal("DSN generation did not affect the ID")
+	}
+	if firstID == DSNID(first, strings.Repeat("2", 32), 0) {
+		t.Fatal("source incarnation did not affect the ID")
+	}
+	if err := ValidateID(firstID); err != nil {
+		t.Fatalf("derived ID is invalid: %v", err)
+	}
+}
+
+func TestAddDSNLinksSourceBeforePublicationAndRecovers(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	source := testEnv("dsn-source-link")
+	if err := q.Add(source, []byte("source")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.Next(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	dsn := testDSN(source)
+	wantErr := errors.New("stop before DSN publication")
+	observedLink := false
+	disk.SetHooks(disk.Hooks{BeforeRename: func(oldpath, newpath string) error {
+		if oldpath != filepath.Join(root, dirDSN, dsn.ID) || newpath != filepath.Join(root, dirReady, dsn.ID) {
+			return nil
+		}
+		raw, err := os.ReadFile(filepath.Join(root, dirReady, source.ID, metaName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var linked Envelope
+		if err := json.Unmarshal(raw, &linked); err != nil {
+			t.Fatal(err)
+		}
+		if linked.DSNID != dsn.ID {
+			t.Fatalf("source DSNID=%q before publication, want %q", linked.DSNID, dsn.ID)
+		}
+		observedLink = true
+		return wantErr
+	}})
+	if err := q.AddDSN(source, dsn, []byte("dsn")); !errors.Is(err, wantErr) {
+		t.Fatalf("AddDSN error=%v, want %v", err, wantErr)
+	}
+	if !observedLink {
+		t.Fatal("DSN publication was not observed")
+	}
+	if source.DSNID != "" {
+		t.Fatal("failed publication changed caller source state")
+	}
+	if err := q.Finish(source); !errors.Is(err, ErrIDConflict) {
+		t.Fatalf("stale Finish error=%v, want ErrIDConflict", err)
+	}
+	if err := q.Bury(source); !errors.Is(err, ErrIDConflict) {
+		t.Fatalf("stale Bury error=%v, want ErrIDConflict", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, dirDSN, dsn.ID)); err != nil {
+		t.Fatalf("linked stage missing: %v", err)
+	}
+
+	disk.SetHooks(disk.Hooks{})
+	q = mustReopen(t, q, root, Limits{})
+	if _, err := os.Stat(filepath.Join(root, dirReady, dsn.ID)); err != nil {
+		t.Fatalf("recovery did not publish DSN: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, dirDSN, dsn.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stage remains after recovery: %v", err)
+	}
+	if q.Len() != 2 {
+		t.Fatalf("Len=%d want source and DSN", q.Len())
+	}
+}
+
+func TestOpenQuarantinesUnlinkedDSNStage(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	source := testEnv("dsn-source-orphan")
+	if err := q.Add(source, []byte("source")); err != nil {
+		t.Fatal(err)
+	}
+	dsn := testDSN(source)
+	wantErr := errors.New("stop before source link")
+	sourceMeta := filepath.Join(root, dirReady, source.ID, metaName)
+	disk.SetHooks(disk.Hooks{BeforeRename: func(_, newpath string) error {
+		if newpath == sourceMeta {
+			return wantErr
+		}
+		return nil
+	}})
+	if err := q.AddDSN(source, dsn, []byte("dsn")); !errors.Is(err, wantErr) {
+		t.Fatalf("AddDSN error=%v, want %v", err, wantErr)
+	}
+	if _, err := os.Stat(filepath.Join(root, dirDSN, dsn.ID)); err != nil {
+		t.Fatalf("complete orphan stage missing: %v", err)
+	}
+
+	disk.SetHooks(disk.Hooks{})
+	q = mustReopen(t, q, root, Limits{})
+	if _, err := os.Stat(filepath.Join(root, dirReady, dsn.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphan DSN was published: %v", err)
+	}
+	if q.Len() != 1 {
+		t.Fatalf("Len=%d want source only", q.Len())
+	}
+	if len(q.Corrupt) == 0 || len(corruptEntries(t, root)) == 0 {
+		t.Fatal("orphan DSN was not reported and quarantined")
+	}
+}
+
+func TestAddDSNReconcilesPostRenameError(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	source := testEnv("dsn-source-moved")
+	if err := q.Add(source, []byte("source")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.Next(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	dsn := testDSN(source)
+	wantErr := errors.New("after DSN rename")
+	disk.SetHooks(disk.Hooks{AfterRename: func(oldpath, newpath string) error {
+		if oldpath == filepath.Join(root, dirDSN, dsn.ID) && newpath == filepath.Join(root, dirReady, dsn.ID) {
+			return wantErr
+		}
+		return nil
+	}})
+	if err := q.AddDSN(source, dsn, []byte("dsn")); !errors.Is(err, wantErr) {
+		t.Fatalf("AddDSN error=%v, want %v", err, wantErr)
+	}
+	if source.DSNID != dsn.ID {
+		t.Fatalf("source DSNID=%q want %q", source.DSNID, dsn.ID)
+	}
+	if q.Len() != 1 {
+		t.Fatalf("Len=%d want published DSN", q.Len())
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != dsn.ID {
+		t.Fatalf("scheduled %s want %s", got.ID, dsn.ID)
+	}
+}
+
+func TestAddDSNReleasesOwnershipBeforeScheduling(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	source := testEnv("dsn-consumer-handoff")
+	if err := q.Add(source, []byte("source")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.Next(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	published := make(chan struct{})
+	release := make(chan struct{})
+	q.afterPublish = func() {
+		close(published)
+		<-release
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- q.AddDSN(source, testDSN(source), []byte("dsn"))
+	}()
+	<-published
+	dsn, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Finish(dsn); err != nil {
+		t.Fatalf("immediate DSN consumer: %v", err)
+	}
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAddReleasesOwnershipBeforeScheduling(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	published := make(chan struct{})
+	release := make(chan struct{})
+	q.afterPublish = func() {
+		close(published)
+		<-release
+	}
+	result := make(chan error, 1)
+	env := testEnv("add-consumer-handoff")
+	go func() {
+		result <- q.Add(env, []byte("body"))
+	}()
+	<-published
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Finish(got); err != nil {
+		t.Fatalf("immediate added-message consumer: %v", err)
+	}
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAddRejectsOccupiedReadyID(t *testing.T) {
+	for _, checkedOut := range []bool{false, true} {
+		t.Run(fmt.Sprintf("checked_out_%t", checkedOut), func(t *testing.T) {
+			clearHooks(t)
+			q := mustOpen(t, t.TempDir(), Limits{})
+			original := testEnv("occupied-add-id")
+			if err := q.Add(original, []byte("original")); err != nil {
+				t.Fatal(err)
+			}
+			if checkedOut {
+				if _, err := q.Next(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := q.Add(testEnv(original.ID), []byte("replacement")); !errors.Is(err, ErrIDConflict) {
+				t.Fatalf("Add error=%v, want ErrIDConflict", err)
+			}
+			body, err := q.ReadBody(original.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(body) != "original" {
+				t.Fatalf("body=%q want original", body)
+			}
+			if messages, bytes := q.Stats(); messages != 1 || bytes != int64(len("original")) {
+				t.Fatalf("Stats=(%d, %d) want (1, %d)", messages, bytes, len("original"))
+			}
+		})
+	}
+}
+
+func TestAddReconcilesPriorUncommittedReadyEntry(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("retry-uncommitted-add")
+	wantErr := errors.New("inject post-rename add failure")
+	disk.SetHooks(disk.Hooks{AfterRename: func(oldpath, newpath string) error {
+		if filepath.Clean(oldpath) == filepath.Join(root, dirTmp, env.ID) &&
+			filepath.Clean(newpath) == filepath.Join(root, dirReady, env.ID) {
+			return wantErr
+		}
+		return nil
+	}})
+	if err := q.Add(env, []byte("first")); !errors.Is(err, wantErr) {
+		t.Fatalf("Add error=%v, want %v", err, wantErr)
+	}
+	disk.SetHooks(disk.Hooks{})
+	if err := q.Add(env, []byte("retry")); err != nil {
+		t.Fatalf("same-process Add retry: %v", err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := q.ReadBody(got.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "retry" {
+		t.Fatalf("body=%q want retry", body)
+	}
+}
+
+func TestAddDoesNotQuarantineUnreadableReadyState(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("unreadable-ready-state")
+	env.Size = int64(len("original"))
+	readyDir := filepath.Join(root, dirReady, env.ID)
+	if err := disk.Mkdir(readyDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.writeMeta(filepath.Join(readyDir, metaName), env); err != nil {
+		t.Fatal(err)
+	}
+	if err := disk.Write(filepath.Join(readyDir, bodyName), []byte("original"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	writeAcceptedMarker(t, readyDir)
+	statePath := filepath.Join(readyDir, addStateName)
+	if err := os.Remove(statePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(statePath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Add(testEnv(env.ID), []byte("replacement")); err == nil {
+		t.Fatal("Add should report unreadable ready state")
+	}
+	if _, err := os.Stat(filepath.Join(root, dirReady, env.ID, bodyName)); err != nil {
+		t.Fatalf("accepted ready entry was moved: %v", err)
+	}
+	if err := os.RemoveAll(statePath); err != nil {
+		t.Fatal(err)
+	}
+	writeAcceptedMarker(t, readyDir)
+	body, err := q.ReadBody(env.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "original" {
+		t.Fatalf("body=%q want original", body)
+	}
+}
+
+func TestAddRejectsDeadID(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	env := testEnv("occupied-dead-id")
+	if err := q.Add(env, []byte("original")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Recipients[0].Status = StatusFailed
+	if err := q.Bury(got); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Add(testEnv(env.ID), []byte("replacement")); !errors.Is(err, ErrIDConflict) {
+		t.Fatalf("Add error=%v, want ErrIDConflict", err)
+	}
+	body, err := q.ReadBody(env.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "original" {
+		t.Fatalf("dead body=%q want original", body)
+	}
+}
+
+func TestRequeueDoesNotPublishDuringTransition(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("requeue-transition")
+	if err := q.Add(env, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	disk.SetHooks(disk.Hooks{BeforeRename: func(oldpath, newpath string) error {
+		if filepath.Clean(newpath) == filepath.Join(root, dirReady, got.ID, metaName) {
+			close(entered)
+			<-release
+		}
+		return nil
+	}})
+	result := make(chan error, 1)
+	go func() {
+		result <- q.Retry(got)
+	}()
+	<-entered
+	q.Requeue(got)
+	if q.Len() != 0 {
+		t.Fatalf("Len=%d want no publication during transition", q.Len())
+	}
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	disk.SetHooks(disk.Hooks{})
+	if q.Len() != 1 {
+		t.Fatalf("Len=%d want retried message", q.Len())
+	}
+}
+
+func TestRequeueIntentSurvivesFailedTransition(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("requeue-failed-transition")
+	if err := q.Add(env, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	wantErr := errors.New("inject finish failure")
+	disk.SetHooks(disk.Hooks{BeforeRename: func(oldpath, newpath string) error {
+		if filepath.Clean(oldpath) == filepath.Join(root, dirReady, got.ID) &&
+			filepath.Clean(filepath.Dir(newpath)) == filepath.Join(root, dirTrash) {
+			close(entered)
+			<-release
+			return wantErr
+		}
+		return nil
+	}})
+	result := make(chan error, 1)
+	go func() {
+		result <- q.Finish(got)
+	}()
+	<-entered
+	q.Requeue(got)
+	if q.Len() != 0 {
+		t.Fatalf("Len=%d want deferred requeue", q.Len())
+	}
+	close(release)
+	if err := <-result; !errors.Is(err, wantErr) {
+		t.Fatalf("Finish error=%v, want %v", err, wantErr)
+	}
+	disk.SetHooks(disk.Hooks{})
+	if q.Len() != 1 {
+		t.Fatalf("Len=%d want preserved requeue intent", q.Len())
+	}
+	requeued, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Finish(requeued); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBuryFailureReleasesOwnershipBeforeRescheduling(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("bury-consumer-handoff")
+	if err := q.Add(env, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Recipients[0].Status = StatusFailed
+	wantErr := errors.New("inject post-rename bury metadata error")
+	disk.SetHooks(disk.Hooks{AfterRename: func(oldpath, newpath string) error {
+		if filepath.Clean(newpath) == filepath.Join(root, dirReady, got.ID, metaName) {
+			return wantErr
+		}
+		return nil
+	}})
+	published := make(chan struct{})
+	release := make(chan struct{})
+	q.afterPublish = func() {
+		close(published)
+		<-release
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- q.Bury(got)
+	}()
+	<-published
+	disk.SetHooks(disk.Hooks{})
+	q.afterPublish = nil
+	requeued, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Finish(requeued); err != nil {
+		t.Fatalf("immediate consumer after Bury failure: %v", err)
+	}
+	close(release)
+	if err := <-result; !errors.Is(err, wantErr) {
+		t.Fatalf("Bury error=%v, want %v", err, wantErr)
+	}
+}
+
+func TestAddDSNRejectsExistingDifferentIdentity(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	source := testEnv("dsn-source-conflict")
+	if err := q.Add(source, []byte("source")); err != nil {
+		t.Fatal(err)
+	}
+	dsn := testDSN(source)
+	occupant := testEnv(dsn.ID)
+	if err := q.Add(occupant, []byte("occupant")); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.AddDSN(source, dsn, []byte("dsn")); !errors.Is(err, ErrIDConflict) {
+		t.Fatalf("AddDSN error=%v, want ErrIDConflict", err)
+	}
+}
+
+func TestStaleHandleCannotMutateReplacement(t *testing.T) {
+	for _, operation := range []string{"retry", "finish", "bury", "dsn"} {
+		t.Run(operation, func(t *testing.T) {
+			clearHooks(t)
+			q := mustOpen(t, t.TempDir(), Limits{})
+			stale := testEnv("reused-id")
+			if err := q.Add(stale, []byte("old")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := q.Next(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if err := q.Finish(stale); err != nil {
+				t.Fatal(err)
+			}
+			replacement := testEnv("reused-id")
+			if err := q.Add(replacement, []byte("replacement")); err != nil {
+				t.Fatal(err)
+			}
+			if stale.Incarnation == replacement.Incarnation {
+				t.Fatal("replacement reused the old incarnation")
+			}
+
+			var err error
+			switch operation {
+			case "retry":
+				err = q.Retry(stale)
+			case "finish":
+				err = q.Finish(stale)
+			case "bury":
+				stale.Recipients[0].Status = StatusFailed
+				err = q.Bury(stale)
+			case "dsn":
+				stale.Recipients[0].Status = StatusFailed
+				err = q.AddDSN(stale, testDSN(stale), []byte("dsn"))
+			}
+			if !errors.Is(err, ErrIDConflict) {
+				t.Fatalf("%s error=%v, want ErrIDConflict", operation, err)
+			}
+			body, readErr := q.ReadBody(replacement.ID)
+			if readErr != nil || string(body) != "replacement" {
+				t.Fatalf("replacement changed: body=%q err=%v", body, readErr)
+			}
+			if q.Len() != 1 {
+				t.Fatalf("Len=%d want replacement only", q.Len())
+			}
+		})
+	}
+}
+
+func TestRequeueIsIdempotentAndRejectsStaleRevision(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	env := testEnv("requeue-owner")
+	if err := q.Add(env, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.Requeue(got)
+	q.Requeue(got)
+	if q.Len() != 1 {
+		t.Fatalf("duplicate Requeue Len=%d want 1", q.Len())
+	}
+	got, err = q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := *got
+	got.Attempts++
+	got.NextAttempt = time.Now()
+	if err := q.Retry(got); err != nil {
+		t.Fatal(err)
+	}
+	q.Requeue(&stale)
+	if q.Len() != 1 {
+		t.Fatalf("stale Requeue Len=%d want current revision only", q.Len())
+	}
+}
+
+func TestAddDSNRejectsStaleSourceRevision(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	source := testEnv("dsn-stale-revision")
+	if err := q.Add(source, []byte("source")); err != nil {
+		t.Fatal(err)
+	}
+	stale := *source
+	if _, err := q.Next(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	source.Attempts++
+	source.NextAttempt = time.Now().Add(time.Minute)
+	if err := q.Retry(source); err != nil {
+		t.Fatal(err)
+	}
+	stale.Recipients = append([]Recipient(nil), stale.Recipients...)
+	stale.Recipients[0].Status = StatusFailed
+	if err := q.AddDSN(&stale, testDSN(&stale), []byte("dsn")); !errors.Is(err, ErrIDConflict) {
+		t.Fatalf("AddDSN error=%v, want ErrIDConflict", err)
+	}
+	if _, err := os.Stat(filepath.Join(q.dsn, DSNID(stale.ID, stale.Incarnation, stale.DSNGeneration))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale AddDSN created a stage: %v", err)
 	}
 }
 
@@ -1290,8 +2147,12 @@ func TestSMTPUTF8EnvelopeInvariant(t *testing.T) {
 	}
 
 	// Null sender DSN with ASCII recipient, no SMTPUTF8.
-	if err := q.Add(&Envelope{
-		ID: "u6", Username: "u", Sender: "", IsDSN: true,
+	source6 := testEnv("source-u6")
+	if err := q.Add(source6, body); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.AddDSN(source6, &Envelope{
+		ID: DSNID(source6.ID, source6.Incarnation, 0), Username: "u", Sender: "", DSNSourceID: source6.ID, DSNSourceIncarnation: source6.Incarnation,
 		Recipients:  []Recipient{{Address: "b@ex.com", Domain: "ex.com", Status: StatusPending}},
 		Created:     now,
 		NextAttempt: now,
@@ -1301,8 +2162,12 @@ func TestSMTPUTF8EnvelopeInvariant(t *testing.T) {
 	}
 
 	// Null sender DSN with UTF-8 recipient requires SMTPUTF8.
-	err = q.Add(&Envelope{
-		ID: "u7", Username: "u", Sender: "", IsDSN: true,
+	source7 := testEnv("source-u7")
+	if err := q.Add(source7, body); err != nil {
+		t.Fatal(err)
+	}
+	err = q.AddDSN(source7, &Envelope{
+		ID: DSNID(source7.ID, source7.Incarnation, 0), Username: "u", Sender: "", DSNSourceID: source7.ID, DSNSourceIncarnation: source7.Incarnation,
 		Recipients:  []Recipient{{Address: "björn@ex.com", Domain: "ex.com", Status: StatusPending}},
 		Created:     now,
 		NextAttempt: now,
@@ -1311,8 +2176,12 @@ func TestSMTPUTF8EnvelopeInvariant(t *testing.T) {
 	if err == nil {
 		t.Fatal("DSN UTF-8 recipient without SMTPUTF8 must reject")
 	}
-	if err := q.Add(&Envelope{
-		ID: "u8", Username: "u", Sender: "", IsDSN: true,
+	source8 := testEnv("source-u8")
+	if err := q.Add(source8, body); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.AddDSN(source8, &Envelope{
+		ID: DSNID(source8.ID, source8.Incarnation, 0), Username: "u", Sender: "", DSNSourceID: source8.ID, DSNSourceIncarnation: source8.Incarnation,
 		Recipients:  []Recipient{{Address: "björn@ex.com", Domain: "ex.com", Status: StatusPending}},
 		Created:     now,
 		NextAttempt: now,

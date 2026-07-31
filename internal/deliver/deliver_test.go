@@ -597,7 +597,7 @@ func TestRunDSNAtFullQueueNotFatal(t *testing.T) {
 			t.Fatal("message never buried")
 		default:
 			_, deadErr := os.Stat(filepath.Join(root, "dead", "full1"))
-			_, dsnErr := os.Stat(filepath.Join(root, "ready", "dsn.full1"))
+			_, dsnErr := os.Stat(filepath.Join(root, "ready", queue.DSNID("full1", env.Incarnation, 0)))
 			if deadErr == nil && dsnErr == nil {
 				goto buried
 			}

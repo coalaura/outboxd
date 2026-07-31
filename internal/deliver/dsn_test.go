@@ -1,6 +1,7 @@
 package deliver
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -54,10 +55,10 @@ func TestEnsureDSNFlagsASCII(t *testing.T) {
 	if err := d.ensureDSN(orig); err != nil {
 		t.Fatal(err)
 	}
-	if !orig.DSNSent {
-		t.Fatal("DSNSent")
+	if orig.DSNID == "" {
+		t.Fatal("DSNID")
 	}
-	env := loadReadyEnvelope(t, q.Path(), "dsn.orig1")
+	env := loadReadyEnvelope(t, q.Path(), queue.DSNID(orig.ID, orig.Incarnation, orig.DSNGeneration))
 	if env.SMTPUTF8 {
 		t.Fatal("ASCII sender DSN SMTPUTF8 must be false")
 	}
@@ -90,7 +91,7 @@ func TestEnsureDSNFlagsUTF8Recipient(t *testing.T) {
 	if err := d.ensureDSN(orig); err != nil {
 		t.Fatal(err)
 	}
-	env := loadReadyEnvelope(t, q.Path(), "dsn.orig2")
+	env := loadReadyEnvelope(t, q.Path(), queue.DSNID(orig.ID, orig.Incarnation, orig.DSNGeneration))
 	if !env.SMTPUTF8 {
 		t.Fatal("UTF-8 DSN recipient must set SMTPUTF8")
 	}
@@ -119,8 +120,68 @@ func TestEnsureDSNEightBitFromHighOctets(t *testing.T) {
 	if err := d.ensureDSN(orig); err != nil {
 		t.Fatal(err)
 	}
-	env := loadReadyEnvelope(t, q.Path(), "dsn.orig3")
+	env := loadReadyEnvelope(t, q.Path(), queue.DSNID(orig.ID, orig.Incarnation, orig.DSNGeneration))
 	if !env.EightBit {
 		t.Fatal("high-bit DSN content must set EightBit")
+	}
+}
+
+func TestCompletedDSNDoesNotRegenerateBeforeSourceTransition(t *testing.T) {
+	root := t.TempDir()
+	q, err := queue.Open(root, queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := New(&config.Config{Server: config.Server{Hostname: "mail.test"}}, q, nopLog{})
+	now := time.Now()
+	source := &queue.Envelope{
+		ID: "dsn-source-crash", Username: "user", Sender: "alice@ex.com",
+		Recipients: []queue.Recipient{{
+			Address: "bob@ex.com", Domain: "ex.com",
+			Status: queue.StatusFailed, Detail: "gone",
+		}},
+		Created: now, NextAttempt: now,
+	}
+	if err := q.Add(source, []byte("From: a\r\nTo: b\r\n\r\nbody\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.Next(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ensureDSN(source); err != nil {
+		t.Fatal(err)
+	}
+	dsn, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dsn.ID != source.DSNID {
+		t.Fatalf("scheduled DSN %s, source links %s", dsn.ID, source.DSNID)
+	}
+	if err := q.Finish(dsn); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	q, err = queue.Open(root, queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	d = New(&config.Config{Server: config.Server{Hostname: "mail.test"}}, q, nopLog{})
+	recovered, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.ID != source.ID || recovered.DSNID == "" {
+		t.Fatalf("recovered source lost DSN link: %#v", recovered)
+	}
+	if err := d.ensureDSN(recovered); err != nil {
+		t.Fatal(err)
+	}
+	if q.Len() != 0 {
+		t.Fatalf("completed DSN was regenerated; Len=%d", q.Len())
 	}
 }

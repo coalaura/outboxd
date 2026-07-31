@@ -107,6 +107,9 @@ func deadShow(spool *queue.Queue, id string) error {
 func deadRetry(spool *queue.Queue, id string) error {
 	env, err := spool.ReviveDead(id)
 	if err != nil {
+		if env != nil {
+			return fmt.Errorf("requeued %s, but durability could not be confirmed: %w", env.ID, err)
+		}
 		return err
 	}
 	fmt.Printf("requeued %s\n", env.ID)

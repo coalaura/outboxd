@@ -6,8 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -16,22 +14,17 @@ import (
 )
 
 func (d *Deliverer) ensureDSN(envelope *queue.Envelope) error {
-	if envelope.DSNSent || envelope.IsDSN || envelope.Sender == "" {
+	if envelope.DSNID != "" || envelope.DSNSourceID != "" || envelope.Sender == "" {
 		return nil
 	}
 	if envelope.Failed() == 0 {
 		return nil
 	}
 
-	dsnID := dsnEnvelopeID(envelope.ID)
-	ready := filepath.Join(d.queue.Path(), "ready", dsnID)
-	if _, err := os.Stat(ready); err == nil {
-		envelope.DSNSent = true
-		return nil
-	}
+	dsnID := dsnEnvelopeID(envelope.ID, envelope.Incarnation, envelope.DSNGeneration)
 
 	body, err := d.queue.ReadBody(envelope.ID)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err != nil {
 		return err
 	}
 
@@ -83,32 +76,20 @@ func (d *Deliverer) ensureDSN(envelope *queue.Envelope) error {
 			Domain:  domain,
 			Status:  queue.StatusPending,
 		}},
-		Created:     now,
-		NextAttempt: now,
-		IsDSN:       true,
-		SMTPUTF8:    needUTF8,
-		EightBit:    eightBit,
+		Created:              now,
+		NextAttempt:          now,
+		DSNSourceID:          envelope.ID,
+		DSNSourceIncarnation: envelope.Incarnation,
+		DSNGeneration:        envelope.DSNGeneration,
+		SMTPUTF8:             needUTF8,
+		EightBit:             eightBit,
 	}
 
-	err = d.queue.Add(dsnEnv, msg)
-	if err != nil {
-		if _, statErr := os.Stat(ready); statErr == nil {
-			envelope.DSNSent = true
-			return nil
-		}
-		return err
-	}
-
-	envelope.DSNSent = true
-	return nil
+	return d.queue.AddDSN(envelope, dsnEnv, msg)
 }
 
-func dsnEnvelopeID(original string) string {
-	id := "dsn." + original
-	if len(id) <= 191 {
-		return id
-	}
-	return "dsn." + original[:180]
+func dsnEnvelopeID(original, incarnation string, generation uint64) string {
+	return queue.DSNID(original, incarnation, generation)
 }
 
 func buildDSN(hostname string, env *queue.Envelope, original []byte) ([]byte, error) {
@@ -132,7 +113,7 @@ func buildDSN(hostname string, env *queue.Envelope, original []byte) ([]byte, er
 	}
 
 	now := time.Now().UTC()
-	msgID := fmt.Sprintf("<%s@%s>", dsnEnvelopeID(env.ID), hostname)
+	msgID := fmt.Sprintf("<%s@%s>", dsnEnvelopeID(env.ID, env.Incarnation, env.DSNGeneration), hostname)
 
 	var human bytes.Buffer
 	fmt.Fprintf(&human, "This is the mail system at host %s.\r\n\r\n", hostname)
