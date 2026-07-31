@@ -27,6 +27,7 @@ var (
 	errBinary    = errors.New("message contains a NUL byte")
 	errLongLine  = fmt.Errorf("message contains a line longer than %d octets; use quoted-printable or base64", maxLineLength)
 	errOversized = errors.New("message exceeds size limit")
+	errBodyUTF8  = errors.New("8-bit message body contains invalid UTF-8")
 
 	crlf = []byte("\r\n")
 )
@@ -197,6 +198,9 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 	}
 
 	eightBit := !ascii(body)
+	if eightBit && !utf8.Valid(body) {
+		return nil, errBodyUTF8
+	}
 
 	if present["content-type"] == 0 && eightBit {
 		out.WriteString("Content-Type: text/plain; charset=utf-8\r\n")

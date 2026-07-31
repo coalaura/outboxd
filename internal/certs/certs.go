@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -32,11 +33,12 @@ type Keeper struct {
 	// mode is config TLS mode; self_signed is development-only (see Ensure).
 	mode string
 
-	mu          sync.Mutex
-	certificate *tls.Certificate
-	stamp       time.Time
-	checked     time.Time
-	lastError   error
+	mu            sync.Mutex
+	certificate   *tls.Certificate
+	fingerprint   [sha256.Size]byte
+	checked       time.Time
+	lastError     error
+	onReloadError func(error)
 }
 
 // Status is a snapshot of the loaded certificate for observability.
@@ -54,12 +56,9 @@ type Status struct {
 // self_signed is development-only: ordinary SMTP clients will not trust the
 // certificate. Production must use tls.mode=files with a publicly trusted leaf.
 func Ensure(cfg *config.Config) (*Keeper, bool, error) {
-	keeper := &Keeper{
-		certificateFile: cfg.ResolvePath(cfg.TLS.CertificateFile),
-		privateKeyFile:  cfg.ResolvePath(cfg.TLS.PrivateKeyFile),
-		minimumVersion:  cfg.MinimumTLSVersion(),
-		hostname:        cfg.Server.Hostname,
-		mode:            cfg.TLS.Mode,
+	keeper, err := configuredKeeper(cfg)
+	if err != nil {
+		return nil, false, err
 	}
 
 	created, err := keeper.ensureFiles()
@@ -75,6 +74,54 @@ func Ensure(cfg *config.Config) (*Keeper, bool, error) {
 	return keeper, created, nil
 }
 
+// Load reads and validates the serving certificate without creating or
+// modifying files. Deployment checks use this read-only path.
+func Load(cfg *config.Config) (*Keeper, error) {
+	keeper, err := configuredKeeper(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := keeper.load(); err != nil {
+		return nil, err
+	}
+	return keeper, nil
+}
+
+// Check validates the configured serving certificate without modifying files.
+func Check(cfg *config.Config) error {
+	_, err := Load(cfg)
+	return err
+}
+
+func configuredKeeper(cfg *config.Config) (*Keeper, error) {
+	certificateFile := cfg.ResolvePath(cfg.TLS.CertificateFile)
+	privateKeyFile := cfg.ResolvePath(cfg.TLS.PrivateKeyFile)
+	if cfg.TLS.Mode == "self_signed" {
+		var err error
+		certificateFile, err = cfg.ResolveGeneratedPath(cfg.TLS.CertificateFile)
+		if err != nil {
+			return nil, fmt.Errorf("tls certificate file: %w", err)
+		}
+		privateKeyFile, err = cfg.ResolveGeneratedPath(cfg.TLS.PrivateKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("tls private key file: %w", err)
+		}
+		if err := cfg.CheckGeneratedParents(certificateFile); err != nil {
+			return nil, fmt.Errorf("tls certificate file: %w", err)
+		}
+		if err := cfg.CheckGeneratedParents(privateKeyFile); err != nil {
+			return nil, fmt.Errorf("tls private key file: %w", err)
+		}
+	}
+	return &Keeper{
+		certificateFile: certificateFile,
+		privateKeyFile:  privateKeyFile,
+		minimumVersion:  cfg.MinimumTLSVersion(),
+		hostname:        cfg.Server.Hostname,
+		mode:            cfg.TLS.Mode,
+	}, nil
+}
+
 func (k *Keeper) ensureFiles() (bool, error) {
 	_, certErr := os.Stat(k.certificateFile)
 	_, keyErr := os.Stat(k.privateKeyFile)
@@ -87,22 +134,13 @@ func (k *Keeper) ensureFiles() (bool, error) {
 	if keyErr != nil && !errors.Is(keyErr, os.ErrNotExist) {
 		return false, keyErr
 	}
-
 	// tls.mode=self_signed is development-only (untrusted leaf for local clients).
 	if k.mode == "self_signed" {
 		if certOK && keyOK {
 			return false, nil
 		}
-		// Partial pair: regenerate both. Never partial-overwrite in files mode.
-		if certOK {
-			if err := os.Remove(k.certificateFile); err != nil {
-				return false, fmt.Errorf("remove incomplete certificate: %w", err)
-			}
-		}
-		if keyOK {
-			if err := os.Remove(k.privateKeyFile); err != nil {
-				return false, fmt.Errorf("remove incomplete private key: %w", err)
-			}
+		if certOK || keyOK {
+			return false, fmt.Errorf("incomplete self-signed tls pair: certificate exists=%t, private key exists=%t; refusing to replace configured files", certOK, keyOK)
 		}
 		if err := k.generate(k.hostname); err != nil {
 			return false, err
@@ -135,6 +173,14 @@ func (k *Keeper) LastError() error {
 	return k.lastError
 }
 
+// SetReloadErrorHandler installs an observability callback for failed reloads.
+// Reload checks are already rate-limited by reloadInterval.
+func (k *Keeper) SetReloadErrorHandler(handler func(error)) {
+	k.mu.Lock()
+	k.onReloadError = handler
+	k.mu.Unlock()
+}
+
 // Status returns observability details for the currently served certificate.
 func (k *Keeper) Status() Status {
 	k.mu.Lock()
@@ -161,62 +207,58 @@ func (k *Keeper) Status() Status {
 
 func (k *Keeper) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	k.mu.Lock()
-	defer k.mu.Unlock()
-
 	if time.Since(k.checked) < reloadInterval {
-		if k.certificate == nil {
-			if k.lastError != nil {
-				return nil, k.lastError
+		certificate, lastError := k.certificate, k.lastError
+		k.mu.Unlock()
+		if !certificateValid(certificate, time.Now()) {
+			if lastError != nil {
+				return nil, lastError
 			}
-			return nil, errors.New("no tls certificate loaded")
+			return nil, errors.New("no currently valid tls certificate loaded")
 		}
-		return k.certificate, nil
+		return certificate, nil
 	}
-
 	k.checked = time.Now()
+	oldCertificate, oldFingerprint := k.certificate, k.fingerprint
+	k.mu.Unlock()
 
-	stamp, err := k.modified()
+	certPEM, keyPEM, fingerprint, err := k.readPair()
 	if err != nil {
-		k.lastError = err
-		// Keep last valid certificate on failure.
-		if k.certificate != nil {
-			return k.certificate, nil
-		}
-		return nil, err
+		return k.finishReloadError(oldCertificate, err)
 	}
-	if !stamp.After(k.stamp) {
-		return k.certificate, nil
+	if fingerprint == oldFingerprint {
+		if !certificateValid(oldCertificate, time.Now()) {
+			err := errors.New("loaded tls certificate is no longer valid")
+			return k.finishReloadError(oldCertificate, err)
+		}
+		k.mu.Lock()
+		k.lastError = nil
+		k.mu.Unlock()
+		return oldCertificate, nil
 	}
 
-	certificate, err := k.loadPair()
+	certificate, err := k.parsePair(certPEM, keyPEM)
 	if err != nil {
-		k.lastError = err
-		if k.certificate != nil {
-			return k.certificate, nil
-		}
-		return nil, err
+		return k.finishReloadError(oldCertificate, err)
 	}
 
+	k.mu.Lock()
 	k.certificate = certificate
-	k.stamp = stamp
+	k.fingerprint = fingerprint
 	k.lastError = nil
-	return k.certificate, nil
+	k.mu.Unlock()
+	return certificate, nil
 }
 
 func (k *Keeper) load() (*tls.Certificate, error) {
-	certificate, err := k.loadPair()
-	if err != nil {
-		return nil, err
-	}
-
-	stamp, err := k.modified()
+	certificate, fingerprint, err := k.loadPair()
 	if err != nil {
 		return nil, err
 	}
 
 	k.mu.Lock()
 	k.certificate = certificate
-	k.stamp = stamp
+	k.fingerprint = fingerprint
 	k.checked = time.Now()
 	k.lastError = nil
 	k.mu.Unlock()
@@ -224,8 +266,20 @@ func (k *Keeper) load() (*tls.Certificate, error) {
 	return certificate, nil
 }
 
-func (k *Keeper) loadPair() (*tls.Certificate, error) {
-	certificate, err := tls.LoadX509KeyPair(k.certificateFile, k.privateKeyFile)
+func (k *Keeper) loadPair() (*tls.Certificate, [sha256.Size]byte, error) {
+	certPEM, keyPEM, fingerprint, err := k.readPair()
+	if err != nil {
+		return nil, fingerprint, err
+	}
+	certificate, err := k.parsePair(certPEM, keyPEM)
+	if err != nil {
+		return nil, fingerprint, err
+	}
+	return certificate, fingerprint, nil
+}
+
+func (k *Keeper) parsePair(certPEM, keyPEM []byte) (*tls.Certificate, error) {
+	certificate, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return nil, err
 	}
@@ -320,22 +374,45 @@ func leafHasServerAuth(leaf *x509.Certificate) error {
 	return errors.New("tls certificate lacks serverAuth extended key usage")
 }
 
-func (k *Keeper) modified() (time.Time, error) {
-	certificate, err := os.Stat(k.certificateFile)
+func (k *Keeper) readPair() ([]byte, []byte, [sha256.Size]byte, error) {
+	var fingerprint [sha256.Size]byte
+	allowSymlink := k.mode == "files"
+	certPEM, err := config.ReadCheckedFile(k.certificateFile, false, allowSymlink)
 	if err != nil {
-		return time.Time{}, err
+		return nil, nil, fingerprint, fmt.Errorf("tls certificate: %w", err)
 	}
-
-	key, err := os.Stat(k.privateKeyFile)
+	keyPEM, err := config.ReadCheckedFile(k.privateKeyFile, true, allowSymlink)
 	if err != nil {
-		return time.Time{}, err
+		return nil, nil, fingerprint, fmt.Errorf("tls private key: %w", err)
 	}
+	h := sha256.New()
+	_, _ = h.Write(certPEM)
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write(keyPEM)
+	copy(fingerprint[:], h.Sum(nil))
+	return certPEM, keyPEM, fingerprint, nil
+}
 
-	if key.ModTime().After(certificate.ModTime()) {
-		return key.ModTime(), nil
+func certificateValid(certificate *tls.Certificate, now time.Time) bool {
+	if certificate == nil || len(certificate.Certificate) == 0 {
+		return false
 	}
+	leaf, err := x509.ParseCertificate(certificate.Certificate[0])
+	return err == nil && !now.Before(leaf.NotBefore) && now.Before(leaf.NotAfter)
+}
 
-	return certificate.ModTime(), nil
+func (k *Keeper) finishReloadError(certificate *tls.Certificate, err error) (*tls.Certificate, error) {
+	k.mu.Lock()
+	k.lastError = err
+	handler := k.onReloadError
+	k.mu.Unlock()
+	if handler != nil {
+		handler(err)
+	}
+	if certificateValid(certificate, time.Now()) {
+		return certificate, nil
+	}
+	return nil, err
 }
 
 func (k *Keeper) generate(hostname string) error {

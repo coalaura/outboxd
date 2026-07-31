@@ -53,6 +53,22 @@ func TestEightBitAndUTF8Flags(t *testing.T) {
 	}
 }
 
+func TestEightBitCharsetInferenceRequiresValidUTF8(t *testing.T) {
+	valid := []byte("From: a@b.co\r\n\r\ncaf\xc3\xa9\r\n")
+	msg, err := Prepare(bytes.NewReader(valid), Options{Hostname: "h"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(msg.Data, []byte("charset=utf-8")) {
+		t.Fatal("valid UTF-8 body did not infer UTF-8 charset")
+	}
+
+	invalid := []byte("From: a@b.co\r\n\r\nbad\xff\r\n")
+	if _, err := Prepare(bytes.NewReader(invalid), Options{Hostname: "h"}); err == nil {
+		t.Fatal("invalid UTF-8 8-bit body accepted with inferred semantics")
+	}
+}
+
 func TestRejectsInvalidUTF8Header(t *testing.T) {
 	raw := []byte("From: a@b.co\r\nSubject: bad\xff\xfe\r\n\r\nbody\r\n")
 	_, err := Prepare(bytes.NewReader(raw), Options{Hostname: "h"})

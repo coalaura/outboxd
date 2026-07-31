@@ -7,9 +7,9 @@ package check
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
-	"net/mail"
 	"sort"
 	"strings"
 	"time"
@@ -236,7 +236,8 @@ func checkSPF(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 		var spf []string
 		for _, t := range txts {
 			tt := strings.TrimSpace(t)
-			if strings.HasPrefix(strings.ToLower(tt), "v=spf1") {
+			fields := strings.Fields(tt)
+			if len(fields) > 0 && strings.EqualFold(fields[0], "v=spf1") {
 				spf = append(spf, tt)
 			}
 		}
@@ -244,7 +245,12 @@ func checkSPF(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 		case 0:
 			rs = append(rs, Result{Name: name, Level: Fail, Message: fmt.Sprintf("no SPF TXT at %s", owner)})
 		case 1:
-			rs = append(rs, Result{Name: name, Level: Pass, Message: fmt.Sprintf("exactly one SPF at %s", owner)})
+			want := normalizeSPF(cfg.ExpectedSPF())
+			if normalizeSPF(spf[0]) != want {
+				rs = append(rs, Result{Name: name, Level: Fail, Message: fmt.Sprintf("SPF at %s does not match configured policy: got %q, want %q", owner, spf[0], cfg.ExpectedSPF())})
+			} else {
+				rs = append(rs, Result{Name: name, Level: Pass, Message: fmt.Sprintf("SPF at %s matches configured policy", owner)})
+			}
 		default:
 			rs = append(rs, Result{Name: name, Level: Fail, Message: fmt.Sprintf("%d SPF TXT records at %s (must be exactly one)", len(spf), owner)})
 		}
@@ -336,7 +342,8 @@ func checkDMARC(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 	var found []string
 	for _, t := range txts {
 		tt := strings.TrimSpace(t)
-		if strings.HasPrefix(strings.ToLower(tt), "v=dmarc1") {
+		first, _, _ := strings.Cut(tt, ";")
+		if strings.EqualFold(strings.TrimSpace(first), "v=DMARC1") {
 			found = append(found, tt)
 		}
 	}
@@ -347,7 +354,10 @@ func checkDMARC(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("multiple DMARC TXT at %s", name)}}
 	}
 
-	tags := parseTags(found[0])
+	tags, err := parseDMARCTags(found[0])
+	if err != nil {
+		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("DMARC record invalid: %v", err)}}
+	}
 	p := strings.ToLower(tags["p"])
 	switch p {
 	case "none", "quarantine", "reject":
@@ -376,10 +386,46 @@ func checkDMARC(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 			level = Warn
 		}
 		msg += "; no rua= (no aggregate reports)"
-	} else if err := validateMailtoRUA(rua); err != nil {
+	} else if err := config.ValidateDMARCReportURIList(rua); err != nil {
 		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("DMARC rua invalid: %v", err)}}
 	}
 	return []Result{{Name: checkName, Level: level, Message: msg}}
+}
+
+func parseDMARCTags(record string) (map[string]string, error) {
+	parts := strings.Split(record, ";")
+	tags := make(map[string]string, len(parts))
+	for i, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			if i == len(parts)-1 {
+				continue
+			}
+			return nil, errors.New("empty tag")
+		}
+		key, value, ok := strings.Cut(part, "=")
+		key, value = strings.ToLower(strings.TrimSpace(key)), strings.TrimSpace(value)
+		if !ok || key == "" || value == "" || !asciiLetters(key) {
+			return nil, fmt.Errorf("malformed tag %q", part)
+		}
+		if _, duplicate := tags[key]; duplicate {
+			return nil, fmt.Errorf("duplicate %s tag", key)
+		}
+		tags[key] = value
+	}
+	if !strings.EqualFold(tags["v"], "DMARC1") {
+		return nil, errors.New("first tag must be exactly v=DMARC1")
+	}
+	return tags, nil
+}
+
+func asciiLetters(value string) bool {
+	for _, char := range value {
+		if char < 'a' || char > 'z' {
+			return false
+		}
+	}
+	return value != ""
 }
 
 func checkEnvelopeMX(ctx context.Context, r Resolver, cfg *config.Config) []Result {
@@ -482,22 +528,6 @@ func normalizeB64(s string) string {
 	return base64.StdEncoding.EncodeToString(raw)
 }
 
-func validateMailtoRUA(list string) error {
-	for _, part := range strings.Split(list, ",") {
-		part = strings.TrimSpace(part)
-		addr, ok := strings.CutPrefix(part, "mailto:")
-		if !ok {
-			// allow https
-			if strings.HasPrefix(strings.ToLower(part), "https://") {
-				continue
-			}
-			return fmt.Errorf("unsupported rua URI %q", part)
-		}
-		addr, _, _ = strings.Cut(addr, "!")
-		addr, _, _ = strings.Cut(addr, "?")
-		if _, err := mail.ParseAddress(addr); err != nil {
-			return err
-		}
-	}
-	return nil
+func normalizeSPF(value string) string {
+	return strings.ToLower(strings.Join(strings.Fields(value), " "))
 }

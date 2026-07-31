@@ -88,3 +88,51 @@ func TestTLSRPTSeparateFromDMARC(t *testing.T) {
 		t.Fatalf("want p=none got %s", dmarc)
 	}
 }
+
+func TestExternalDMARCMailboxBangIsNotSizeSuffix(t *testing.T) {
+	hosts := external("mailto:ops!alerts@reports.example.net", "example.com")
+	if len(hosts) != 1 || hosts[0] != "reports.example.net" {
+		t.Fatalf("external hosts=%v", hosts)
+	}
+}
+
+func TestExternalDMARCHTTPSDestination(t *testing.T) {
+	hosts := external("mailto:ops!alerts@reports.example.net, https://aggregate.example.org/v1!12x, https://limited.example.net/report!10M", "example.com")
+	want := []string{"reports.example.net", "aggregate.example.org", "limited.example.net"}
+	if len(hosts) != len(want) {
+		t.Fatalf("external hosts=%v", hosts)
+	}
+	for i := range want {
+		if hosts[i] != want[i] {
+			t.Fatalf("external hosts=%v want %v", hosts, want)
+		}
+	}
+
+	cfg := config.Default()
+	cfg.Server.Domain = "example.com"
+	cfg.DNS.ReportURI = "https://aggregate.example.org/v1/reports"
+	for _, record := range Build(cfg, "v=DKIM1; p=x") {
+		if record.Name == "example.com._report._dmarc.aggregate.example.org." && record.Value == "v=DMARC1" {
+			return
+		}
+	}
+	t.Fatal("missing HTTPS DMARC destination authorization record")
+}
+
+func TestInstructionsListOnlyEnabledListenerPorts(t *testing.T) {
+	cfg := config.Default()
+	cfg.Server.DataDirectory = t.TempDir()
+	cfg.Server.DisableImplicitTLS = true
+	cfg.Server.SubmissionAddr = "127.0.0.1:2525"
+	_, body, err := Write(cfg, "v=DKIM1; p=x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	if !strings.Contains(text, "port 2525 (STARTTLS") {
+		t.Fatalf("enabled listener missing from instructions:\n%s", text)
+	}
+	if strings.Contains(text, "port 465") || strings.Contains(text, "implicit TLS submission") {
+		t.Fatal("disabled implicit TLS listener included in instructions")
+	}
+}

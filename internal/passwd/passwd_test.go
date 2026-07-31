@@ -38,37 +38,19 @@ func TestValidatePHCBounds(t *testing.T) {
 	salt := encoding.EncodeToString(make([]byte, 16))
 	key := encoding.EncodeToString(make([]byte, 32))
 
-	// Memory just above 64 MiB (KiB units).
-	mOver := fmt.Sprintf("$argon2id$v=%d$m=%d,t=2,p=1$%s$%s", argon2.Version, maxMemory+1, salt, key)
-	if err := ValidatePHC(mOver); err == nil {
-		t.Fatal("expected memory just above 64 MiB to be rejected")
+	canonical := fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s", argon2.Version, hashMemory, hashTime, hashThreads, salt, key)
+	if err := ValidatePHC(canonical); err != nil {
+		t.Fatalf("canonical parameters rejected: %v", err)
 	}
-
-	// Valid max memory (64 * 1024 KiB = 64 MiB).
-	mMax := fmt.Sprintf("$argon2id$v=%d$m=%d,t=2,p=1$%s$%s", argon2.Version, maxMemory, salt, key)
-	if err := ValidatePHC(mMax); err != nil {
-		t.Fatalf("expected m=%d to be valid, got: %v", maxMemory, err)
-	}
-
-	// Iterations at edge of accepted range.
-	t10 := fmt.Sprintf("$argon2id$v=%d$m=19456,t=10,p=1$%s$%s", argon2.Version, salt, key)
-	if err := ValidatePHC(t10); err != nil {
-		t.Fatalf("t=10 must be accepted: %v", err)
-	}
-	t11 := fmt.Sprintf("$argon2id$v=%d$m=19456,t=11,p=1$%s$%s", argon2.Version, salt, key)
-	if err := ValidatePHC(t11); err == nil {
-		t.Fatal("t=11 must be rejected")
-	}
-
-	// Parallelism.
-	p4 := fmt.Sprintf("$argon2id$v=%d$m=19456,t=2,p=4$%s$%s", argon2.Version, salt, key)
-	if err := ValidatePHC(p4); err != nil {
-		t.Fatalf("p=4 must be accepted: %v", err)
-	}
-	for _, p := range []int{5, 257, 272} {
-		hp := fmt.Sprintf("$argon2id$v=%d$m=19456,t=2,p=%d$%s$%s", argon2.Version, p, salt, key)
-		if err := ValidatePHC(hp); err == nil {
-			t.Fatalf("expected p=%d to be rejected", p)
+	for _, params := range []string{
+		"m=19457,t=2,p=1",
+		"m=19456,t=3,p=1",
+		"m=19456,t=2,p=2",
+		"t=2,m=19456,p=1",
+	} {
+		h := fmt.Sprintf("$argon2id$v=%d$%s$%s$%s", argon2.Version, params, salt, key)
+		if err := ValidatePHC(h); err == nil {
+			t.Fatalf("non-canonical parameters %q accepted", params)
 		}
 	}
 
@@ -116,7 +98,7 @@ func TestValidatePHCBounds(t *testing.T) {
 	}
 
 	// Extremely long salt field rejected before base64 decode.
-	hugeSaltField := strings.Repeat("A", maxEncodedLen(maxSaltLen)+1)
+	hugeSaltField := strings.Repeat("A", maxEncodedLen(saltLength)+1)
 	hugeSalt := fmt.Sprintf("$argon2id$v=%d$m=1024,t=2,p=1$%s$%s", argon2.Version, hugeSaltField, key)
 	if err := ValidatePHC(hugeSalt); err == nil {
 		t.Fatal("expected huge encoded salt to be rejected before decode")
@@ -128,7 +110,7 @@ func TestValidatePHCBounds(t *testing.T) {
 	if err := ValidatePHC(overKey); err == nil {
 		t.Fatal("expected oversized key to be rejected")
 	}
-	hugeKeyField := strings.Repeat("A", maxEncodedLen(maxKeyLen)+1)
+	hugeKeyField := strings.Repeat("A", maxEncodedLen(keyLength)+1)
 	hugeKey := fmt.Sprintf("$argon2id$v=%d$m=1024,t=2,p=1$%s$%s", argon2.Version, salt, hugeKeyField)
 	if err := ValidatePHC(hugeKey); err == nil {
 		t.Fatal("expected huge encoded key to be rejected before decode")
@@ -176,41 +158,24 @@ func TestVerifyRejectsHostileBeforeDerive(t *testing.T) {
 	}
 }
 
-func TestValidatePHCMemoryParallelismRelation(t *testing.T) {
+func TestValidatePHCRequiresCanonicalSizes(t *testing.T) {
 	salt := encoding.EncodeToString(make([]byte, 16))
 	key := encoding.EncodeToString(make([]byte, 32))
-
-	// m >= 8*p accepted at structural edges (no IDKey call for max profile).
-	accept := []struct {
-		m, p int
+	params := fmt.Sprintf("m=%d,t=%d,p=%d", hashMemory, hashTime, hashThreads)
+	for _, tc := range []struct {
+		salt []byte
+		key  []byte
 	}{
-		{8, 1},
-		{32, 4},
-		{19456, 1},
-	}
-	for _, c := range accept {
-		h := fmt.Sprintf("$argon2id$v=%d$m=%d,t=2,p=%d$%s$%s", argon2.Version, c.m, c.p, salt, key)
-		if err := ValidatePHC(h); err != nil {
-			t.Fatalf("m=%d p=%d should accept: %v", c.m, c.p, err)
-		}
-	}
-	reject := []struct {
-		m, p int
-	}{
-		{7, 1},
-		{31, 4},
-		{1, 4},
-	}
-	for _, c := range reject {
-		h := fmt.Sprintf("$argon2id$v=%d$m=%d,t=2,p=%d$%s$%s", argon2.Version, c.m, c.p, salt, key)
+		{make([]byte, saltLength-1), make([]byte, keyLength)},
+		{make([]byte, saltLength+1), make([]byte, keyLength)},
+		{make([]byte, saltLength), make([]byte, keyLength-1)},
+		{make([]byte, saltLength), make([]byte, keyLength+1)},
+	} {
+		h := fmt.Sprintf("$argon2id$v=%d$%s$%s$%s", argon2.Version, params, encoding.EncodeToString(tc.salt), encoding.EncodeToString(tc.key))
 		if err := ValidatePHC(h); err == nil {
-			t.Fatalf("m=%d p=%d must reject", c.m, c.p)
+			t.Fatalf("accepted salt=%d key=%d", len(tc.salt), len(tc.key))
 		}
 	}
-	// Hostile relationship via Verify: ordinary error, no panic.
-	bad := fmt.Sprintf("$argon2id$v=%d$m=1,t=2,p=4$%s$%s", argon2.Version, salt, key)
-	ok, err := Verify(bad, "x")
-	if ok || err == nil {
-		t.Fatalf("Verify hostile relation ok=%v err=%v", ok, err)
-	}
+	_ = salt
+	_ = key
 }

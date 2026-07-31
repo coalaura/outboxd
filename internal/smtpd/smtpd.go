@@ -6,8 +6,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"math"
 	"net"
-	"net/mail"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +17,7 @@ import (
 
 	"github.com/coalaura/outboxd/internal/certs"
 	"github.com/coalaura/outboxd/internal/config"
+	"github.com/coalaura/outboxd/internal/mailbox"
 	"github.com/coalaura/outboxd/internal/queue"
 	"github.com/coalaura/outboxd/internal/sign"
 	"github.com/emersion/go-smtp"
@@ -35,12 +36,6 @@ var (
 		Message:      "Submission rate limit exceeded, try again later",
 	}
 
-	errTooManyConnections = &smtp.SMTPError{
-		Code:         421,
-		EnhancedCode: smtp.EnhancedCode{4, 3, 2},
-		Message:      "Too many connections, try again later",
-	}
-
 	errAuthBusy = &smtp.SMTPError{
 		Code:         451,
 		EnhancedCode: smtp.EnhancedCode{4, 7, 0},
@@ -52,6 +47,12 @@ var (
 		EnhancedCode: smtp.EnhancedCode{4, 3, 1},
 		Message:      "Queue full, try again later",
 	}
+
+	errDataBusy = &smtp.SMTPError{
+		Code:         421,
+		EnhancedCode: smtp.EnhancedCode{4, 3, 2},
+		Message:      "Message processing busy; connection closing",
+	}
 )
 
 const (
@@ -59,6 +60,12 @@ const (
 	DefaultImplicitTLSAddr = ":465"
 
 	maxResponseLength = 256
+	// Account conservatively for ReadAll capacity growth, newline normalization
+	// up to twice the input size, prepared output, and the signed copy.
+	dataMemoryBudget   = int64(512 << 20)
+	dataMemoryCopies   = int64(8)
+	dataMemoryOverhead = int64(1 << 20)
+	maxDataWorkers     = 8
 )
 
 // shutdownTimeout bounds graceful Shutdown during Run.
@@ -84,8 +91,8 @@ type Server struct {
 
 	// Bound concurrent Argon2id derivations (worker slots).
 	hashing chan struct{}
-	// Bound waiters that may sit waiting for a hashing slot.
-	authWait chan struct{}
+	// Bound concurrent DATA parsing, normalization, signing, and queueing.
+	dataWork chan struct{}
 
 	starttls *smtp.Server
 	implicit *smtp.Server
@@ -107,10 +114,7 @@ func New(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signer, spool *q
 	if authWorkers <= 0 {
 		authWorkers = 4
 	}
-	authQueue := cfg.Server.AuthQueue
-	if authQueue <= 0 {
-		authQueue = 64
-	}
+	dataWorkers := dataWorkerCount(cfg.Server.MaxMessageBytes)
 
 	msgBurst := cfg.Server.MessageBurst
 	if msgBurst <= 0 {
@@ -130,7 +134,7 @@ func New(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signer, spool *q
 		authLimit: newAuthLimiter(),
 		rates:     newSubmissionLimiter(cfg.Server.MaxMessagesPerHour, cfg.Server.MaxRecipientsPerHour, msgBurst, rcptBurst),
 		hashing:   make(chan struct{}, authWorkers),
-		authWait:  make(chan struct{}, authQueue),
+		dataWork:  make(chan struct{}, dataWorkers),
 	}
 
 	srv.starttls = srv.newSMTP(cfg, keeper)
@@ -140,6 +144,32 @@ func New(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signer, spool *q
 	srv.implicit.Addr = cfg.Server.ImplicitTLSListenAddr()
 
 	return srv
+}
+
+func dataWorkerCount(maxMessageBytes int64) int {
+	perWorker, ok := dataWorkerMemory(maxMessageBytes)
+	if !ok {
+		return 1
+	}
+	workers := int(dataMemoryBudget / perWorker)
+	if workers < 1 {
+		return 1
+	}
+	return min(workers, maxDataWorkers)
+}
+
+func dataWorkerMemory(maxMessageBytes int64) (int64, bool) {
+	if maxMessageBytes <= 0 || maxMessageBytes > (math.MaxInt64-dataMemoryOverhead)/dataMemoryCopies {
+		return 0, false
+	}
+	return maxMessageBytes*dataMemoryCopies + dataMemoryOverhead, true
+}
+
+func incrementLimit(limit int64) int64 {
+	if limit == math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return limit + 1
 }
 
 func burstDefault(hourly int) int {
@@ -160,7 +190,7 @@ func (s *Server) newSMTP(cfg *config.Config, keeper *certs.Keeper) *smtp.Server 
 	server := smtp.NewServer(smtp.BackendFunc(s.session))
 	server.Domain = cfg.Server.Hostname
 	server.TLSConfig = keeper.Config()
-	server.MaxMessageBytes = cfg.Server.MaxMessageBytes
+	server.MaxMessageBytes = incrementLimit(cfg.Server.MaxMessageBytes)
 	server.MaxRecipients = cfg.Server.MaxRecipients
 	server.ReadTimeout = config.Duration(cfg.Server.ReadTimeout)
 	server.WriteTimeout = config.Duration(cfg.Server.WriteTimeout)
@@ -230,16 +260,31 @@ func (s *Server) Run(ctx context.Context) error {
 		return errors.New("submission listeners are not open")
 	}
 
-	runCtx, cancelRun := context.WithCancel(ctx)
-	defer cancelRun()
-
 	var (
-		mu   sync.Mutex
-		errs []error
-		wg   sync.WaitGroup
-		once sync.Once
+		mu              sync.Mutex
+		errs            []error
+		wg              sync.WaitGroup
+		once            sync.Once
+		shutdownStarted = make(chan struct{})
 	)
 	active := atomic.Int32{}
+	var startup sync.WaitGroup
+	started := make(chan struct{})
+	listenerCount := 0
+	if s.starttlsListener != nil {
+		listenerCount++
+	}
+	if s.implicitListener != nil {
+		listenerCount++
+	}
+	startup.Add(listenerCount)
+	go func() {
+		startup.Wait()
+		close(started)
+		if s.serveEntered != nil {
+			s.serveEntered()
+		}
+	}()
 
 	record := func(err error) {
 		if err = ignoreClosed(err); err == nil {
@@ -251,11 +296,14 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	shutdown := func() {
+		// Serve registers its listener before calling Accept. Waiting for every
+		// wrapped listener to enter Accept prevents Shutdown from missing one.
+		<-started
 		once.Do(func() {
+			close(shutdownStarted)
 			if s.shutdownHook != nil {
 				s.shutdownHook()
 			}
-			cancelRun()
 
 			var (
 				shutdownCtx context.Context
@@ -288,16 +336,7 @@ func (s *Server) Run(ctx context.Context) error {
 		})
 	}
 
-	var serveOnce sync.Once
-	notifyServe := func() {
-		serveOnce.Do(func() {
-			if s.serveEntered != nil {
-				s.serveEntered()
-			}
-		})
-	}
-
-	serveOne := func(name string, fn func() error) {
+	serveOne := func(name string, listener net.Listener, srv *smtp.Server) {
 		active.Add(1)
 		wg.Go(func() {
 			defer func() {
@@ -305,8 +344,7 @@ func (s *Server) Run(ctx context.Context) error {
 					shutdown()
 				}
 			}()
-			notifyServe()
-			if err := fn(); err != nil {
+			if err := srv.Serve(&startListener{Listener: listener, entered: startup.Done}); err != nil {
 				record(fmt.Errorf("%s serve: %w", name, err))
 			}
 			// Unexpected exit of either listener shuts down the other.
@@ -315,27 +353,20 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	if s.starttlsListener != nil {
-		ln := s.starttlsListener
-		srv := s.starttls
-		serveOne("starttls", func() error {
-			return srv.Serve(newLimitListener(ln, s.connLimit))
-		})
+		serveOne("starttls", newLimitListener(s.starttlsListener, s.connLimit), s.starttls)
 	}
 	if s.implicitListener != nil {
-		ln := s.implicitListener
-		srv := s.implicit
-		serveOne("implicit", func() error {
-			return srv.Serve(tls.NewListener(newLimitListener(ln, s.connLimit), srv.TLSConfig))
-		})
+		ln := tls.NewListener(newLimitListener(s.implicitListener, s.connLimit), s.implicit.TLSConfig)
+		serveOne("implicit", ln, s.implicit)
 	}
 
-	// Parent cancellation. Exits when runCtx ends (parent cancel OR peer
-	// failure via cancelRun), so it cannot leak after the server fails.
+	// Parent cancellation initiates shutdown. An unexpected Serve exit closes
+	// shutdownStarted so this waiter cannot leak after the server fails.
 	wg.Go(func() {
 		select {
 		case <-ctx.Done():
 			shutdown()
-		case <-runCtx.Done():
+		case <-shutdownStarted:
 		}
 	})
 
@@ -346,25 +377,29 @@ func (s *Server) Run(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+type startListener struct {
+	net.Listener
+	once    sync.Once
+	entered func()
+}
+
+func (l *startListener) Accept() (net.Conn, error) {
+	l.once.Do(l.entered)
+	return l.Listener.Accept()
+}
+
 func (s *Server) session(c *smtp.Conn) (smtp.Session, error) {
 	return &session{server: s, conn: c}, nil
 }
 
-// acquireHashSlot reserves a seat in the auth work queue then a worker slot.
-// Returns errAuthBusy if the wait queue is full (never spawns unbounded waiters).
-func (s *Server) acquireHashSlot(ctx context.Context) error {
-	select {
-	case s.authWait <- struct{}{}:
-	default:
-		return errAuthBusy
-	}
-	defer func() { <-s.authWait }()
-
+// acquireHashSlot admits hashing immediately. SMTP sessions have no cancellation
+// context, so they must never remain queued behind expensive password work.
+func (s *Server) acquireHashSlot() bool {
 	select {
 	case s.hashing <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+		return true
+	default:
+		return false
 	}
 }
 
@@ -372,25 +407,22 @@ func (s *Server) releaseHashSlot() {
 	<-s.hashing
 }
 
+func (s *Server) acquireDataSlot() bool {
+	select {
+	case s.dataWork <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) releaseDataSlot() {
+	<-s.dataWork
+}
+
 // address normalizes an SMTP mailbox while preserving local-part case.
 func address(value string) (string, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "", errors.New("empty address")
-	}
-
-	parsed, err := mail.ParseAddress(value)
-	if err != nil {
-		return "", err
-	}
-	if parsed.Name != "" {
-		return "", errors.New("address contains a display name")
-	}
-	// Reject if the client sent more than a bare addr-spec.
-	if parsed.Address != value && value != "<"+parsed.Address+">" {
-		return "", errors.New("address contains a display name")
-	}
-	return parsed.Address, nil
+	return mailbox.Address(value)
 }
 
 func needsUTF8(s string) bool {

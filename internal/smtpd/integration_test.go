@@ -21,6 +21,7 @@ import (
 	"github.com/coalaura/outboxd/internal/passwd"
 	"github.com/coalaura/outboxd/internal/queue"
 	"github.com/coalaura/outboxd/internal/sign"
+	"github.com/emersion/go-smtp"
 )
 
 // testServerWithUser builds a submission stack with one Argon2id user and DKIM.
@@ -49,7 +50,6 @@ func testServerWithUser(t *testing.T, password string) (*Server, *config.Config,
 		"  max_connections: 16",
 		"  max_connections_per_ip: 8",
 		"  auth_workers: 2",
-		"  auth_queue: 8",
 		"tls:",
 		"  mode: self_signed",
 		"  certificate_file: tls/server.crt",
@@ -217,6 +217,86 @@ func (c *smtpClient) authPlain(t *testing.T, user, pass string) {
 
 func (c *smtpClient) close() { _ = c.conn.Close() }
 
+func (c *smtpClient) expectClosed(t *testing.T) {
+	t.Helper()
+	_ = c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.br.ReadByte(); err == nil {
+		t.Fatal("connection remained open after DATA admission denial")
+	}
+}
+
+func runTestSubmission(t *testing.T, srv *Server) {
+	t.Helper()
+	entered := waitServeEntered(t, srv)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Run(ctx) }()
+	awaitCh(t, entered, 3*time.Second, "serve")
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("submission server did not stop")
+		}
+	})
+}
+
+func beginMessage(t *testing.T, cl *smtpClient, bodyOpt string) {
+	t.Helper()
+	mail := "MAIL FROM:<Alice.Sender@test.example>"
+	if bodyOpt != "" {
+		mail += " BODY=" + bodyOpt
+	}
+	cl.cmd(t, mail, 250)
+	cl.cmd(t, "RCPT TO:<dest@example.com>", 250)
+	cl.cmd(t, "DATA", 354)
+}
+
+func writeMessage(cl *smtpClient, body string) {
+	_, _ = io.WriteString(cl.conn, "From: Alice.Sender@test.example\r\nTo: dest@example.com\r\nSubject: test\r\n\r\n"+body+"\r\n.\r\n")
+}
+
+func messageOfSize(size int64) string {
+	const headers = "From: Alice.Sender@test.example\r\nTo: dest@example.com\r\nSubject: size test\r\n\r\n"
+	remaining := int(size) - len(headers) - 2
+	var body strings.Builder
+	body.Grow(int(size))
+	body.WriteString(headers)
+	for remaining > 998 {
+		body.WriteString(strings.Repeat("x", 998))
+		body.WriteString("\r\n")
+		remaining -= 1000
+	}
+	body.WriteString(strings.Repeat("x", remaining))
+	body.WriteString("\r\n")
+	return body.String()
+}
+
+func TestSubmissionMessageSizeBoundary(t *testing.T) {
+	const password = "message-size-password"
+	srv, cfg, _, _, pool := testServerWithUser(t, password)
+	runTestSubmission(t, srv)
+
+	for _, tt := range []struct {
+		name string
+		size int64
+		code int
+	}{
+		{"exact maximum", cfg.Server.MaxMessageBytes, 250},
+		{"one over maximum", cfg.Server.MaxMessageBytes + 1, 552},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
+			defer cl.close()
+			cl.authPlain(t, "alice", password)
+			beginMessage(t, cl, "")
+			_, _ = io.WriteString(cl.conn, messageOfSize(tt.size)+".\r\n")
+			cl.readCode(t, tt.code)
+		})
+	}
+}
+
 func TestSubmissionUnnecessarySMTPUTF8OptIn(t *testing.T) {
 	const password = "test-password-xyz"
 	srv, _, spool, _, pool := testServerWithUser(t, password)
@@ -261,4 +341,119 @@ func TestSubmissionUnnecessarySMTPUTF8OptIn(t *testing.T) {
 	}
 	// Requeue so we do not leave the item active for delivery.
 	spool.Requeue(env)
+}
+
+func TestDataProcessingSemaphoreNonblockingAndReleased(t *testing.T) {
+	const password = "data-semaphore-password"
+	srv, _, _, _, pool := testServerWithUser(t, password)
+	srv.dataWork = make(chan struct{}, 1)
+	runTestSubmission(t, srv)
+
+	first := dialSTARTTLS(t, srv.starttls.Addr, pool)
+	defer first.close()
+	first.authPlain(t, "alice", password)
+	beginMessage(t, first, "")
+	_, _ = io.WriteString(first.conn, "From: Alice.Sender@test.example\r\nTo: dest@example.com\r\n\r\nblocked")
+	deadline := time.Now().Add(3 * time.Second)
+	for len(srv.dataWork) != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(srv.dataWork) != 1 {
+		t.Fatal("first DATA did not acquire processing slot")
+	}
+
+	second := dialSTARTTLS(t, srv.starttls.Addr, pool)
+	defer second.close()
+	second.authPlain(t, "alice", password)
+	beginMessage(t, second, "")
+	second.expectClosed(t)
+
+	_, _ = io.WriteString(first.conn, "\r\n.\r\n")
+	first.readCode(t, 250)
+	if len(srv.dataWork) != 0 {
+		t.Fatal("processing slot not released after success")
+	}
+	third := dialSTARTTLS(t, srv.starttls.Addr, pool)
+	defer third.close()
+	third.authPlain(t, "alice", password)
+	beginMessage(t, third, "")
+	writeMessage(third, "accepted after release")
+	third.readCode(t, 250)
+}
+
+func TestMalformedDataConsumesSubmissionBudget(t *testing.T) {
+	const password = "malformed-rate-password"
+	srv, _, _, _, pool := testServerWithUser(t, password)
+	srv.rates = newSubmissionLimiter(2, 2, 2, 2)
+	runTestSubmission(t, srv)
+	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
+	defer cl.close()
+	cl.authPlain(t, "alice", password)
+	cl.cmd(t, "MAIL FROM:<unauthorized@test.example>", 550)
+
+	for i := 0; i < 2; i++ {
+		beginMessage(t, cl, "")
+		_, _ = io.WriteString(cl.conn, "not-a-header\r\n\r\nbody\r\n.\r\n")
+		cl.readCode(t, 550)
+	}
+	beginMessage(t, cl, "")
+	cl.expectClosed(t)
+}
+
+func TestSigningAndQueueFailuresConsumeSubmissionBudget(t *testing.T) {
+	const password = "failure-rate-password"
+	srv, _, _, validSigner, pool := testServerWithUser(t, password)
+	runTestSubmission(t, srv)
+	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
+	defer cl.close()
+	cl.authPlain(t, "alice", password)
+
+	srv.rates = newSubmissionLimiter(1, 1, 1, 1)
+	srv.signer = new(sign.Signer)
+	beginMessage(t, cl, "")
+	writeMessage(cl, "sign failure")
+	cl.readCode(t, 451)
+	srv.signer = validSigner
+	beginMessage(t, cl, "")
+	cl.expectClosed(t)
+
+	full, err := queue.Open(filepath.Join(t.TempDir(), "full-queue"), queue.Limits{MaxBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = full.Close() })
+	originalQueue := srv.queue
+	srv.queue = full
+	srv.rates = newSubmissionLimiter(1, 1, 1, 1)
+	queueClient := dialSTARTTLS(t, srv.starttls.Addr, pool)
+	defer queueClient.close()
+	queueClient.authPlain(t, "alice", password)
+	beginMessage(t, queueClient, "")
+	writeMessage(queueClient, "queue failure")
+	queueClient.readCode(t, 452)
+	srv.queue = originalQueue
+	beginMessage(t, queueClient, "")
+	queueClient.expectClosed(t)
+}
+
+func TestBody7BitAndReset(t *testing.T) {
+	const password = "body-mode-password"
+	srv, _, _, _, pool := testServerWithUser(t, password)
+	runTestSubmission(t, srv)
+	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
+	defer cl.close()
+	cl.authPlain(t, "alice", password)
+
+	beginMessage(t, cl, "")
+	writeMessage(cl, "caf\xc3\xa9")
+	cl.readCode(t, 550)
+	beginMessage(t, cl, "8BITMIME")
+	writeMessage(cl, "caf\xc3\xa9")
+	cl.readCode(t, 250)
+
+	s := &session{body: smtp.Body7Bit, sender: "a@example.com", smtpUTF8: true}
+	s.Reset()
+	if s.body != "" || s.sender != "" || s.smtpUTF8 {
+		t.Fatalf("Reset retained transaction state: body=%q sender=%q utf8=%v", s.body, s.sender, s.smtpUTF8)
+	}
 }

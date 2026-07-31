@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -35,7 +36,7 @@ func testServerParts(t *testing.T) (*config.Config, *certs.Keeper, *queue.Queue)
 		filepath.ToSlash(dataDir) + "\n  max_message_bytes: 1048576\n  max_recipients: 10\n" +
 		"  max_messages_per_hour: 100\n  max_recipients_per_hour: 1000\n  read_timeout: 1m\n  write_timeout: 1m\n" +
 		"  submission_addr: \"127.0.0.1:0\"\n  implicit_tls_addr: \"127.0.0.1:0\"\n" +
-		"  max_connections: 16\n  max_connections_per_ip: 4\n  auth_workers: 2\n  auth_queue: 8\n" +
+		"  max_connections: 16\n  max_connections_per_ip: 4\n  auth_workers: 2\n" +
 		"tls:\n  mode: self_signed\n  certificate_file: tls/server.crt\n  private_key_file: tls/server.key\n  minimum_version: \"1.2\"\n" +
 		"dkim:\n  selector: mail\n  private_key_file: dkim/mail.key\n  headers:\n    - From\n    - To\n    - Subject\n    - Date\n    - Message-ID\n" +
 		"delivery:\n  tls_mode: opportunistic\n  max_attempts: 3\n  maximum_lifetime: 1h\n  initial_retry_delay: 1s\n  maximum_retry_delay: 1m\n" +
@@ -263,6 +264,51 @@ func TestConnectionLimitSaturation(t *testing.T) {
 	lim.release("1.2.3.4")
 	if !lim.acquire("1.2.3.4") {
 		t.Fatal("after release")
+	}
+}
+
+func TestDataWorkerCountMemoryBound(t *testing.T) {
+	if dataMemoryCopies < 8 {
+		t.Fatalf("DATA memory factor=%d want at least 8", dataMemoryCopies)
+	}
+	for _, tt := range []struct {
+		name     string
+		maxBytes int64
+		workers  int
+	}{
+		{"default", config.Default().Server.MaxMessageBytes, 2},
+		{"configured upper bound", config.MaxMessageBytes, 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := dataWorkerCount(tt.maxBytes); got != tt.workers {
+				t.Fatalf("workers=%d want %d", got, tt.workers)
+			}
+		})
+	}
+
+	for _, maxBytes := range []int64{1, 100 << 20, dataMemoryBudget, math.MaxInt64} {
+		workers := dataWorkerCount(maxBytes)
+		if workers < 1 || workers > maxDataWorkers {
+			t.Fatalf("maxBytes=%d workers=%d", maxBytes, workers)
+		}
+		if perWorker, ok := dataWorkerMemory(maxBytes); ok && perWorker <= dataMemoryBudget {
+			workingSet := int64(workers) * perWorker
+			if workingSet > dataMemoryBudget {
+				t.Fatalf("maxBytes=%d working set=%d exceeds budget", maxBytes, workingSet)
+			}
+		}
+	}
+}
+
+func TestDataWorkersIndependentOfAuthWorkers(t *testing.T) {
+	cfg, keeper, spool := testServerParts(t)
+	want := dataWorkerCount(cfg.Server.MaxMessageBytes)
+	for _, authWorkers := range []int{1, 1024} {
+		cfg.Server.AuthWorkers = authWorkers
+		srv := New(cfg, keeper, nil, spool, testLog{})
+		if got := cap(srv.dataWork); got != want {
+			t.Fatalf("authWorkers=%d dataWorkers=%d want %d", authWorkers, got, want)
+		}
 	}
 }
 

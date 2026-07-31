@@ -46,12 +46,14 @@ External DMARC report destinations need the usual `<org-domain>._report._dmarc.<
 
 | `tls.mode` | Meaning |
 |------------|---------|
-| `self_signed` | **Development only.** Generates an untrusted leaf (not a CA). Ordinary MUAs will reject it. |
+| `self_signed` | **Development only.** Generates an untrusted leaf (not a CA). Serving also requires the explicit `tls.allow_self_signed_serving: true` opt-in. |
 | `files` | Operator-supplied certificate + key paths. Use a publicly trusted cert in production. |
 
-Minimum TLS version is configurable (`1.2` / `1.3`). Certificate files are hot-reloaded; a bad reload keeps the last valid cert.
+Minimum TLS version is configurable (`1.2` / `1.3`). Certificate files are content-fingerprint hot-reloaded; a bad reload is logged and keeps the previous certificate only while it remains valid.
 
-Outbound delivery TLS policy is separate (`delivery.tls_mode`: `opportunistic`, `required`, `opportunistic_insecure`).
+Outbound delivery TLS policy is separate (`delivery.tls_mode`: `opportunistic`, `required`, `opportunistic_insecure`). New configurations default to required, verified TLS with plaintext disabled. Weaker policies require explicit configuration.
+
+On Unix, the config and generated DKIM private key must be regular, non-symlink files with no group/other access. Operator-managed TLS paths may use renewal symlinks (including Let's Encrypt `live/` paths), but their opened final targets must be regular files and the private key must have no group/other access. On Windows, outboxd validates opened files as regular and rejects direct symlinks for config/generated secrets, but it does not validate DACLs; operators must explicitly restrict config and private-key ACLs.
 
 ## Queue semantics
 

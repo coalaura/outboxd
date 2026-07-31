@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 
 	"golang.org/x/crypto/argon2"
@@ -71,17 +70,7 @@ func Waste() {
 	argon2.IDKey([]byte("outboxd"), make([]byte, saltLength), hashTime, hashMemory, hashThreads, keyLength)
 }
 
-// Accepted extremes for stored PHC parameters.
-// Memory is measured in KiB (1 KiB = 1024 bytes).
 const (
-	maxMemory     = 64 * 1024 // 64 MiB in KiB
-	maxIterations = 10
-	maxThreads    = 4
-	minSaltLen    = 8
-	maxSaltLen    = 64
-	minKeyLen     = 16
-	maxKeyLen     = 64
-
 	// Bound the entire PHC string before field work.
 	maxPHCLength = 512
 )
@@ -115,90 +104,32 @@ func parsePHC(hash string) (*PHCParams, error) {
 	}
 
 	// Bound encoded salt/key before any base64 decode work.
-	if len(parts[4]) > maxEncodedLen(maxSaltLen) {
+	if len(parts[4]) > maxEncodedLen(saltLength) {
 		return nil, fmt.Errorf("%w: salt size", ErrInvalidHash)
 	}
-	if len(parts[5]) > maxEncodedLen(maxKeyLen) {
+	if len(parts[5]) > maxEncodedLen(keyLength) {
 		return nil, fmt.Errorf("%w: output size", ErrInvalidHash)
 	}
 
-	var (
-		memory     uint32
-		iterations uint32
-		threads    uint8
-		seenM      bool
-		seenT      bool
-		seenP      bool
-	)
-
-	for pair := range strings.SplitSeq(parts[3], ",") {
-		key, raw, ok := strings.Cut(pair, "=")
-		if !ok {
-			return nil, ErrInvalidHash
-		}
-
-		// Parse into a wide type; validate before narrowing.
-		val, parseErr := strconv.ParseUint(raw, 10, 64)
-		if parseErr != nil {
-			return nil, ErrInvalidHash
-		}
-
-		switch key {
-		case "m":
-			if seenM || val == 0 || val > maxMemory {
-				return nil, fmt.Errorf("%w: memory out of range", ErrInvalidHash)
-			}
-			if val > uint64(^uint32(0)) {
-				return nil, fmt.Errorf("%w: memory out of range", ErrInvalidHash)
-			}
-			memory = uint32(val)
-			seenM = true
-		case "t":
-			if seenT || val == 0 || val > maxIterations {
-				return nil, fmt.Errorf("%w: iterations out of range", ErrInvalidHash)
-			}
-			if val > uint64(^uint32(0)) {
-				return nil, fmt.Errorf("%w: iterations out of range", ErrInvalidHash)
-			}
-			iterations = uint32(val)
-			seenT = true
-		case "p":
-			if seenP || val == 0 || val > maxThreads {
-				return nil, fmt.Errorf("%w: parallelism out of range", ErrInvalidHash)
-			}
-			if val > 255 {
-				return nil, fmt.Errorf("%w: parallelism out of range", ErrInvalidHash)
-			}
-			threads = uint8(val)
-			seenP = true
-		default:
-			return nil, ErrInvalidHash
-		}
-	}
-
-	if !seenM || !seenT || !seenP {
-		return nil, ErrInvalidHash
-	}
-
-	// Argon2 requires memory (KiB) >= 8 * parallelism.
-	if uint64(memory) < 8*uint64(threads) {
-		return nil, fmt.Errorf("%w: memory too small for parallelism", ErrInvalidHash)
+	canonical := fmt.Sprintf("m=%d,t=%d,p=%d", hashMemory, hashTime, hashThreads)
+	if parts[3] != canonical {
+		return nil, fmt.Errorf("%w: non-canonical parameters", ErrInvalidHash)
 	}
 
 	salt, err := encoding.DecodeString(parts[4])
-	if err != nil || len(salt) < minSaltLen || len(salt) > maxSaltLen {
+	if err != nil || len(salt) != saltLength {
 		return nil, fmt.Errorf("%w: salt size", ErrInvalidHash)
 	}
 
 	expected, err := encoding.DecodeString(parts[5])
-	if err != nil || len(expected) < minKeyLen || len(expected) > maxKeyLen {
+	if err != nil || len(expected) != keyLength {
 		return nil, fmt.Errorf("%w: output size", ErrInvalidHash)
 	}
 
 	return &PHCParams{
-		Memory:     memory,
-		Iterations: iterations,
-		Threads:    threads,
+		Memory:     hashMemory,
+		Iterations: hashTime,
+		Threads:    hashThreads,
 		Salt:       salt,
 		Key:        expected,
 	}, nil

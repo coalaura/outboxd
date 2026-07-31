@@ -132,6 +132,8 @@ type Deliverer struct {
 
 	// next pulls the next due envelope. Nil means use queue.Next (tests may override).
 	next func(context.Context) (*queue.Envelope, error)
+	// reader opens a queued message body. Tests may replace it.
+	reader func(string) (io.ReadCloser, error)
 
 	// fatal signals Run to stop on queue persistence failure
 	mu    sync.Mutex
@@ -162,6 +164,9 @@ func NewWithSigner(cfg *config.Config, spool *queue.Queue, log Logger, signer Si
 		dialer:   &net.Dialer{Timeout: config.Duration(cfg.Delivery.ConnectionTimeout)},
 		orderIPs: shuffleIPs,
 		next:     spool.Next,
+		reader: func(id string) (io.ReadCloser, error) {
+			return spool.Reader(id)
+		},
 
 		active:  make(chan struct{}, attemptLimit),
 		global:  make(chan struct{}, cfg.Delivery.GlobalConcurrency),
@@ -290,21 +295,32 @@ func (d *Deliverer) attempt(ctx context.Context, envelope *queue.Envelope) error
 	if expired {
 		return nil
 	}
+	deadline := envelope.Created.Add(d.lifetime)
+	if current, ok := ctx.Deadline(); !ok || deadline.Before(current) {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
 
 	envelope.Attempts++
 	envelope.LastError = ""
 
 	groups := make(map[string][]int, len(envelope.Recipients))
+	groupOrder := make([]string, 0, len(envelope.Recipients))
 	for i := range envelope.Recipients {
 		recipient := &envelope.Recipients[i]
 		if recipient.Status != queue.StatusPending {
 			continue
 		}
+		if _, ok := groups[recipient.Domain]; !ok {
+			groupOrder = append(groupOrder, recipient.Domain)
+		}
 		groups[recipient.Domain] = append(groups[recipient.Domain], i)
 	}
 
 	// Fairness: acquire domain first without holding a global connection slot.
-	for domain, indexes := range groups {
+	for _, domain := range groupOrder {
+		indexes := groups[domain]
 		if ctx.Err() != nil {
 			break
 		}
@@ -314,13 +330,22 @@ func (d *Deliverer) attempt(ctx context.Context, envelope *queue.Envelope) error
 		err := d.domain(ctx, envelope, domain, indexes)
 		d.domains.release(domain)
 		if err != nil {
-			envelope.LastError = fmt.Sprintf("%s: %s", domain, err)
+			envelope.LastError = normalizeDiagnostic(fmt.Sprintf("%s: %s", domain, err))
 		}
 	}
 
 	switch {
 	case envelope.Pending() == 0:
 		return d.complete(envelope)
+	case ctx.Err() != nil && time.Now().Before(deadline):
+		envelope.Attempts--
+		envelope.NextAttempt = time.Now()
+		if err := d.queue.Retry(envelope); err != nil {
+			return fmt.Errorf("retry canceled %s: %w", envelope.ID, err)
+		}
+		return nil
+	case ctx.Err() != nil:
+		return d.expirePending(envelope)
 	case envelope.Attempts >= d.cfg.Delivery.MaxAttempts:
 		for i := range envelope.Recipients {
 			recipient := &envelope.Recipients[i]
@@ -331,7 +356,7 @@ func (d *Deliverer) attempt(ctx context.Context, envelope *queue.Envelope) error
 				case recipient.Detail != "":
 					// keep capability-specific or prior MX detail
 				case envelope.LastError != "":
-					recipient.Detail = envelope.LastError
+					recipient.Detail = normalizeDiagnostic(envelope.LastError)
 				default:
 					recipient.Detail = "delivery attempts exhausted"
 				}
@@ -358,6 +383,10 @@ func (d *Deliverer) expire(envelope *queue.Envelope) (bool, error) {
 		return false, nil
 	}
 
+	return true, d.expirePending(envelope)
+}
+
+func (d *Deliverer) expirePending(envelope *queue.Envelope) error {
 	for i := range envelope.Recipients {
 		recipient := &envelope.Recipients[i]
 		if recipient.Status == queue.StatusPending {
@@ -367,7 +396,7 @@ func (d *Deliverer) expire(envelope *queue.Envelope) (bool, error) {
 	}
 	envelope.LastError = lifetimeDetail
 	d.log.Printf("expiring %s after %s\n", envelope.ID, d.lifetime)
-	return true, d.failTerminal(envelope)
+	return d.failTerminal(envelope)
 }
 
 func (d *Deliverer) complete(envelope *queue.Envelope) error {
@@ -585,7 +614,11 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 		return true, nil
 	}
 
-	reader, err := d.queue.Reader(envelope.ID)
+	openReader := d.reader
+	if openReader == nil {
+		openReader = func(id string) (io.ReadCloser, error) { return d.queue.Reader(id) }
+	}
+	reader, err := openReader(envelope.ID)
 	if err != nil {
 		return false, err
 	}
@@ -602,7 +635,8 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 
 	_, err = io.Copy(dw, reader)
 	if err != nil {
-		_ = dw.Close()
+		// Closing DotWriter emits the DATA terminator. Abort the transport instead.
+		_ = client.Close()
 		return false, err
 	}
 	if err := dw.Close(); err != nil {
@@ -617,7 +651,7 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 	for _, index := range accepted {
 		recipient := &envelope.Recipients[index]
 		recipient.Status = queue.StatusSent
-		recipient.Detail = fmt.Sprintf("%s: %s", host, strings.TrimSpace(reply))
+		recipient.Detail = normalizeDiagnostic(fmt.Sprintf("%s: %s", host, reply))
 	}
 	_ = client.Quit()
 	return true, nil
@@ -717,33 +751,53 @@ func isRestricted(ip net.IP) bool {
 	if ip == nil {
 		return true
 	}
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
-		return true
-	}
 	addr, ok := netip.AddrFromSlice(ip)
 	if !ok {
 		return true
 	}
 	addr = addr.Unmap()
-	if addr.Is4() {
-		b := addr.As4()
-		if b[0] == 0 {
-			return true
-		}
-		if b[0] == 192 && b[1] == 0 && b[2] == 2 {
-			return true
-		}
-		if b[0] == 198 && b[1] == 51 && b[2] == 100 {
-			return true
-		}
-		if b[0] == 203 && b[1] == 0 && b[2] == 113 {
-			return true
-		}
-		if b[0] >= 240 {
+	for _, prefix := range restrictedPrefixes {
+		if prefix.Contains(addr) {
 			return true
 		}
 	}
 	return false
+}
+
+var restrictedPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.31.196.0/24"),
+	netip.MustParsePrefix("192.52.193.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("192.175.48.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("224.0.0.0/4"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("::/128"),
+	netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("100:0:0:1::/64"),
+	netip.MustParsePrefix("2001::/23"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("2620:4f:8000::/48"),
+	netip.MustParsePrefix("3fff::/20"),
+	netip.MustParsePrefix("5f00::/16"),
+	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fe80::/10"),
+	netip.MustParsePrefix("ff00::/8"),
 }
 
 func (d *Deliverer) dialAndSession(ctx context.Context, mxHost string, ip net.IP) (*Client, error) {
@@ -769,6 +823,7 @@ func (d *Deliverer) dialAndSession(ctx context.Context, mxHost string, ip net.IP
 	}
 
 	client := NewClient(conn, d.command, d.submission)
+	client.bindContext(ctx)
 	if err := client.Greet(); err != nil {
 		client.Close()
 		return nil, err
@@ -883,6 +938,7 @@ func (d *Deliverer) hosts(ctx context.Context, domain string) ([]string, error) 
 }
 
 func (d *Deliverer) reject(envelope *queue.Envelope, indexes []int, detail string) {
+	detail = normalizeDiagnostic(detail)
 	for _, index := range indexes {
 		recipient := &envelope.Recipients[index]
 		recipient.Status = queue.StatusFailed
@@ -893,15 +949,23 @@ func (d *Deliverer) reject(envelope *queue.Envelope, indexes []int, detail strin
 func (d *Deliverer) backoff(attempts int) time.Duration {
 	delay := d.initial
 	for range attempts - 1 {
-		delay *= 2
-		if delay >= d.maximum {
+		if delay >= d.maximum || delay > d.maximum/2 {
 			delay = d.maximum
 			break
 		}
+		delay *= 2
 	}
 	spread := int64(delay / 5)
 	if spread <= 0 {
 		return delay
 	}
-	return delay + time.Duration(rand.Int64N(spread)) - delay/10
+	delta := time.Duration(rand.Int64N(spread)) - delay/10
+	if delta > 0 && delay > d.maximum-delta {
+		return d.maximum
+	}
+	delay += delta
+	if delay > d.maximum {
+		return d.maximum
+	}
+	return delay
 }

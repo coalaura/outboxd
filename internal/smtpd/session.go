@@ -1,7 +1,6 @@
 package smtpd
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +25,7 @@ type session struct {
 	sender     string
 	recipients []string
 	smtpUTF8   bool
+	body       smtp.BodyType
 }
 
 func (s *session) AuthMechanisms() []string {
@@ -89,6 +89,12 @@ func (s *session) Mail(from string, opts *smtp.MailOptions) error {
 	s.sender = address
 	s.recipients = s.recipients[:0]
 	s.smtpUTF8 = utf8Wanted
+	s.body = smtp.Body7Bit
+	if opts != nil {
+		if opts.Body != "" {
+			s.body = opts.Body
+		}
+	}
 
 	return nil
 }
@@ -140,15 +146,24 @@ func (s *session) Rcpt(to string, opts *smtp.RcptOptions) error {
 }
 
 func (s *session) Data(r io.Reader) error {
-	// go-smtp expects the reader to be consumed even on failure.
-	defer io.Copy(io.Discard, r)
-
 	if s.sender == "" || len(s.recipients) == 0 {
 		return &smtp.SMTPError{
 			Code:         503,
 			EnhancedCode: smtp.EnhancedCode{5, 5, 1},
 			Message:      "No valid recipients",
 		}
+	}
+
+	if !s.server.acquireDataSlot() {
+		return s.abortData(errDataBusy)
+	}
+	defer s.server.releaseDataSlot()
+
+	// Rate is work admission: once admitted, all DATA processing outcomes consume it.
+	if !s.server.rates.take(s.user.Username, len(s.recipients)) {
+		s.server.log.Printf("rate-limited submission for user %q\n", s.user.Username)
+
+		return s.abortData(errSubmissionRate)
 	}
 
 	var remoteAddress string
@@ -160,7 +175,7 @@ func (s *session) Data(r io.Reader) error {
 	maxBytes := s.server.cfg.Server.MaxMessageBytes
 	body := io.Reader(r)
 	if maxBytes > 0 {
-		body = io.LimitReader(r, maxBytes+1)
+		body = io.LimitReader(r, incrementLimit(maxBytes))
 	}
 
 	prepared, err := message.Prepare(body, message.Options{
@@ -172,7 +187,7 @@ func (s *session) Data(r io.Reader) error {
 	})
 
 	if err != nil {
-		if errors.Is(err, message.ErrOversized) {
+		if errors.Is(err, message.ErrOversized) || errors.Is(err, smtp.ErrDataTooLarge) {
 			return &smtp.SMTPError{
 				Code:         552,
 				EnhancedCode: smtp.EnhancedCode{5, 3, 4},
@@ -183,6 +198,14 @@ func (s *session) Data(r io.Reader) error {
 			Code:         550,
 			EnhancedCode: smtp.EnhancedCode{5, 6, 0},
 			Message:      responseText(err.Error()),
+		}
+	}
+
+	if s.body == smtp.Body7Bit && prepared.EightBit {
+		return &smtp.SMTPError{
+			Code:         550,
+			EnhancedCode: smtp.EnhancedCode{5, 6, 3},
+			Message:      "BODY=7BIT message contains 8-bit data",
 		}
 	}
 
@@ -203,20 +226,6 @@ func (s *session) Data(r io.Reader) error {
 			Message:      "From header not allowed for this account",
 		}
 	}
-
-	if !s.server.rates.take(s.user.Username, len(s.recipients)) {
-		s.server.log.Printf("rate-limited submission for user %q\n", s.user.Username)
-
-		return errSubmissionRate
-	}
-
-	var accepted bool
-
-	defer func() {
-		if !accepted {
-			s.server.rates.refund(s.user.Username, len(s.recipients))
-		}
-	}()
 
 	signature, err := s.server.signer.Signature(prepared.Data)
 	if err != nil {
@@ -275,17 +284,24 @@ func (s *session) Data(r io.Reader) error {
 		return errTemporaryFailure
 	}
 
-	accepted = true
-
 	s.server.log.Printf("queued %s from %s for %d recipient(s)\n", envelope.ID, s.sender, len(envelope.Recipients))
 
 	return nil
+}
+
+// go-smtp calls Data only after 354 and unconditionally drains its reader after
+// Data returns. Closing is the only supported way to reject admission without
+// consuming an attacker-controlled body.
+func (s *session) abortData(err error) error {
+	_ = s.conn.Close()
+	return err
 }
 
 func (s *session) Reset() {
 	s.sender = ""
 	s.recipients = s.recipients[:0]
 	s.smtpUTF8 = false
+	s.body = ""
 }
 
 func (s *session) Logout() error {
@@ -295,20 +311,17 @@ func (s *session) Logout() error {
 func (s *session) authenticate(username, password string) error {
 	ip := host(s.conn)
 
+	if !s.server.acquireHashSlot() {
+		s.server.log.Printf("authentication busy from %s\n", ip)
+		return errAuthBusy
+	}
+	defer s.server.releaseHashSlot()
+
 	if !s.server.authLimit.reserve(ip, username) {
 		s.server.log.Printf("throttled authentication from %s user %q\n", ip, username)
 
 		return smtp.ErrAuthFailed
 	}
-
-	// Bound waiters: non-blocking queue, corners out with 451 when saturated.
-	if err := s.server.acquireHashSlot(context.Background()); err != nil {
-		// Release reserve without attributing a password failure or success.
-		s.server.authLimit.canceled(ip, username)
-		s.server.log.Printf("authentication busy from %s\n", ip)
-		return errAuthBusy
-	}
-	defer s.server.releaseHashSlot()
 
 	user, ok := s.server.cfg.User(username)
 	if !ok || !user.Enabled {

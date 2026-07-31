@@ -4,6 +4,7 @@ package mailbox
 import (
 	"errors"
 	"fmt"
+	"net/mail"
 	"strings"
 	"unicode/utf8"
 
@@ -27,7 +28,62 @@ var (
 	ErrInvalidDomain = errors.New("invalid domain")
 	ErrDomainLabel   = errors.New("invalid DNS label")
 	ErrDomainLength  = errors.New("domain too long")
+	ErrLocalLength   = errors.New("local part too long")
+	ErrMailboxLength = errors.New("mailbox too long")
 )
+
+const (
+	maxLocalOctets   = 64
+	maxMailboxOctets = 254
+)
+
+// Address parses a bare SMTP mailbox, preserving local-part case, and enforces
+// RFC mailbox limits in octets. Angle brackets are accepted; display names are not.
+func Address(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", errors.New("empty address")
+	}
+	parsed, err := mail.ParseAddress(value)
+	if err != nil {
+		return "", err
+	}
+	if parsed.Name != "" || (parsed.Address != value && value != "<"+parsed.Address+">") {
+		return "", errors.New("address contains a display name")
+	}
+	if err := ValidateAddress(parsed.Address); err != nil {
+		return "", err
+	}
+	return parsed.Address, nil
+}
+
+// ValidateAddress enforces SMTP mailbox and DNS-representation octet limits.
+// It intentionally accepts single-label and address-literal domains; routing
+// callers can apply RoutingDomain's stricter DNS requirements afterwards.
+func ValidateAddress(addr string) error {
+	if !utf8.ValidString(addr) {
+		return ErrInvalidUTF8
+	}
+	if len(addr) > maxMailboxOctets {
+		return ErrMailboxLength
+	}
+	at := strings.LastIndexByte(addr, '@')
+	if at <= 0 || at == len(addr)-1 {
+		return ErrEmptyDomain
+	}
+	if at > maxLocalOctets {
+		return ErrLocalLength
+	}
+	domain := addr[at+1:]
+	if strings.HasPrefix(domain, "[") && strings.HasSuffix(domain, "]") {
+		if len(domain) > 255 {
+			return ErrDomainLength
+		}
+		return nil
+	}
+	_, err := asciiDomain(domain, false)
+	return err
+}
 
 // DomainOf extracts the domain after the final '@' and returns its ASCII
 // routing A-label (lowercased). The local part is not inspected beyond the split.
@@ -43,6 +99,10 @@ func DomainOf(addr string) (string, error) {
 // for MX/A lookup and concurrency keys. Unicode U-labels are not returned.
 // Leading or trailing whitespace is rejected; input is never silently trimmed.
 func RoutingDomain(domain string) (string, error) {
+	return asciiDomain(domain, true)
+}
+
+func asciiDomain(domain string, requireFQDN bool) (string, error) {
 	if domain == "" {
 		return "", ErrEmptyDomain
 	}
@@ -71,7 +131,7 @@ func RoutingDomain(domain string) (string, error) {
 		return "", ErrDomainLength
 	}
 	labels := strings.Split(ascii, ".")
-	if len(labels) < 2 {
+	if requireFQDN && len(labels) < 2 {
 		// Delivery still requires a multi-label FQDN for ordinary recipients.
 		return "", ErrDomainLabel
 	}

@@ -50,7 +50,7 @@ func user(configPath string, arguments []string) error {
 		return err
 	}
 	if created {
-		fmt.Fprintf(os.Stderr, "created default config at %s\n", cfg.Path())
+		fmt.Fprintf(os.Stderr, "created default config at %q\n", cfg.Path())
 	}
 
 	if err := cfg.AddUser(entry); err != nil {
@@ -59,7 +59,7 @@ func user(configPath string, arguments []string) error {
 
 	var out strings.Builder
 	out.Grow(256)
-	fmt.Fprintf(&out, "Added user %s to %s\n", entry.Username, cfg.Path())
+	fmt.Fprintf(&out, "Added user %q to %q\n", escapeControl(entry.Username), cfg.Path())
 	if generated {
 		fmt.Fprintf(&out, "\nGenerated password (store it now; shown once):\n\n  %s\n", password)
 	}

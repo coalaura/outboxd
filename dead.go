@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"text/tabwriter"
 
@@ -105,6 +106,7 @@ func deadShow(spool *queue.Queue, id string) error {
 }
 
 func deadRetry(spool *queue.Queue, id string) error {
+	reportQueueIssues(os.Stderr, spool)
 	env, err := spool.ReviveDead(id)
 	if err != nil {
 		if env != nil {
@@ -114,4 +116,13 @@ func deadRetry(spool *queue.Queue, id string) error {
 	}
 	fmt.Printf("requeued %s\n", env.ID)
 	return nil
+}
+
+func reportQueueIssues(w io.Writer, spool *queue.Queue) {
+	for _, err := range spool.Corrupt {
+		fmt.Fprintf(w, "corrupt queue entry: %s\n", escapeControl(err.Error()))
+	}
+	for _, err := range spool.Warnings {
+		fmt.Fprintf(w, "queue maintenance warning: %s\n", escapeControl(err.Error()))
+	}
 }

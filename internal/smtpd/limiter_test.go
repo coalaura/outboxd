@@ -1,7 +1,6 @@
 package smtpd
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -346,8 +345,8 @@ func TestAuthLimiterCapacityExistingIdentityContinues(t *testing.T) {
 	for i := 0; i < maxAuthKeyEntries-1; i++ {
 		ip := fmt.Sprintf("10.%d.%d.1", i/256, i%256)
 		key := ip + "\x00u"
-		l.byIP[ip] = &attemptState{failures: 1, seen: now}
-		l.byKey[key] = &attemptState{failures: 1, seen: now}
+		l.byIP[ip] = &attemptState{failures: 1, seen: now.Add(-time.Minute)}
+		l.byKey[key] = &attemptState{failures: 1, seen: now.Add(-time.Minute)}
 	}
 	trackedIP := "192.0.2.50"
 	trackedKey := trackedIP + "\x00tracked"
@@ -363,9 +362,10 @@ func TestAuthLimiterCapacityExistingIdentityContinues(t *testing.T) {
 	}
 	l.canceled(trackedIP, "tracked")
 
-	if l.reserve("198.51.100.1", "newuser") {
-		t.Fatal("new identity must be rejected when key map at capacity")
+	if !l.reserve("198.51.100.1", "newuser") {
+		t.Fatal("new identity must replace oldest safe state at capacity")
 	}
+	l.canceled("198.51.100.1", "newuser")
 	checkAgg(t, l)
 
 	// Independent IP-map capacity: consistent IP+identity pairs so aggregates hold.
@@ -374,8 +374,12 @@ func TestAuthLimiterCapacityExistingIdentityContinues(t *testing.T) {
 	l2.mu.Lock()
 	for i := 0; i < maxAuthIPEntries; i++ {
 		ip := fmt.Sprintf("11.%d.%d.1", i/256, i%256)
-		l2.byIP[ip] = &attemptState{failures: 1, seen: now}
-		l2.byKey[ip+"\x00u"] = &attemptState{failures: 1, seen: now}
+		seen := now.Add(-time.Minute)
+		if i == 0 {
+			seen = now
+		}
+		l2.byIP[ip] = &attemptState{failures: 1, seen: seen}
+		l2.byKey[ip+"\x00u"] = &attemptState{failures: 1, seen: seen}
 	}
 	existIP := "11.0.0.1"
 	l2.mu.Unlock()
@@ -384,9 +388,10 @@ func TestAuthLimiterCapacityExistingIdentityContinues(t *testing.T) {
 		t.Fatal("existing IP+user at IP capacity should still reserve")
 	}
 	l2.canceled(existIP, "u")
-	if l2.reserve("203.0.113.9", "x") {
-		t.Fatal("new IP must be rejected at IP capacity")
+	if !l2.reserve("203.0.113.9", "x") {
+		t.Fatal("new IP must replace oldest safe IP at capacity")
 	}
+	l2.canceled("203.0.113.9", "x")
 	l2.mu.Lock()
 	if len(l2.byIP) > maxAuthIPEntries || len(l2.byKey) > maxAuthKeyEntries {
 		t.Fatalf("overshoot ips=%d keys=%d", len(l2.byIP), len(l2.byKey))
@@ -406,14 +411,15 @@ func TestAuthLimiterCapacityNoTemporaryOvershoot(t *testing.T) {
 		l.byKey[ip+"\x00u"] = &attemptState{failures: 1, seen: now}
 	}
 	l.mu.Unlock()
-	if l.reserve("203.0.113.50", "overflow") {
-		t.Fatal("must not create beyond capacity")
+	if !l.reserve("203.0.113.50", "overflow") {
+		t.Fatal("safe capacity entry was not replaced")
 	}
 	l.mu.Lock()
 	if len(l.byKey) > maxAuthKeyEntries || len(l.byIP) > maxAuthIPEntries {
 		t.Fatalf("overshoot keys=%d ips=%d", len(l.byKey), len(l.byIP))
 	}
 	l.mu.Unlock()
+	l.canceled("203.0.113.50", "overflow")
 }
 
 func TestAuthLimiterFailedDoesNotHalfReserve(t *testing.T) {
@@ -495,7 +501,7 @@ func TestAuthLimiterConcurrentCapacityBoundary(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			if l.reserve(fmt.Sprintf("20.0.0.%d", i+1), "u") {
+			if l.reserve(fmt.Sprintf("20.0.0.%d", i+1), fmt.Sprintf("u%d", i)) {
 				ok.Add(1)
 			}
 		}(i)
@@ -516,17 +522,67 @@ func TestAuthLimiterConcurrentCapacityBoundary(t *testing.T) {
 	l.mu.Unlock()
 }
 
+func TestAuthLimiterUsernameGlobalConcurrentBudget(t *testing.T) {
+	l := newAuthLimiter()
+	for i := 0; i < freeAttempts; i++ {
+		if !l.reserve(fmt.Sprintf("192.0.2.%d", i+1), "DistributedUser") {
+			t.Fatalf("distributed reserve %d", i)
+		}
+	}
+	if l.reserve("198.51.100.1", "distributeduser") {
+		t.Fatal("username-global in-flight budget must reject another IP")
+	}
+	for i := 0; i < freeAttempts; i++ {
+		l.failed(fmt.Sprintf("192.0.2.%d", i+1), "DistributedUser")
+	}
+	if !l.reserve("198.51.100.1", "distributeduser") {
+		t.Fatal("completed distributed failures must not persistently lock the username")
+	}
+	l.canceled("198.51.100.1", "distributeduser")
+	checkAgg(t, l)
+}
+
 func TestAuthWorkQueueSaturated(t *testing.T) {
 	s := &Server{
-		hashing:  make(chan struct{}, 1),
-		authWait: make(chan struct{}, 1),
+		hashing:   make(chan struct{}, 1),
+		authLimit: newAuthLimiter(),
 	}
 	s.hashing <- struct{}{}
-	s.authWait <- struct{}{}
-	err := s.acquireHashSlot(context.Background())
-	if err != errAuthBusy {
-		t.Fatalf("want errAuthBusy, got %v", err)
+	if s.acquireHashSlot() {
+		t.Fatal("saturated hashing must reject without waiting")
 	}
+	if len(s.authLimit.byIP) != 0 || len(s.authLimit.byKey) != 0 || len(s.authLimit.byUser) != 0 {
+		t.Fatal("busy hash admission must not reserve or charge an auth identity")
+	}
+}
+
+func TestAuthLimiterCapacityEvictsOldestSafeState(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	l := newAuthLimiterSized(2, 2, entryExpiry, entryExpiry)
+	l.clock = func() time.Time { return now }
+	for _, tc := range []struct {
+		ip   string
+		seen time.Time
+	}{{"192.0.2.1", now.Add(-time.Minute)}, {"192.0.2.2", now}} {
+		l.mu.Lock()
+		l.byIP[tc.ip] = &attemptState{failures: 1, seen: tc.seen}
+		l.byKey[tc.ip+"\x00user"] = &attemptState{failures: 1, seen: tc.seen}
+		l.mu.Unlock()
+	}
+
+	if !l.reserve("192.0.2.3", "user") {
+		t.Fatal("new identity was denied despite safe capacity state")
+	}
+	l.mu.Lock()
+	_, oldestIP := l.byIP["192.0.2.1"]
+	_, oldestKey := l.byKey["192.0.2.1\x00user"]
+	_, newerIP := l.byIP["192.0.2.2"]
+	l.mu.Unlock()
+	if oldestIP || oldestKey || !newerIP {
+		t.Fatalf("oldestIP=%v oldestKey=%v newerIP=%v", oldestIP, oldestKey, newerIP)
+	}
+	l.canceled("192.0.2.3", "user")
+	checkAgg(t, l)
 }
 
 func TestAuthLimiterExistingNoFullSweep(t *testing.T) {
@@ -595,17 +651,28 @@ func TestAuthLimiterCapacitySweepOnceThenReject(t *testing.T) {
 	l.mu.Lock()
 	before := l.fullSweeps
 	l.pruned = now
+	for ip, st := range l.byIP {
+		if ip != "10.0.0.1" {
+			st.seen = now.Add(-time.Minute)
+		}
+	}
+	for key, st := range l.byKey {
+		if key != "10.0.0.1\x00u" {
+			st.seen = now.Add(-time.Minute)
+		}
+	}
 	l.mu.Unlock()
 
-	// First at-capacity new identity may sweep once.
-	if l.reserve("203.0.113.1", "attacker0") {
-		t.Fatal("expected reject at capacity with nothing reclaimable")
+	// First at-capacity new identity sweeps and replaces safe oldest state.
+	if !l.reserve("203.0.113.1", "attacker0") {
+		t.Fatal("expected oldest safe state replacement")
 	}
+	l.failed("203.0.113.1", "attacker0")
 	l.mu.Lock()
 	mid := l.fullSweeps
 	l.mu.Unlock()
 	if mid != before+1 {
-		t.Fatalf("first capacity reject sweeps=%d want %d", mid-before, 1)
+		t.Fatalf("first capacity replacement sweeps=%d want %d", mid-before, 1)
 	}
 	// Hundreds more at same logical time: no additional full sweeps.
 	for i := 0; i < 300; i++ {
@@ -675,10 +742,15 @@ func TestAuthLimiterCapacityFloodRealClockBoundedSweeps(t *testing.T) {
 
 	l.clock = time.Now
 	const flood = 2000
+	accepted := 0
 	for i := 0; i < flood; i++ {
 		if l.reserve(fmt.Sprintf("198.51.100.%d", i%250+1), fmt.Sprintf("flood%d", i)) {
-			t.Fatalf("unexpected accept at flood %d", i)
+			accepted++
+			l.failed(fmt.Sprintf("198.51.100.%d", i%250+1), fmt.Sprintf("flood%d", i))
 		}
+	}
+	if accepted > 1 {
+		t.Fatalf("accepted %d replacements within one sweep interval", accepted)
 	}
 	l.mu.Lock()
 	grew := l.fullSweeps - before
@@ -700,13 +772,27 @@ func TestAuthLimiterExistingDuringCapacityFlood(t *testing.T) {
 		l.failed(ip, "u")
 	}
 	l.mu.Lock()
+	for ip, st := range l.byIP {
+		if ip == "10.51.0.1" {
+			st.seen = time.Now()
+		} else {
+			st.seen = time.Now().Add(-time.Minute)
+		}
+	}
+	for key, st := range l.byKey {
+		if key == "10.51.0.1\x00u" {
+			st.seen = time.Now()
+		} else {
+			st.seen = time.Now().Add(-time.Minute)
+		}
+	}
 	l.pruned = l.nowTime()
 	l.mu.Unlock()
 	l.clock = time.Now
 
 	for i := 0; i < 500; i++ {
 		if l.reserve(fmt.Sprintf("203.0.113.%d", i%200+1), fmt.Sprintf("n%d", i)) {
-			t.Fatalf("new identity accepted at capacity i=%d", i)
+			l.failed(fmt.Sprintf("203.0.113.%d", i%200+1), fmt.Sprintf("n%d", i))
 		}
 		// Existing seat still reservable during the flood.
 		if !l.reserve("10.51.0.1", "u") {
@@ -746,8 +832,8 @@ func TestAuthLimiterSmallCapacityConcurrentExact(t *testing.T) {
 	}
 	close(start)
 	wg.Wait()
-	if got := ok.Load(); got != int32(remaining) {
-		t.Fatalf("accepted=%d want %d", got, remaining)
+	if got := ok.Load(); got != int32(remaining+1) {
+		t.Fatalf("accepted=%d want %d (free slots plus one safe replacement)", got, remaining+1)
 	}
 	l.mu.Lock()
 	if len(l.byIP) > capN || len(l.byKey) > capN {

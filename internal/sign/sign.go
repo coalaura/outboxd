@@ -28,18 +28,48 @@ type Signer struct {
 
 // Ensure loads the DKIM key, generating one when it does not exist yet.
 func Ensure(cfg *config.Config) (*Signer, bool, error) {
-	path := cfg.ResolvePath(cfg.DKIM.PrivateKeyFile)
+	path, err := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := cfg.CheckGeneratedParents(path); err != nil {
+		return nil, false, err
+	}
 
 	key, created, err := ensureKey(path)
 	if err != nil {
 		return nil, false, err
 	}
 
-	public, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	loaded, err := signer(cfg, key)
 	if err != nil {
 		return nil, false, err
 	}
+	return loaded, created, nil
+}
 
+// Load reads and validates the configured DKIM key without creating or
+// modifying any file. Deployment checks use this read-only path.
+func Load(cfg *config.Config) (*Signer, error) {
+	path, err := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.CheckGeneratedParents(path); err != nil {
+		return nil, err
+	}
+	key, err := loadKey(path)
+	if err != nil {
+		return nil, err
+	}
+	return signer(cfg, key)
+}
+
+func signer(cfg *config.Config, key *rsa.PrivateKey) (*Signer, error) {
+	public, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		return nil, err
+	}
 	return &Signer{
 		options: dkim.SignOptions{
 			Domain:                 cfg.Server.Domain,
@@ -51,7 +81,7 @@ func Ensure(cfg *config.Config) (*Signer, bool, error) {
 			HeaderKeys:             cfg.DKIM.Headers,
 		},
 		PublicKey: base64.StdEncoding.EncodeToString(public),
-	}, created, nil
+	}, nil
 }
 
 // Signature returns the DKIM-Signature field, including its trailing CRLF, for
@@ -83,7 +113,7 @@ func (s *Signer) Record() string {
 }
 
 func ensureKey(path string) (*rsa.PrivateKey, bool, error) {
-	body, err := os.ReadFile(path)
+	body, err := config.ReadCheckedFile(path, true, false)
 	if err == nil {
 		key, err := parseKey(body)
 
@@ -112,7 +142,7 @@ func ensureKey(path string) (*rsa.PrivateKey, bool, error) {
 	if err != nil {
 		// Another process may have won the create race; adopt their key.
 		if errors.Is(err, os.ErrExist) {
-			body, readErr := os.ReadFile(path)
+			body, readErr := config.ReadCheckedFile(path, true, false)
 			if readErr != nil {
 				return nil, false, readErr
 			}
@@ -123,6 +153,18 @@ func ensureKey(path string) (*rsa.PrivateKey, bool, error) {
 	}
 
 	return key, true, nil
+}
+
+func loadKey(path string) (*rsa.PrivateKey, error) {
+	body, err := config.ReadCheckedFile(path, true, false)
+	if err != nil {
+		return nil, fmt.Errorf("read dkim private key: %w", err)
+	}
+	key, err := parseKey(body)
+	if err != nil {
+		return nil, fmt.Errorf("parse dkim private key: %w", err)
+	}
+	return key, nil
 }
 
 func parseKey(body []byte) (*rsa.PrivateKey, error) {

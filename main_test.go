@@ -4,12 +4,14 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/coalaura/outboxd/internal/config"
 	"github.com/coalaura/outboxd/internal/disk"
 	"github.com/coalaura/outboxd/internal/passwd"
 	"github.com/coalaura/outboxd/internal/queue"
+	"github.com/coalaura/outboxd/internal/sign"
 )
 
 func TestServeDataDirectoryResolvedAgainstConfig(t *testing.T) {
@@ -59,6 +61,112 @@ func TestServeDataDirectoryResolvedAgainstConfig(t *testing.T) {
 	}
 }
 
+func TestRunCheckDoesNotGenerateMissingDKIMKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	cfg, _, err := config.EnsurePath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, err := passwd.Hash("test-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Server.Hostname = "mail.example.com"
+	cfg.Server.Domain = "example.com"
+	cfg.DNS.PublicIPv4 = "203.0.113.10"
+	cfg.TLS.AllowSelfSignedServing = true
+	cfg.Users = []config.User{{Username: "alice", PasswordHash: hash, AllowedSenders: []string{"alice@example.com"}, Enabled: true}}
+	if err := cfg.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	keyPath, err := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runCheck(path); err == nil || !strings.Contains(err.Error(), "DKIM") {
+		t.Fatalf("missing DKIM key must fail check, got %v", err)
+	}
+	if _, err := os.Stat(keyPath); !os.IsNotExist(err) {
+		t.Fatalf("check generated DKIM key: %v", err)
+	}
+}
+
+func TestRunCheckMissingTLSDoesNotMutateFilesystem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	cfg, _, err := config.EnsurePath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, err := passwd.Hash("test-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Server.Hostname = "mail.example.com"
+	cfg.Server.Domain = "example.com"
+	cfg.DNS.PublicIPv4 = "203.0.113.10"
+	cfg.TLS.AllowSelfSignedServing = true
+	cfg.Users = []config.User{{Username: "alice", PasswordHash: hash, AllowedSenders: []string{"alice@example.com"}, Enabled: true}}
+	if err := cfg.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := disk.Mkdir(cfg.ResolvedDataDir()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := sign.Ensure(cfg); err != nil {
+		t.Fatal(err)
+	}
+	before := filesystemSnapshot(t, dir)
+	if err := runCheck(path); err == nil || !strings.Contains(err.Error(), "TLS certificate") {
+		t.Fatalf("missing TLS pair must fail check, got %v", err)
+	}
+	after := filesystemSnapshot(t, dir)
+	if strings.Join(before, "\n") != strings.Join(after, "\n") {
+		t.Fatalf("check mutated filesystem\nbefore: %v\nafter:  %v", before, after)
+	}
+}
+
+func filesystemSnapshot(t *testing.T, root string) []string {
+	t.Helper()
+	var snapshot []string
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		entry := rel + ":" + info.Mode().String()
+		if !info.IsDir() {
+			body, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			entry += ":" + string(body)
+		}
+		snapshot = append(snapshot, entry)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
+func TestEscapeControl(t *testing.T) {
+	if got := escapeControl("a\n\tb"); got != `a\x0a\x09b` {
+		t.Fatalf("escapeControl=%q", got)
+	}
+}
+
 func TestServeLocksQueueBeforeGeneratingAssets(t *testing.T) {
 	// serve must take exclusive queue ownership before writing DKIM/TLS/DNS assets.
 	cfgDir := t.TempDir()
@@ -79,6 +187,7 @@ func TestServeLocksQueueBeforeGeneratingAssets(t *testing.T) {
 		"    allowed_senders: [\"alice@example.com\"]\n    enabled: true\n"
 
 	cfgPath := filepath.Join(cfgDir, "config.yml")
+	cfgBody = strings.Replace(cfgBody, "  mode: self_signed\n", "  mode: self_signed\n  allow_self_signed_serving: true\n", 1)
 	if err := os.WriteFile(cfgPath, []byte(cfgBody), 0600); err != nil {
 		t.Fatal(err)
 	}

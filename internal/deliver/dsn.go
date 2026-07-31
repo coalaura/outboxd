@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -23,7 +24,11 @@ func (d *Deliverer) ensureDSN(envelope *queue.Envelope) error {
 
 	dsnID := dsnEnvelopeID(envelope.ID, envelope.Incarnation, envelope.DSNGeneration)
 
-	body, err := d.queue.ReadBody(envelope.ID)
+	reader, err := d.queue.Reader(envelope.ID)
+	if err != nil {
+		return err
+	}
+	body, err := readDSNOriginal(reader)
 	if err != nil {
 		return err
 	}
@@ -88,6 +93,27 @@ func (d *Deliverer) ensureDSN(envelope *queue.Envelope) error {
 	return d.queue.AddDSN(envelope, dsnEnv, msg)
 }
 
+const dsnOriginalLimit = 256 << 10
+
+func readDSNOriginal(r io.ReadCloser) (original []byte, err error) {
+	defer func() {
+		if closeErr := r.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	original, err = io.ReadAll(io.LimitReader(r, dsnOriginalLimit+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(original) <= dsnOriginalLimit {
+		return original, nil
+	}
+	if end := bytes.Index(original, []byte("\r\n\r\n")); end >= 0 {
+		return original[:end+4], nil
+	}
+	return original[:dsnOriginalLimit], nil
+}
+
 func dsnEnvelopeID(original, incarnation string, generation uint64) string {
 	return queue.DSNID(original, incarnation, generation)
 }
@@ -141,7 +167,7 @@ func buildDSN(hostname string, env *queue.Envelope, original []byte) ([]byte, er
 	if len(orig) == 0 {
 		orig = []byte("\r\n")
 	}
-	if len(orig) > 256*1024 {
+	if len(orig) > dsnOriginalLimit {
 		if idx := bytes.Index(orig, []byte("\r\n\r\n")); idx >= 0 {
 			orig = orig[:idx+4]
 		}

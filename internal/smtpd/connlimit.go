@@ -10,10 +10,9 @@ type connectionLimiter struct {
 	global int
 	perIP  int
 
-	mu      sync.Mutex
-	active  int
-	byIP    map[string]int
-	waiting int
+	mu     sync.Mutex
+	active int
+	byIP   map[string]int
 }
 
 func newConnectionLimiter(global, perIP int) *connectionLimiter {

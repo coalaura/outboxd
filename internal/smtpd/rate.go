@@ -84,21 +84,6 @@ func (l *submissionLimiter) take(username string, recipients int) bool {
 	return true
 }
 
-func (l *submissionLimiter) refund(username string, recipients int) {
-	now := time.Now()
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	allowance, ok := l.entries[username]
-	if !ok {
-		return
-	}
-	l.refill(allowance, now)
-	allowance.messages = min(allowance.messages+1, l.msgBurst)
-	allowance.recipients = min(allowance.recipients+float64(recipients), l.rcptBurst)
-	allowance.seen = now
-}
-
 func (l *submissionLimiter) refill(a *submissionAllowance, now time.Time) {
 	elapsed := now.Sub(a.updated)
 	a.updated = now

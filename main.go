@@ -8,8 +8,12 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
+	"time"
+	"unicode"
 
 	"github.com/coalaura/outboxd/internal/certs"
 	"github.com/coalaura/outboxd/internal/check"
@@ -111,10 +115,10 @@ func serve(configPath string) error {
 	spool.FreeDisk = disk.FreeBytes
 
 	for _, cerr := range spool.Corrupt {
-		log.Warnln("corrupt queue entry:", cerr)
+		log.Warnln("corrupt queue entry:", escapeControl(cerr.Error()))
 	}
 	for _, warning := range spool.Warnings {
-		log.Warnln("queue maintenance warning:", warning)
+		log.Warnln("queue maintenance warning:", escapeControl(warning.Error()))
 	}
 
 	log.Println("Ensuring DKIM keys...")
@@ -138,6 +142,9 @@ func serve(configPath string) error {
 	if generated {
 		log.Println("Generated self-signed TLS certificate")
 	}
+	keeper.SetReloadErrorHandler(func(err error) {
+		log.Warnln("TLS certificate reload failed:", escapeControl(err.Error()))
+	})
 
 	log.Println("Writing DNS instructions...")
 
@@ -146,11 +153,11 @@ func serve(configPath string) error {
 		return err
 	}
 
-	log.Printf("Wrote DNS instructions to %s\n", path)
+	log.Printf("Wrote DNS instructions to %s\n", strconv.Quote(path))
 
 	log.Println("Starting server...")
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := terminationContext(context.Background())
 	defer stop()
 
 	submission := smtpd.New(cfg, keeper, signer, spool, log)
@@ -248,20 +255,29 @@ func runCheck(configPath string) error {
 	if err != nil {
 		return err
 	}
+	if err := cfg.IsReady(); err != nil {
+		return fmt.Errorf("configuration not ready: %w", err)
+	}
 
 	opts := check.Options{Config: cfg, Resolver: check.DefaultResolver{}}
 
-	if signer, _, err := sign.Ensure(cfg); err == nil {
-		opts.DKIM = &check.DKIMKey{
-			Selector:  cfg.DKIM.Selector,
-			PublicKey: signer.PublicKey,
-		}
+	signer, err := sign.Load(cfg)
+	if err != nil {
+		return fmt.Errorf("load local DKIM key: %w", err)
+	}
+	opts.DKIM = &check.DKIMKey{Selector: cfg.DKIM.Selector, PublicKey: signer.PublicKey}
+	if err := certs.Check(cfg); err != nil {
+		return fmt.Errorf("check serving TLS certificate: %w", err)
 	}
 
-	results := check.Run(context.Background(), opts)
+	signalCtx, stop := terminationContext(context.Background())
+	defer stop()
+	ctx, cancel := context.WithTimeout(signalCtx, 30*time.Second)
+	defer cancel()
+	results := check.Run(ctx, opts)
 	var failed bool
 	for _, r := range results {
-		fmt.Printf("%s  %-24s  %s\n", r.Level, r.Name, r.Message)
+		fmt.Printf("%s  %-24s  %s\n", r.Level, escapeControl(r.Name), escapeControl(r.Message))
 		if r.Level == check.Fail {
 			failed = true
 		}
@@ -270,4 +286,46 @@ func runCheck(configPath string) error {
 		return errors.New("one or more deployment checks failed")
 	}
 	return nil
+}
+
+// terminationContext stops intercepting signals after the first termination
+// request. A second signal therefore regains the operating system's default
+// force-termination behavior.
+func terminationContext(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			signal.Stop(signals)
+			cancel()
+		})
+	}
+	go func() {
+		select {
+		case <-signals:
+			stop()
+		case <-parent.Done():
+			stop()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, stop
+}
+
+func escapeControl(value string) string {
+	var out strings.Builder
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			if r <= 0xff {
+				fmt.Fprintf(&out, `\x%02x`, r)
+			} else {
+				fmt.Fprintf(&out, `\u%04x`, r)
+			}
+			continue
+		}
+		out.WriteRune(r)
+	}
+	return out.String()
 }

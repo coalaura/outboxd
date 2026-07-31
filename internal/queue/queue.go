@@ -37,6 +37,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -76,6 +77,14 @@ const (
 	dirDSN     = "dsn"
 	dirCorrupt = "corrupt"
 	dirTrash   = "trash"
+
+	maxAddStateBytes       = 64
+	maxEnvelopeMetadata    = 4 << 20
+	maxEnvelopeRecipients  = 1000
+	maxEnvelopeStringBytes = 4096
+	maxEnvelopeDetailBytes = 64 << 10
+	maxEnvelopeAttempts    = 1 << 20
+	maxEnvelopeRevision    = math.MaxUint64 - 1
 )
 
 // idPattern accepts the envelope IDs this process generates and previously
@@ -150,6 +159,7 @@ type Queue struct {
 	mu            sync.Mutex
 	pending       schedule
 	notify        chan struct{}
+	closeSignal   chan struct{}
 	count         int
 	bytes         int64
 	accounted     map[string]accountedEntry
@@ -158,6 +168,11 @@ type Queue struct {
 	requeues      map[string][]*Envelope
 	reserved      int   // in-flight Add reservations (count)
 	resBytes      int64 // in-flight Add reservations (bytes)
+	active        int
+	closing       bool
+	closeDone     chan struct{}
+	closeCond     *sync.Cond
+	closeErr      error
 
 	// lock is the exclusive process lock on <root>/.lock (nil for read-only).
 	lock *disk.FileLock
@@ -172,6 +187,9 @@ type Queue struct {
 	// afterPublish is a test seam invoked after publication is signaled but
 	// before the publishing operation returns.
 	afterPublish func()
+	// afterBodyOpen is a test seam invoked after the exact body handle has
+	// passed its initial size check.
+	afterBodyOpen func()
 }
 
 // Pending reports how many recipients still need a delivery attempt.
@@ -198,6 +216,10 @@ func (e *Envelope) Failed() int {
 
 // Len returns the number of messages waiting for delivery.
 func (q *Queue) Len() int {
+	if q == nil || q.beginOperation() != nil {
+		return 0
+	}
+	defer q.endOperation()
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return q.pending.Len()
@@ -205,14 +227,30 @@ func (q *Queue) Len() int {
 
 // Stats returns durable ready-queue occupancy including in-progress adds.
 func (q *Queue) Stats() (messages int, bytes int64) {
+	if q == nil || q.beginOperation() != nil {
+		return 0, 0
+	}
+	defer q.endOperation()
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return q.count + q.reserved, q.bytes + q.resBytes
+	messages, ok := checkedAddInt(q.count, q.reserved)
+	if !ok {
+		messages = math.MaxInt
+	}
+	bytes, ok = checkedAddInt64(q.bytes, q.resBytes)
+	if !ok {
+		bytes = math.MaxInt64
+	}
+	return messages, bytes
 }
 
 // Reserve holds capacity for an in-progress Add so concurrent submissions
 // cannot overshoot quotas. Release with ReleaseReserve if Add is abandoned.
 func (q *Queue) Reserve(size int64) error {
+	if err := q.beginOperation(); err != nil {
+		return err
+	}
+	defer q.endOperation()
 	if err := q.rejectReadOnly(); err != nil {
 		return err
 	}
@@ -225,11 +263,30 @@ func (q *Queue) Reserve(size int64) error {
 // skipped so a terminal notification can be staged while its source still
 // occupies the queue. MinFreeDisk still applies to every write.
 func (q *Queue) reserveLocked(size int64, exempt bool) error {
+	if size < 0 {
+		return errors.New("negative reservation size")
+	}
+	used, ok := checkedAddInt(q.count, q.reserved)
+	if !ok || used == math.MaxInt {
+		return ErrQueueFull
+	}
+	usedBytes, ok := checkedAddInt64(q.bytes, q.resBytes)
+	if !ok {
+		return ErrQueueFull
+	}
+	totalBytes, ok := checkedAddInt64(usedBytes, size)
+	if !ok {
+		return ErrQueueFull
+	}
+	reservedBytes, ok := checkedAddInt64(q.resBytes, size)
+	if !ok {
+		return ErrQueueFull
+	}
 	if !exempt {
-		if q.limits.MaxMessages > 0 && q.count+q.reserved+1 > q.limits.MaxMessages {
+		if q.limits.MaxMessages > 0 && used >= q.limits.MaxMessages {
 			return ErrQueueFull
 		}
-		if q.limits.MaxBytes > 0 && q.bytes+q.resBytes+size > q.limits.MaxBytes {
+		if q.limits.MaxBytes > 0 && totalBytes > q.limits.MaxBytes {
 			return ErrQueueFull
 		}
 	}
@@ -238,30 +295,67 @@ func (q *Queue) reserveLocked(size int64, exempt bool) error {
 		if err != nil {
 			return err
 		}
-		if free < q.limits.MinFreeDisk+size {
+		if free < q.limits.MinFreeDisk || reservedBytes > free-q.limits.MinFreeDisk {
 			return ErrInsufficientDisk
 		}
 	}
+	if q.reserved == math.MaxInt {
+		return ErrQueueFull
+	}
 	q.reserved++
-	q.resBytes += size
+	q.resBytes = reservedBytes
 	return nil
 }
 
 // ReleaseReserve undoes Reserve.
 func (q *Queue) ReleaseReserve(size int64) {
+	if q == nil || q.beginOperation() != nil {
+		return
+	}
+	defer q.endOperation()
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.releaseReserveLocked(size)
 }
 
 func (q *Queue) releaseReserveLocked(size int64) {
+	if size < 0 {
+		return
+	}
 	if q.reserved > 0 {
 		q.reserved--
 	}
-	q.resBytes -= size
-	if q.resBytes < 0 {
+	if size > q.resBytes {
 		q.resBytes = 0
+	} else {
+		q.resBytes -= size
 	}
+}
+
+func (q *Queue) releaseReserve(size int64) {
+	q.mu.Lock()
+	q.releaseReserveLocked(size)
+	q.mu.Unlock()
+}
+
+func checkedAddInt(a, b int) (int, bool) {
+	if b > 0 && a > math.MaxInt-b {
+		return 0, false
+	}
+	if b < 0 && a < math.MinInt-b {
+		return 0, false
+	}
+	return a + b, true
+}
+
+func checkedAddInt64(a, b int64) (int64, bool) {
+	if b > 0 && a > math.MaxInt64-b {
+		return 0, false
+	}
+	if b < 0 && a < math.MinInt64-b {
+		return 0, false
+	}
+	return a + b, true
 }
 
 var (
@@ -275,6 +369,8 @@ var (
 	ErrReadOnly = errors.New("queue opened read-only")
 	// ErrQueueBusy is returned when another operation owns the same queue ID.
 	ErrQueueBusy = errors.New("queue id is busy")
+	// ErrQueueClosed is returned after queue shutdown begins.
+	ErrQueueClosed = errors.New("queue closed")
 	// ErrIDConflict is returned when an ID names a different durable queue item.
 	ErrIDConflict = errors.New("queue id conflict")
 	// ErrCleanup reports that terminal state committed but garbage cleanup did not.
@@ -286,6 +382,28 @@ func (q *Queue) rejectReadOnly() error {
 		return ErrReadOnly
 	}
 	return nil
+}
+
+func (q *Queue) beginOperation() error {
+	if q == nil {
+		return ErrQueueClosed
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closing {
+		return ErrQueueClosed
+	}
+	q.active++
+	return nil
+}
+
+func (q *Queue) endOperation() {
+	q.mu.Lock()
+	q.active--
+	if q.active == 0 && q.closing {
+		q.closeCond.Broadcast()
+	}
+	q.mu.Unlock()
 }
 
 // ValidateID rejects path traversal and malformed identifiers.
@@ -325,8 +443,15 @@ func newIncarnation() (string, error) {
 // The accepted marker is the commit point: before it is synced, neither tmp/
 // nor a pending ready/ entry is recoverable as an accepted message.
 func (q *Queue) Add(envelope *Envelope, data []byte) error {
+	if err := q.beginOperation(); err != nil {
+		return err
+	}
+	defer q.endOperation()
 	if err := q.rejectReadOnly(); err != nil {
 		return err
+	}
+	if envelope == nil {
+		return errors.New("missing envelope")
 	}
 	if err := ValidateID(envelope.ID); err != nil {
 		return err
@@ -357,7 +482,7 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 	}
 	readyDir := filepath.Join(q.ready, envelope.ID)
 	if _, err := os.Stat(readyDir); err == nil {
-		state, stateErr := os.ReadFile(filepath.Join(readyDir, addStateName))
+		state, stateErr := readBoundedRegular(filepath.Join(readyDir, addStateName), maxAddStateBytes)
 		if stateErr != nil {
 			return stateErr
 		}
@@ -393,7 +518,7 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 	held := true
 	defer func() {
 		if held {
-			q.ReleaseReserve(envelope.Size)
+			q.releaseReserve(envelope.Size)
 		}
 	}()
 
@@ -424,7 +549,7 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 		return err
 	}
 
-	meta, err := json.Marshal(envelope)
+	meta, err := marshalEnvelope(envelope)
 	if err != nil {
 		return err
 	}
@@ -447,7 +572,7 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 			// If quarantine itself fails while an accepted marker is visible,
 			// report success rather than invite a duplicate retry for an entry
 			// that recovery will deliver.
-			state, readErr := os.ReadFile(filepath.Join(readyDir, addStateName))
+			state, readErr := readBoundedRegular(filepath.Join(readyDir, addStateName), maxAddStateBytes)
 			if readErr != nil || string(state) != addAccepted {
 				return errors.Join(err, fmt.Errorf("quarantine failed add: %w", abortErr), readErr)
 			}
@@ -476,6 +601,10 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 // AddDSN durably links a generated DSN to its source before making the DSN
 // schedulable. Recovery completes a linked stage after a crash.
 func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
+	if err := q.beginOperation(); err != nil {
+		return err
+	}
+	defer q.endOperation()
 	if err := q.rejectReadOnly(); err != nil {
 		return err
 	}
@@ -585,7 +714,7 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 	held := true
 	defer func() {
 		if held {
-			q.ReleaseReserve(dsn.Size)
+			q.releaseReserve(dsn.Size)
 		}
 	}()
 
@@ -608,7 +737,7 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 	if err := disk.Write(filepath.Join(stageDir, bodyName), data, 0600); err != nil {
 		return err
 	}
-	meta, err := json.Marshal(dsn)
+	meta, err := marshalEnvelope(dsn)
 	if err != nil {
 		return err
 	}
@@ -631,6 +760,9 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 		// Preserve the complete stage. Startup decides whether the source update
 		// committed and either publishes or quarantines it.
 		cleanup = false
+		q.mu.Lock()
+		q.requeues[source.ID] = append(q.requeues[source.ID], cloneEnvelope(durableSource))
+		q.mu.Unlock()
 		return err
 	}
 	cleanup = false
@@ -734,11 +866,19 @@ func writeAddState(file *os.File, state string) error {
 // The returned envelope is removed from the in-memory schedule but remains on
 // disk under ready/ until Finish, Retry, or Bury.
 func (q *Queue) Next(ctx context.Context) (*Envelope, error) {
+	if err := q.beginOperation(); err != nil {
+		return nil, err
+	}
+	defer q.endOperation()
 	timer := time.NewTimer(time.Hour)
 	defer timer.Stop()
 
 	for {
 		q.mu.Lock()
+		if q.closing {
+			q.mu.Unlock()
+			return nil, ErrQueueClosed
+		}
 		wait := time.Hour
 		if q.pending.Len() > 0 {
 			envelope := q.pending[0]
@@ -764,6 +904,8 @@ func (q *Queue) Next(ctx context.Context) (*Envelope, error) {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-q.closeSignal:
+			return nil, ErrQueueClosed
 		case <-q.notify:
 		case <-timer.C:
 		}
@@ -773,15 +915,19 @@ func (q *Queue) Next(ctx context.Context) (*Envelope, error) {
 // Requeue puts an envelope back onto the schedule without disk I/O.
 // Used when delivery is cancelled before a persistence attempt.
 func (q *Queue) Requeue(envelope *Envelope) {
+	if envelope == nil || q == nil || q.beginOperation() != nil {
+		return
+	}
+	defer q.endOperation()
 	q.mu.Lock()
 	if _, transitioning := q.transitioning[envelope.ID]; transitioning {
 		for _, queued := range q.requeues[envelope.ID] {
-			if queued == envelope {
+			if queued.Incarnation == envelope.Incarnation && queued.Revision == envelope.Revision {
 				q.mu.Unlock()
 				return
 			}
 		}
-		q.requeues[envelope.ID] = append(q.requeues[envelope.ID], envelope)
+		q.requeues[envelope.ID] = append(q.requeues[envelope.ID], cloneEnvelope(envelope))
 		q.mu.Unlock()
 		return
 	}
@@ -797,6 +943,10 @@ func (q *Queue) Requeue(envelope *Envelope) {
 // it remains under ready/ and is returned to the schedule so a subsequent
 // Open recovers it. The error is returned to the caller.
 func (q *Queue) Retry(envelope *Envelope) error {
+	if err := q.beginOperation(); err != nil {
+		return err
+	}
+	defer q.endOperation()
 	if err := q.rejectReadOnly(); err != nil {
 		return err
 	}
@@ -827,7 +977,10 @@ func (q *Queue) Retry(envelope *Envelope) error {
 		}
 	}
 	if err := validateEnvelope(envelope); err != nil {
-		// Still reschedule so we do not strand.
+		// Reschedule the durable version rather than caller-mutated invalid data.
+		if durable, loadErr := q.loadAcceptedDir(filepath.Join(q.ready, envelope.ID), envelope.ID); loadErr == nil {
+			envelope = durable
+		}
 		publish()
 		return err
 	}
@@ -846,6 +999,10 @@ func (q *Queue) Retry(envelope *Envelope) error {
 // directory is renamed into trash/ then removed. A crash after rename leaves
 // a trash entry cleaned on Open.
 func (q *Queue) Finish(envelope *Envelope) error {
+	if err := q.beginOperation(); err != nil {
+		return err
+	}
+	defer q.endOperation()
 	if err := q.rejectReadOnly(); err != nil {
 		return err
 	}
@@ -885,6 +1042,10 @@ func (q *Queue) Finish(envelope *Envelope) error {
 // Bury moves an undeliverable message into the dead-letter directory atomically
 // (single directory rename). Metadata is written first inside ready/.
 func (q *Queue) Bury(envelope *Envelope) error {
+	if err := q.beginOperation(); err != nil {
+		return err
+	}
+	defer q.endOperation()
 	if err := q.rejectReadOnly(); err != nil {
 		return err
 	}
@@ -915,6 +1076,11 @@ func (q *Queue) Bury(envelope *Envelope) error {
 		}
 	}
 	if err := validateEnvelope(envelope); err != nil {
+		// Reschedule the durable version rather than caller-mutated invalid data.
+		if durable, loadErr := q.loadAcceptedDir(filepath.Join(q.ready, envelope.ID), envelope.ID); loadErr == nil {
+			envelope = durable
+		}
+		reschedule()
 		return err
 	}
 	src := filepath.Join(q.ready, envelope.ID)
@@ -968,6 +1134,10 @@ func (q *Queue) Bury(envelope *Envelope) error {
 
 // ReviveDead moves a dead-letter item back to ready and schedules it.
 func (q *Queue) ReviveDead(id string) (*Envelope, error) {
+	if err := q.beginOperation(); err != nil {
+		return nil, err
+	}
+	defer q.endOperation()
 	if err := q.rejectReadOnly(); err != nil {
 		return nil, err
 	}
@@ -991,6 +1161,13 @@ func (q *Queue) ReviveDead(id string) (*Envelope, error) {
 	if err != nil {
 		return nil, err
 	}
+	nextRevision, err := incrementRevision(env.Revision)
+	if err != nil {
+		return nil, err
+	}
+	if env.DSNSourceID == "" && env.DSNGeneration == math.MaxUint64 {
+		return nil, errors.New("DSN generation overflow")
+	}
 	q.mu.Lock()
 	if _, exists := q.accounted[id]; exists {
 		q.mu.Unlock()
@@ -1004,7 +1181,7 @@ func (q *Queue) ReviveDead(id string) (*Envelope, error) {
 	held := true
 	defer func() {
 		if held {
-			q.ReleaseReserve(env.Size)
+			q.releaseReserve(env.Size)
 		}
 	}()
 
@@ -1019,13 +1196,13 @@ func (q *Queue) ReviveDead(id string) (*Envelope, error) {
 	env.LastError = ""
 	env.NextAttempt = time.Now()
 	if env.DSNSourceID == "" {
-		if env.DSNGeneration == ^uint64(0) {
-			return nil, errors.New("DSN generation overflow")
-		}
 		env.DSNGeneration++
 		env.DSNID = ""
 	}
-	env.Revision++
+	env.Revision = nextRevision
+	if err := validateEnvelope(env); err != nil {
+		return nil, err
+	}
 
 	stagedMeta := filepath.Join(src, reviveMetaName)
 	if err := q.writeMeta(stagedMeta, env); err != nil {
@@ -1072,6 +1249,10 @@ func (q *Queue) ReviveDead(id string) (*Envelope, error) {
 
 // DeadIDs lists dead-letter entry IDs.
 func (q *Queue) DeadIDs() ([]string, error) {
+	if err := q.beginOperation(); err != nil {
+		return nil, err
+	}
+	defer q.endOperation()
 	entries, err := os.ReadDir(q.dead)
 	if err != nil {
 		return nil, err
@@ -1091,6 +1272,10 @@ func (q *Queue) DeadIDs() ([]string, error) {
 
 // LoadDead reads a dead-letter envelope by id.
 func (q *Queue) LoadDead(id string) (*Envelope, error) {
+	if err := q.beginOperation(); err != nil {
+		return nil, err
+	}
+	defer q.endOperation()
 	if err := ValidateID(id); err != nil {
 		return nil, err
 	}
@@ -1099,48 +1284,68 @@ func (q *Queue) LoadDead(id string) (*Envelope, error) {
 
 // ExportDead copies the original message to w.
 func (q *Queue) ExportDead(id string, w io.Writer) error {
+	if err := q.beginOperation(); err != nil {
+		return err
+	}
+	defer q.endOperation()
 	if err := ValidateID(id); err != nil {
 		return err
 	}
-	if _, err := q.loadAcceptedDir(filepath.Join(q.dead, id), id); err != nil {
-		return err
-	}
-	f, err := os.Open(filepath.Join(q.dead, id, bodyName))
+	dir := filepath.Join(q.dead, id)
+	env, f, err := q.openAcceptedBody(dir, id)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	_, err = io.Copy(w, f)
-	return err
+	return copyExactBody(w, f, env.Size)
 }
 
 // Reader opens the stored message body for a ready entry.
-func (q *Queue) Reader(id string) (*os.File, error) {
+func (q *Queue) Reader(id string) (io.ReadCloser, error) {
+	if err := q.beginOperation(); err != nil {
+		return nil, err
+	}
+	owned := true
+	defer func() {
+		if owned {
+			q.endOperation()
+		}
+	}()
 	if err := ValidateID(id); err != nil {
 		return nil, err
 	}
-	if _, err := q.loadAcceptedDir(filepath.Join(q.ready, id), id); err != nil {
+	dir := filepath.Join(q.ready, id)
+	_, file, err := q.openAcceptedBody(dir, id)
+	if err != nil {
 		return nil, err
 	}
-	return os.OpenFile(filepath.Join(q.ready, id, bodyName), os.O_RDONLY, 0)
+	owned = false
+	return &trackedReader{file: file, queue: q}, nil
 }
 
 // ReadBody returns the full body bytes for ready or dead.
 func (q *Queue) ReadBody(id string) ([]byte, error) {
+	if err := q.beginOperation(); err != nil {
+		return nil, err
+	}
+	defer q.endOperation()
 	if err := ValidateID(id); err != nil {
 		return nil, err
 	}
 	ready := filepath.Join(q.ready, id)
-	if _, err := q.loadAcceptedDir(ready, id); err == nil {
-		return os.ReadFile(filepath.Join(ready, bodyName))
+	if env, file, err := q.openAcceptedBody(ready, id); err == nil {
+		defer file.Close()
+		return readBodyFromFile(file, env.Size)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 	dead := filepath.Join(q.dead, id)
-	if _, err := q.loadAcceptedDir(dead, id); err != nil {
+	env, file, err := q.openAcceptedBody(dead, id)
+	if err != nil {
 		return nil, err
 	}
-	return os.ReadFile(filepath.Join(dead, bodyName))
+	defer file.Close()
+	return readBodyFromFile(file, env.Size)
 }
 
 // Path returns the spool root.
@@ -1148,15 +1353,6 @@ func (q *Queue) Path() string { return q.root }
 
 // DeadDir returns the dead-letter directory.
 func (q *Queue) DeadDir() string { return q.dead }
-
-func (q *Queue) schedule(envelope *Envelope) {
-	q.mu.Lock()
-	added := q.scheduleLocked(envelope)
-	q.mu.Unlock()
-	if added {
-		q.signal()
-	}
-}
 
 func (q *Queue) signal() {
 	select {
@@ -1173,14 +1369,25 @@ func (q *Queue) scheduleLocked(envelope *Envelope) bool {
 	if _, exists := q.scheduled[envelope.ID]; exists {
 		return false
 	}
-	heap.Push(&q.pending, envelope)
+	heap.Push(&q.pending, cloneEnvelope(envelope))
 	q.scheduled[envelope.ID] = struct{}{}
 	return true
 }
 
-func (q *Queue) noteAddedLocked(envelope *Envelope) {
+func cloneEnvelope(envelope *Envelope) *Envelope {
+	clone := *envelope
+	clone.Recipients = append([]Recipient(nil), envelope.Recipients...)
+	clone.index = -1
+	return &clone
+}
+
+func (q *Queue) noteAddedLocked(envelope *Envelope) bool {
 	if _, exists := q.accounted[envelope.ID]; exists {
-		return
+		return true
+	}
+	bytes, ok := checkedAddInt64(q.bytes, envelope.Size)
+	if !ok || q.count == math.MaxInt {
+		return false
 	}
 	q.accounted[envelope.ID] = accountedEntry{
 		size:        envelope.Size,
@@ -1188,7 +1395,8 @@ func (q *Queue) noteAddedLocked(envelope *Envelope) {
 		revision:    envelope.Revision,
 	}
 	q.count++
-	q.bytes += envelope.Size
+	q.bytes = bytes
+	return true
 }
 
 func (q *Queue) beginTransition(id string) error {
@@ -1246,13 +1454,20 @@ func (q *Queue) noteRemoved(id string) {
 }
 
 func (q *Queue) storeReady(envelope *Envelope) error {
+	nextRevision, err := incrementRevision(envelope.Revision)
+	if err != nil {
+		return err
+	}
 	dir := filepath.Join(q.ready, envelope.ID)
 	if err := q.matchReady(envelope); err != nil {
 		return err
 	}
 	path := filepath.Join(dir, metaName)
 	updated := *envelope
-	updated.Revision++
+	updated.Revision = nextRevision
+	if err := validateEnvelope(&updated); err != nil {
+		return err
+	}
 	committed, err := q.writeMetaReconciled(path, &updated)
 	if !committed {
 		return err
@@ -1286,7 +1501,7 @@ func (q *Queue) matchReady(envelope *Envelope) error {
 }
 
 func acceptedDir(dir string) error {
-	state, err := os.ReadFile(filepath.Join(dir, addStateName))
+	state, err := readBoundedRegular(filepath.Join(dir, addStateName), maxAddStateBytes)
 	if err != nil {
 		return err
 	}
@@ -1319,7 +1534,7 @@ func removeAndSync(path string) error {
 }
 
 func (q *Queue) writeMeta(path string, envelope *Envelope) error {
-	body, err := json.Marshal(envelope)
+	body, err := marshalEnvelope(envelope)
 	if err != nil {
 		return err
 	}
@@ -1327,12 +1542,12 @@ func (q *Queue) writeMeta(path string, envelope *Envelope) error {
 }
 
 func (q *Queue) writeMetaReconciled(path string, envelope *Envelope) (bool, error) {
-	body, err := json.Marshal(envelope)
+	body, err := marshalEnvelope(envelope)
 	if err != nil {
 		return false, err
 	}
 	if err := disk.Write(path, body, 0600); err != nil {
-		visible, readErr := os.ReadFile(path)
+		visible, readErr := readBoundedRegular(path, maxEnvelopeMetadata)
 		if readErr == nil && bytes.Equal(visible, body) {
 			return true, err
 		}
@@ -1342,10 +1557,25 @@ func (q *Queue) writeMetaReconciled(path string, envelope *Envelope) (bool, erro
 }
 
 func (q *Queue) loadDir(dir, expectID string) (*Envelope, error) {
-	metaPath := filepath.Join(dir, metaName)
-	bodyPath := filepath.Join(dir, bodyName)
+	env, err := loadEnvelopeMetadata(dir, expectID)
+	if err != nil {
+		return nil, err
+	}
+	file, info, err := openRegular(filepath.Join(dir, bodyName))
+	if err != nil {
+		return nil, fmt.Errorf("missing body: %w", err)
+	}
+	file.Close()
+	if info.Size() != env.Size {
+		return nil, fmt.Errorf("body size mismatch: metadata=%d actual=%d", env.Size, info.Size())
+	}
+	return env, nil
+}
 
-	raw, err := os.ReadFile(metaPath)
+func loadEnvelopeMetadata(dir, expectID string) (*Envelope, error) {
+	metaPath := filepath.Join(dir, metaName)
+
+	raw, err := readBoundedRegular(metaPath, maxEnvelopeMetadata)
 	if err != nil {
 		return nil, err
 	}
@@ -1362,17 +1592,146 @@ func (q *Queue) loadDir(dir, expectID string) (*Envelope, error) {
 	if err := validateEnvelope(env); err != nil {
 		return nil, err
 	}
-	st, err := os.Lstat(bodyPath)
-	if err != nil {
-		return nil, fmt.Errorf("missing body: %w", err)
-	}
-	if !st.Mode().IsRegular() {
-		return nil, errors.New("body is not a regular file")
-	}
-	if env.Size != st.Size() {
-		return nil, fmt.Errorf("body size mismatch: metadata=%d actual=%d", env.Size, st.Size())
-	}
 	return env, nil
+}
+
+func marshalEnvelope(envelope *Envelope) ([]byte, error) {
+	body, err := json.Marshal(envelope)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxEnvelopeMetadata {
+		return nil, fmt.Errorf("envelope metadata exceeds %d bytes", maxEnvelopeMetadata)
+	}
+	return body, nil
+}
+
+func readBoundedRegular(path string, max int64) ([]byte, error) {
+	before, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !before.Mode().IsRegular() {
+		return nil, errors.New("queue metadata is not a regular file")
+	}
+	if before.Size() > max {
+		return nil, fmt.Errorf("queue metadata exceeds %d bytes", max)
+	}
+	file, _, err := openRegularFromInfo(path, before)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) > max {
+		return nil, fmt.Errorf("queue metadata exceeds %d bytes", max)
+	}
+	return raw, nil
+}
+
+func openRegular(path string) (*os.File, os.FileInfo, error) {
+	before, err := os.Lstat(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return openRegularFromInfo(path, before)
+}
+
+func openRegularFromInfo(path string, before os.FileInfo) (*os.File, os.FileInfo, error) {
+	if !before.Mode().IsRegular() {
+		return nil, nil, errors.New("queue file is not a regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	after, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, nil, err
+	}
+	if !after.Mode().IsRegular() || !os.SameFile(before, after) {
+		file.Close()
+		return nil, nil, errors.New("queue file changed while opening")
+	}
+	return file, after, nil
+}
+
+type trackedReader struct {
+	file  *os.File
+	queue *Queue
+	once  sync.Once
+	err   error
+}
+
+func (r *trackedReader) Read(p []byte) (int, error) {
+	return r.file.Read(p)
+}
+
+func (r *trackedReader) Close() error {
+	r.once.Do(func() {
+		r.err = r.file.Close()
+		r.queue.endOperation()
+	})
+	return r.err
+}
+
+func (q *Queue) openBody(path string, expected int64) (*os.File, error) {
+	file, info, err := openRegular(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() != expected {
+		file.Close()
+		return nil, fmt.Errorf("body size mismatch: metadata=%d actual=%d", expected, info.Size())
+	}
+	if q.afterBodyOpen != nil {
+		q.afterBodyOpen()
+	}
+	info, err = file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() != expected {
+		file.Close()
+		return nil, fmt.Errorf("body size mismatch: metadata=%d actual=%d", expected, info.Size())
+	}
+	return file, nil
+
+}
+
+func readBodyFromFile(file *os.File, expected int64) ([]byte, error) {
+	var body bytes.Buffer
+	if err := copyExactBody(&body, file, expected); err != nil {
+		return nil, err
+	}
+	return body.Bytes(), nil
+}
+
+func copyExactBody(dst io.Writer, file *os.File, expected int64) error {
+	limit, ok := checkedAddInt64(expected, 1)
+	if !ok {
+		return errors.New("body size is too large")
+	}
+	written, err := io.Copy(dst, io.LimitReader(file, limit))
+	if err != nil {
+		return err
+	}
+	if written != expected {
+		return fmt.Errorf("body size mismatch while reading: metadata=%d actual=%d", expected, written)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Size() != expected {
+		return fmt.Errorf("body size mismatch while reading: metadata=%d actual=%d", expected, info.Size())
+	}
+	return nil
 }
 
 // Open loads an existing spool directory, creating it when needed.
@@ -1390,10 +1749,16 @@ func Open(directory string, limits Limits) (*Queue, error) {
 		trash:         filepath.Join(directory, dirTrash),
 		limits:        limits,
 		notify:        make(chan struct{}, 1),
+		closeSignal:   make(chan struct{}),
 		accounted:     make(map[string]accountedEntry),
 		scheduled:     make(map[string]struct{}),
 		transitioning: make(map[string]struct{}),
 		requeues:      make(map[string][]*Envelope),
+		closeDone:     make(chan struct{}),
+	}
+	q.closeCond = sync.NewCond(&q.mu)
+	if limits.MinFreeDisk > 0 {
+		q.FreeDisk = disk.FreeBytes
 	}
 
 	if err := disk.MkdirDurable(q.root); err != nil {
@@ -1438,7 +1803,7 @@ func Open(directory string, limits Limits) (*Queue, error) {
 // Supported: DeadIDs, LoadDead, ExportDead, ReadBody, Path, DeadDir.
 // Mutating methods return ErrReadOnly.
 func OpenReadOnly(directory string) (*Queue, error) {
-	return &Queue{
+	q := &Queue{
 		root:          directory,
 		ready:         filepath.Join(directory, dirReady),
 		dead:          filepath.Join(directory, dirDead),
@@ -1447,21 +1812,50 @@ func OpenReadOnly(directory string) (*Queue, error) {
 		corr:          filepath.Join(directory, dirCorrupt),
 		trash:         filepath.Join(directory, dirTrash),
 		notify:        make(chan struct{}, 1),
+		closeSignal:   make(chan struct{}),
 		accounted:     make(map[string]accountedEntry),
 		scheduled:     make(map[string]struct{}),
 		transitioning: make(map[string]struct{}),
 		requeues:      make(map[string][]*Envelope),
+		closeDone:     make(chan struct{}),
 		readOnly:      true,
-	}, nil
+	}
+	q.closeCond = sync.NewCond(&q.mu)
+	return q, nil
 }
 
 // Close releases the exclusive spool lock.
 func (q *Queue) Close() error {
-	if q == nil || q.lock == nil {
+	if q == nil {
 		return nil
 	}
-	err := q.lock.Close()
+	q.mu.Lock()
+	if q.closing {
+		done := q.closeDone
+		q.mu.Unlock()
+		<-done
+		q.mu.Lock()
+		err := q.closeErr
+		q.mu.Unlock()
+		return err
+	}
+	q.closing = true
+	close(q.closeSignal)
+	for q.active > 0 {
+		q.closeCond.Wait()
+	}
+	lock := q.lock
 	q.lock = nil
+	q.mu.Unlock()
+
+	var err error
+	if lock != nil {
+		err = lock.Close()
+	}
+	q.mu.Lock()
+	q.closeErr = err
+	close(q.closeDone)
+	q.mu.Unlock()
 	return err
 }
 
@@ -1477,7 +1871,9 @@ func (q *Queue) recoverTmp() error {
 	}
 	for _, e := range entries {
 		if !e.IsDir() {
-			_ = os.Remove(filepath.Join(q.tmp, e.Name()))
+			if err := os.Remove(filepath.Join(q.tmp, e.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+				q.Warnings = append(q.Warnings, fmt.Errorf("remove stray tmp file %s: %w", e.Name(), err))
+			}
 			continue
 		}
 		id := e.Name()
@@ -1584,7 +1980,7 @@ func (q *Queue) quarantineDSNStage(stage, id, suffix string, cause error) error 
 			continue
 		}
 		sourceDir := filepath.Join(q.ready, entry.Name())
-		raw, err := os.ReadFile(filepath.Join(sourceDir, metaName))
+		raw, err := readBoundedRegular(filepath.Join(sourceDir, metaName), maxEnvelopeMetadata)
 		if err != nil {
 			continue
 		}
@@ -1627,7 +2023,7 @@ func (q *Queue) loadReady() error {
 			q.Corrupt = append(q.Corrupt, fmt.Errorf("ready %s: %w", id, err))
 			continue
 		}
-		state, err := os.ReadFile(filepath.Join(dir, addStateName))
+		state, err := readBoundedRegular(filepath.Join(dir, addStateName), maxAddStateBytes)
 		if err != nil {
 			if qerr := q.quarantineDir(dir, id); qerr != nil {
 				return qerr
@@ -1677,13 +2073,35 @@ func (q *Queue) loadReady() error {
 			}
 			q.Corrupt = append(q.Corrupt, fmt.Errorf("dead %s: %w", id, deadErr))
 		}
-		q.noteAddedLocked(env)
+		if !q.noteAddedLocked(env) {
+			if qerr := q.quarantineDir(dir, id+"-accounting-overflow"); qerr != nil {
+				return qerr
+			}
+			q.Corrupt = append(q.Corrupt, fmt.Errorf("ready %s: queue accounting overflow", id))
+			continue
+		}
 		q.scheduleLocked(env)
 	}
 	return nil
 }
 
 func (q *Queue) loadAcceptedDir(dir, expectID string) (*Envelope, error) {
+	env, err := loadAcceptedMetadata(dir, expectID)
+	if err != nil {
+		return nil, err
+	}
+	file, info, err := openRegular(filepath.Join(dir, bodyName))
+	if err != nil {
+		return nil, fmt.Errorf("missing body: %w", err)
+	}
+	file.Close()
+	if info.Size() != env.Size {
+		return nil, fmt.Errorf("body size mismatch: metadata=%d actual=%d", env.Size, info.Size())
+	}
+	return env, nil
+}
+
+func loadAcceptedMetadata(dir, expectID string) (*Envelope, error) {
 	if err := acceptedDir(dir); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			if _, statErr := os.Stat(dir); statErr == nil {
@@ -1694,7 +2112,19 @@ func (q *Queue) loadAcceptedDir(dir, expectID string) (*Envelope, error) {
 		}
 		return nil, err
 	}
-	return q.loadDir(dir, expectID)
+	return loadEnvelopeMetadata(dir, expectID)
+}
+
+func (q *Queue) openAcceptedBody(dir, expectID string) (*Envelope, *os.File, error) {
+	env, err := loadAcceptedMetadata(dir, expectID)
+	if err != nil {
+		return nil, nil, err
+	}
+	file, err := q.openBody(filepath.Join(dir, bodyName), env.Size)
+	if err != nil {
+		return nil, nil, err
+	}
+	return env, file, nil
 }
 
 func (q *Queue) removeTrash(path string) error {
@@ -1767,11 +2197,17 @@ func validateEnvelope(e *Envelope) error {
 	if _, err := hex.DecodeString(e.Incarnation); err != nil {
 		return errors.New("invalid queue incarnation")
 	}
-	if e.Revision == 0 {
+	if e.Revision == 0 || e.Revision > maxEnvelopeRevision {
 		return errors.New("invalid queue revision")
 	}
 	if e.Username == "" {
 		return errors.New("missing username")
+	}
+	if len(e.Username) > maxEnvelopeStringBytes {
+		return errors.New("username too long")
+	}
+	if len(e.LastError) > maxEnvelopeDetailBytes {
+		return errors.New("last error too long")
 	}
 	if e.DSNSourceID != "" {
 		if err := ValidateID(e.DSNSourceID); err != nil {
@@ -1808,11 +2244,14 @@ func validateEnvelope(e *Envelope) error {
 	if len(e.Recipients) == 0 {
 		return errors.New("no recipients")
 	}
+	if len(e.Recipients) > maxEnvelopeRecipients {
+		return fmt.Errorf("too many recipients: maximum is %d", maxEnvelopeRecipients)
+	}
 	if e.Created.IsZero() {
 		return errors.New("missing created timestamp")
 	}
-	if e.Attempts < 0 {
-		return errors.New("negative attempts")
+	if e.Attempts < 0 || e.Attempts > maxEnvelopeAttempts {
+		return errors.New("invalid attempts")
 	}
 	if e.Size < 0 {
 		return errors.New("negative size")
@@ -1823,6 +2262,12 @@ func validateEnvelope(e *Envelope) error {
 	}
 	for i := range e.Recipients {
 		r := &e.Recipients[i]
+		if len(r.Domain) > maxEnvelopeStringBytes {
+			return fmt.Errorf("recipient[%d]: domain too long", i)
+		}
+		if len(r.Detail) > maxEnvelopeDetailBytes {
+			return fmt.Errorf("recipient[%d]: detail too long", i)
+		}
 		if err := validateAddress(r.Address); err != nil {
 			return fmt.Errorf("recipient[%d]: %w", i, err)
 		}
@@ -1858,7 +2303,37 @@ func validateEnvelope(e *Envelope) error {
 	if needUTF8 && !e.SMTPUTF8 {
 		return errors.New("SMTPUTF8 required for non-ASCII envelope address")
 	}
+	if !envelopeMetadataWithinLimit(e) {
+		return fmt.Errorf("envelope metadata exceeds %d bytes", maxEnvelopeMetadata)
+	}
 	return nil
+}
+
+func incrementRevision(revision uint64) (uint64, error) {
+	if revision == 0 || revision >= maxEnvelopeRevision {
+		return 0, errors.New("queue revision cannot be incremented")
+	}
+	return revision + 1, nil
+}
+
+func envelopeMetadataWithinLimit(e *Envelope) bool {
+	// JSON can expand a byte to a six-byte escape. Include ample fixed overhead
+	// per envelope and recipient so validation rejects before marshaling.
+	remaining := int64(maxEnvelopeMetadata) - 2048 - int64(len(e.Recipients))*256
+	strings := []string{
+		e.ID, e.Incarnation, e.Username, e.Sender, e.LastError, e.DSNID,
+		e.DSNSourceID, e.DSNSourceIncarnation,
+	}
+	for i := range e.Recipients {
+		strings = append(strings, e.Recipients[i].Address, e.Recipients[i].Domain, string(e.Recipients[i].Status), e.Recipients[i].Detail)
+	}
+	for _, value := range strings {
+		if int64(len(value)) > remaining/6 {
+			return false
+		}
+		remaining -= int64(len(value)) * 6
+	}
+	return remaining >= 0
 }
 
 // addressHasNonASCII reports whether addr contains any octet above 0x7F.
@@ -1879,11 +2354,19 @@ func validateAddress(addr string) error {
 	if !utf8.ValidString(addr) {
 		return errors.New("invalid utf-8")
 	}
+	if len(addr) > maxEnvelopeStringBytes {
+		return errors.New("address too long")
+	}
+	for i := 0; i < len(addr); i++ {
+		if addr[i] < 0x20 || addr[i] == 0x7f {
+			return errors.New("control character in address")
+		}
+	}
 	at := strings.LastIndexByte(addr, '@')
 	if at <= 0 || at == len(addr)-1 {
 		return errors.New("missing @domain")
 	}
-	if strings.ContainsAny(addr, " \t\r\n") {
+	if strings.Contains(addr, " ") {
 		return errors.New("whitespace in address")
 	}
 	return nil

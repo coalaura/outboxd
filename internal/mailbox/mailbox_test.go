@@ -100,3 +100,43 @@ func TestInvalidUTF8Rejected(t *testing.T) {
 		t.Fatalf("got %v want ErrInvalidUTF8", err)
 	}
 }
+
+func TestAddressOctetLimits(t *testing.T) {
+	for _, addr := range []string{
+		strings.Repeat("a", 64) + "@example.com",
+		strings.Repeat("é", 32) + "@example.com",
+	} {
+		if _, err := mailbox.Address(addr); err != nil {
+			t.Fatalf("boundary address %q: %v", addr, err)
+		}
+	}
+	for _, addr := range []string{
+		strings.Repeat("a", 65) + "@example.com",
+		strings.Repeat("é", 33) + "@example.com",
+	} {
+		if _, err := mailbox.Address(addr); err == nil {
+			t.Fatalf("overlong local part accepted: %q", addr)
+		}
+	}
+}
+
+func TestAddressMailboxAndDNSRepresentationLimits(t *testing.T) {
+	longDomain := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 61)
+	if len(longDomain) != 253 {
+		t.Fatalf("test domain length=%d", len(longDomain))
+	}
+	if _, err := mailbox.RoutingDomain(longDomain); err != nil {
+		t.Fatalf("255-octet DNS representation rejected: %v", err)
+	}
+	if _, err := mailbox.Address("x@" + longDomain); err == nil {
+		t.Fatal("mailbox over 254 octets accepted")
+	}
+	mailboxDomain := longDomain[:len(longDomain)-1]
+	if err := mailbox.ValidateAddress("x@" + mailboxDomain); err != nil {
+		t.Fatalf("254-octet mailbox rejected: %v", err)
+	}
+	overDomain := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 62)
+	if err := mailbox.ValidateAddress("x@" + overDomain); err == nil {
+		t.Fatal("DNS representation over 255 octets accepted")
+	}
+}

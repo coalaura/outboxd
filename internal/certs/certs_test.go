@@ -4,14 +4,17 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/coalaura/outboxd/internal/disk"
+	"github.com/coalaura/outboxd/internal/config"
 )
 
 func ensureWithDir(t *testing.T, dir, mode string) (*Keeper, bool, error) {
@@ -69,34 +72,69 @@ func TestSelfSignedLeafNotCA(t *testing.T) {
 	}
 }
 
-func TestPartialPairRecoverySelfSigned(t *testing.T) {
-	dir := t.TempDir()
-	// Create only a key file initially.
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
+func TestPartialPairSelfSignedPreservesConfiguredFile(t *testing.T) {
+	for _, name := range []string{"server.crt", "server.key"} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, name)
+			body := []byte("operator bytes must remain")
+			mode := os.FileMode(0644)
+			if name == "server.key" {
+				mode = 0600
+			}
+			if err := os.WriteFile(path, body, mode); err != nil {
+				t.Fatal(err)
+			}
+			_, created, err := ensureWithDir(t, dir, "self_signed")
+			if err == nil || !strings.Contains(err.Error(), "incomplete self-signed tls pair") {
+				t.Fatalf("partial pair error=%v", err)
+			}
+			if created {
+				t.Fatal("partial pair reported generation")
+			}
+			got, readErr := os.ReadFile(path)
+			if readErr != nil || string(got) != string(body) {
+				t.Fatalf("configured file changed: body=%q err=%v", got, readErr)
+			}
+			other := "server.crt"
+			if name == other {
+				other = "server.key"
+			}
+			if _, statErr := os.Stat(filepath.Join(dir, other)); !os.IsNotExist(statErr) {
+				t.Fatalf("missing half was generated: %v", statErr)
+			}
+		})
 	}
-	enc, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyPath := filepath.Join(dir, "server.key")
-	if err := disk.WriteExclusive(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: enc}), 0600); err != nil {
-		t.Fatal(err)
-	}
+}
 
-	k, created, err := ensureWithDir(t, dir, "self_signed")
-	if err != nil {
-		t.Fatal(err)
+func TestSelfSignedPathsConfinedToDataDirectory(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.Server.DataDirectory = filepath.Join(dir, "data")
+	cfg.TLS.CertificateFile = filepath.Join(dir, "outside.crt")
+	cfg.TLS.PrivateKeyFile = filepath.Join(dir, "outside.key")
+	if _, _, err := Ensure(cfg); err == nil || !strings.Contains(err.Error(), "beneath server.data_directory") {
+		t.Fatalf("escaping generated paths accepted: %v", err)
 	}
-	if !created {
-		t.Fatal("expected regeneration")
+	for _, path := range []string{cfg.TLS.CertificateFile, cfg.TLS.PrivateKeyFile} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("escaping path created: %s (%v)", path, err)
+		}
 	}
-	if _, err := os.Stat(filepath.Join(dir, "server.crt")); err != nil {
-		t.Fatal("cert missing after recovery")
+}
+
+func TestLoadDoesNotGenerateMissingSelfSignedPair(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.Server.Hostname = "mail.test.example"
+	cfg.Server.DataDirectory = dir
+	if _, err := Load(cfg); err == nil {
+		t.Fatal("Load accepted missing certificate pair")
 	}
-	if k.certificate == nil {
-		t.Fatal("no certificate loaded")
+	for _, name := range []string{"tls/server.crt", "tls/server.key"} {
+		if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(name))); !os.IsNotExist(err) {
+			t.Fatalf("Load generated %s: %v", name, err)
+		}
 	}
 }
 
@@ -130,6 +168,111 @@ func TestValidateRejectsHostnameMismatch(t *testing.T) {
 	}
 	if _, err := k.load(); err == nil {
 		t.Fatal("expected hostname mismatch error")
+	}
+}
+
+func TestCheckRejectsInvalidServingCertificates(t *testing.T) {
+	tests := []struct {
+		name string
+		prep func(t *testing.T, dir string)
+		want string
+	}{
+		{
+			name: "bad",
+			prep: func(t *testing.T, dir string) {
+				t.Helper()
+				if err := os.WriteFile(filepath.Join(dir, "server.crt"), []byte("bad certificate"), 0644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "server.key"), []byte("bad key"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "failed to find any PEM data",
+		},
+		{
+			name: "expired",
+			prep: func(t *testing.T, dir string) {
+				t.Helper()
+				writeTestPair(t, dir, "mail.test.example", time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour))
+			},
+			want: "expired",
+		},
+		{
+			name: "hostname mismatch",
+			prep: func(t *testing.T, dir string) {
+				t.Helper()
+				if err := writeSelfSigned(dir, "other.test.example"); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "does not match hostname",
+		},
+		{
+			name: "key mismatch",
+			prep: func(t *testing.T, dir string) {
+				t.Helper()
+				if err := writeSelfSigned(dir, "mail.test.example"); err != nil {
+					t.Fatal(err)
+				}
+				replacement := t.TempDir()
+				if err := writeSelfSigned(replacement, "mail.test.example"); err != nil {
+					t.Fatal(err)
+				}
+				key, err := os.ReadFile(filepath.Join(replacement, "server.key"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "server.key"), key, 0600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "private key does not match",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			test.prep(t, dir)
+			cfg := config.Default()
+			cfg.Server.Hostname = "mail.test.example"
+			cfg.TLS.Mode = "files"
+			cfg.TLS.CertificateFile = filepath.Join(dir, "server.crt")
+			cfg.TLS.PrivateKeyFile = filepath.Join(dir, "server.key")
+			if err := Check(cfg); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Check error=%v want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func writeTestPair(t *testing.T, dir, hostname string, notBefore, notAfter time.Time) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		DNSNames:     []string{hostname},
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "server.crt"), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "server.key"), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: encoded}), 0600); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -179,6 +322,129 @@ func TestHotReloadKeepsLastValid(t *testing.T) {
 	st := k.Status()
 	if !st.Loaded {
 		t.Fatal("status should still show loaded previous cert")
+	}
+}
+
+func TestHotReloadDetectsEqualMtimeReplacement(t *testing.T) {
+	dir := t.TempDir()
+	k, _, err := ensureWithDir(t, dir, "self_signed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldLeaf, _ := x509.ParseCertificate(k.certificate.Certificate[0])
+	replacement := t.TempDir()
+	if err := writeSelfSigned(replacement, "mail.test.example"); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Now().Add(-24 * time.Hour)
+	for _, name := range []string{"server.crt", "server.key"} {
+		body, err := os.ReadFile(filepath.Join(replacement, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), body, map[string]os.FileMode{"server.crt": 0644, "server.key": 0600}[name]); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(filepath.Join(dir, name), stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	k.mu.Lock()
+	k.checked = time.Time{}
+	k.mu.Unlock()
+	loaded, err := k.get(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newLeaf, _ := x509.ParseCertificate(loaded.Certificate[0])
+	if oldLeaf.SerialNumber.Cmp(newLeaf.SerialNumber) == 0 {
+		t.Fatal("equal/backdated mtime replacement was not reloaded")
+	}
+}
+
+func TestHotReloadDetectsKeyOnlyReplacement(t *testing.T) {
+	dir := t.TempDir()
+	k, _, err := ensureWithDir(t, dir, "self_signed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := k.certificate
+	replacement := t.TempDir()
+	if err := writeSelfSigned(replacement, "mail.test.example"); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(replacement, "server.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "server.key"), body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(filepath.Join(dir, "server.key"), stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	var reported error
+	k.SetReloadErrorHandler(func(err error) { reported = err })
+	k.mu.Lock()
+	k.checked = time.Time{}
+	k.mu.Unlock()
+	loaded, err := k.get(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded != old || k.LastError() == nil || reported == nil {
+		t.Fatal("key-only replacement was not detected and reported while retaining valid certificate")
+	}
+}
+
+func TestReloadErrorHandlerCanInspectKeeper(t *testing.T) {
+	dir := t.TempDir()
+	k, _, err := ensureWithDir(t, dir, "self_signed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := make(chan struct{})
+	k.SetReloadErrorHandler(func(error) {
+		_ = k.Status()
+		_ = k.LastError()
+		close(called)
+	})
+	if err := os.WriteFile(filepath.Join(dir, "server.crt"), []byte("broken"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	k.mu.Lock()
+	k.checked = time.Time{}
+	k.mu.Unlock()
+	if _, err := k.get(nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("reload callback deadlocked while inspecting keeper")
+	}
+}
+
+func TestExpiredRetainedCertificateIsNotServed(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    now.Add(-2 * time.Hour),
+		NotAfter:     now.Add(-time.Hour),
+		DNSNames:     []string{"mail.test.example"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := &Keeper{certificate: &tls.Certificate{Certificate: [][]byte{der}}, checked: now}
+	if certificate, err := k.get(nil); err == nil || certificate != nil {
+		t.Fatalf("expired retained certificate served: certificate=%v err=%v", certificate != nil, err)
 	}
 }
 

@@ -3,7 +3,7 @@ package records
 import (
 	"bytes"
 	"fmt"
-	"net/mail"
+	"net"
 	"net/url"
 	"slices"
 	"strconv"
@@ -98,14 +98,12 @@ func Build(cfg *config.Config, dkim string) []Record {
 
 	// TLS-RPT is separate from DMARC reporting.
 	if tlsURI := strings.TrimSpace(cfg.DNS.TLSRPTURI); tlsURI != "" {
-		if err := validateReportURIList(tlsURI); err == nil {
-			records = append(records, Record{
-				Name:    "_smtp._tls." + domain,
-				Type:    "TXT",
-				Value:   fmt.Sprintf("v=TLSRPTv1; rua=%s", tlsURI),
-				Purpose: "optional SMTP TLS reporting endpoint (separate from DMARC rua)",
-			})
-		}
+		records = append(records, Record{
+			Name:    "_smtp._tls." + domain,
+			Type:    "TXT",
+			Value:   fmt.Sprintf("v=TLSRPTv1; rua=%s", tlsURI),
+			Purpose: "optional SMTP TLS reporting endpoint (separate from DMARC rua)",
+		})
 	}
 
 	return records
@@ -113,6 +111,12 @@ func Build(cfg *config.Config, dkim string) []Record {
 
 // Write renders the DNS instructions next to the other generated files.
 func Write(cfg *config.Config, dkim string) (string, []byte, error) {
+	if err := config.ValidateDMARCReportURIList(cfg.DNS.ReportURI); err != nil {
+		return "", nil, fmt.Errorf("dns.dmarc_report_uri: %w", err)
+	}
+	if err := config.ValidateTLSReportURIList(cfg.DNS.TLSRPTURI); err != nil {
+		return "", nil, fmt.Errorf("dns.tlsrpt_uri: %w", err)
+	}
 	var buffer bytes.Buffer
 
 	buffer.Grow(4096)
@@ -121,8 +125,12 @@ func Write(cfg *config.Config, dkim string) (string, []byte, error) {
 
 	buffer.WriteString("- Outboxd is outbound submission + delivery only: it does not provide inbound MX\n")
 	buffer.WriteString("- Outbound TCP port 25 (sending mail) must be open from this host\n")
-	buffer.WriteString("- Inbound TCP port 465 (implicit TLS submission) must be open for clients\n")
-	buffer.WriteString("- Inbound TCP port 587 (STARTTLS submission) must be open for clients\n")
+	if addr := cfg.Server.ImplicitTLSListenAddr(); addr != "" {
+		fmt.Fprintf(&buffer, "- Inbound TCP port %s (implicit TLS submission) must be open for clients\n", listenPort(addr))
+	}
+	if addr := cfg.Server.SubmissionListenAddr(); addr != "" {
+		fmt.Fprintf(&buffer, "- Inbound TCP port %s (STARTTLS submission) must be open for clients\n", listenPort(addr))
+	}
 	buffer.WriteString("- Do not publish an MX for this host unless a separate mailbox accepts mail elsewhere\n")
 
 	if cfg.DNS.PublicIPv4 != "" {
@@ -145,13 +153,6 @@ func Write(cfg *config.Config, dkim string) (string, []byte, error) {
 		buffer.WriteString("- tls.mode is self_signed (development only); replace with a publicly trusted certificate for production clients\n")
 	}
 
-	if err := validateReportURIList(cfg.DNS.ReportURI); err != nil && strings.TrimSpace(cfg.DNS.ReportURI) != "" {
-		fmt.Fprintf(&buffer, "- WARNING: dns.dmarc_report_uri is invalid: %v\n", err)
-	}
-	if err := validateReportURIList(cfg.DNS.TLSRPTURI); err != nil && strings.TrimSpace(cfg.DNS.TLSRPTURI) != "" {
-		fmt.Fprintf(&buffer, "- WARNING: dns.tlsrpt_uri is invalid: %v\n", err)
-	}
-
 	records := Build(cfg, dkim)
 
 	for i, record := range records {
@@ -168,10 +169,23 @@ func Write(cfg *config.Config, dkim string) (string, []byte, error) {
 		}
 	}
 
-	path := cfg.ResolvePath(cfg.DNS.OutputFile)
+	path, err := cfg.ResolveGeneratedPath(cfg.DNS.OutputFile)
+	if err != nil {
+		return "", nil, err
+	}
+	if err := cfg.CheckGeneratedParents(path); err != nil {
+		return "", nil, err
+	}
 	body := buffer.Bytes()
 
 	return path, body, disk.Write(path, body, 0644)
+}
+
+func listenPort(addr string) string {
+	if _, port, err := net.SplitHostPort(addr); err == nil {
+		return port
+	}
+	return strings.TrimPrefix(addr, ":")
 }
 
 func quote(value string) string {
@@ -239,29 +253,7 @@ func spfOwnerNames(cfg *config.Config) []string {
 }
 
 func spf(cfg *config.Config) string {
-	var builder strings.Builder
-
-	builder.WriteString("v=spf1")
-
-	if cfg.DNS.PublicIPv4 != "" {
-		fmt.Fprintf(&builder, " ip4:%s", cfg.DNS.PublicIPv4)
-	}
-
-	if cfg.DNS.PublicIPv6 != "" {
-		fmt.Fprintf(&builder, " ip6:%s", cfg.DNS.PublicIPv6)
-	}
-
-	for _, include := range cfg.DNS.SPFIncludes {
-		include = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(include)), ".")
-		if include == "" {
-			continue
-		}
-		fmt.Fprintf(&builder, " include:%s", include)
-	}
-
-	builder.WriteString(" -all")
-
-	return builder.String()
+	return cfg.ExpectedSPF()
 }
 
 func dmarc(cfg *config.Config) string {
@@ -277,53 +269,10 @@ func dmarc(cfg *config.Config) string {
 
 	rua := strings.TrimSpace(cfg.DNS.ReportURI)
 	if rua != "" {
-		if err := validateReportURIList(rua); err == nil {
-			fmt.Fprintf(&builder, "; rua=%s", rua)
-		}
+		fmt.Fprintf(&builder, "; rua=%s", rua)
 	}
 
 	return builder.String()
-}
-
-func validateReportURIList(list string) error {
-	list = strings.TrimSpace(list)
-	if list == "" {
-		return nil
-	}
-	parts := strings.Split(list, ",")
-	if len(parts) == 0 {
-		return fmt.Errorf("empty report URI list")
-	}
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			return fmt.Errorf("empty report URI entry")
-		}
-		// Optional size suffix: mailto:a@b!10m
-		uriPart, _, _ := strings.Cut(part, "!")
-		u, err := url.Parse(uriPart)
-		if err != nil {
-			return fmt.Errorf("invalid report URI %q: %w", part, err)
-		}
-		switch strings.ToLower(u.Scheme) {
-		case "mailto":
-			addr := u.Opaque
-			if addr == "" {
-				addr = strings.TrimPrefix(u.String(), "mailto:")
-				addr, _, _ = strings.Cut(addr, "?")
-			}
-			if _, err := mail.ParseAddress(addr); err != nil {
-				return fmt.Errorf("invalid mailto report address %q: %w", addr, err)
-			}
-		case "https":
-			if u.Host == "" {
-				return fmt.Errorf("https report URI missing host: %q", part)
-			}
-		default:
-			return fmt.Errorf("unsupported report URI scheme %q (use mailto: or https:)", u.Scheme)
-		}
-	}
-	return nil
 }
 
 func external(reportURI, orgDomain string) []string {
@@ -331,20 +280,24 @@ func external(reportURI, orgDomain string) []string {
 	orgDomain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(orgDomain), "."))
 
 	for _, uri := range strings.Split(reportURI, ",") {
-		address, ok := strings.CutPrefix(strings.TrimSpace(uri), "mailto:")
-		if !ok {
+		uri = strings.TrimSpace(uri)
+		uri = trimDMARCSize(uri)
+		parsed, err := url.Parse(uri)
+		if err != nil {
 			continue
 		}
 
-		address, _, _ = strings.Cut(address, "!")
-		address, _, _ = strings.Cut(address, "?")
-
-		at := strings.LastIndexByte(address, '@')
-		if at < 0 {
-			continue
+		var host string
+		switch strings.ToLower(parsed.Scheme) {
+		case "mailto":
+			at := strings.LastIndexByte(parsed.Opaque, '@')
+			if at >= 0 {
+				host = parsed.Opaque[at+1:]
+			}
+		case "https":
+			host = parsed.Hostname()
 		}
-
-		host := strings.ToLower(strings.TrimSuffix(address[at+1:], "."))
+		host = strings.ToLower(strings.TrimSuffix(host, "."))
 
 		if host == "" || host == orgDomain || strings.HasSuffix(host, "."+orgDomain) {
 			continue
@@ -356,4 +309,24 @@ func external(reportURI, orgDomain string) []string {
 	}
 
 	return domains
+}
+
+func trimDMARCSize(value string) string {
+	bang := strings.LastIndexByte(value, '!')
+	if bang < 0 || bang == len(value)-1 {
+		return value
+	}
+	suffix := value[bang+1:]
+	if unit := suffix[len(suffix)-1]; unit == 'k' || unit == 'K' || unit == 'm' || unit == 'M' || unit == 'g' || unit == 'G' || unit == 't' || unit == 'T' {
+		suffix = suffix[:len(suffix)-1]
+	}
+	if suffix == "" {
+		return value
+	}
+	for _, char := range suffix {
+		if char < '0' || char > '9' {
+			return value
+		}
+	}
+	return value[:bang]
 }

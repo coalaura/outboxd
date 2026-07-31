@@ -1,10 +1,12 @@
 package deliver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +14,23 @@ import (
 	"github.com/coalaura/outboxd/internal/disk"
 	"github.com/coalaura/outboxd/internal/queue"
 )
+
+type limitedDSNReader struct {
+	*bytes.Reader
+	read   int
+	closed bool
+}
+
+func (r *limitedDSNReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	r.read += n
+	return n, err
+}
+
+func (r *limitedDSNReader) Close() error {
+	r.closed = true
+	return nil
+}
 
 type nopLog struct{}
 
@@ -165,6 +184,39 @@ func TestEnsureDSNEightBitFromHighOctets(t *testing.T) {
 	env := loadReadyEnvelope(t, q.Path(), queue.DSNID(orig.ID, orig.Incarnation, orig.DSNGeneration))
 	if !env.EightBit {
 		t.Fatal("high-bit DSN content must set EightBit")
+	}
+}
+
+func TestReadDSNOriginalBounded(t *testing.T) {
+	header := "From: alice@example.com\r\nSubject: original\r\n\r\n"
+	source := header + strings.Repeat("x", 2<<20)
+	r := &limitedDSNReader{Reader: bytes.NewReader([]byte(source))}
+	original, err := readDSNOriginal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.read > dsnOriginalLimit+1 {
+		t.Fatalf("read=%d exceeds bound=%d", r.read, dsnOriginalLimit+1)
+	}
+	if !r.closed {
+		t.Fatal("original reader was not closed")
+	}
+	if string(original) != header {
+		t.Fatalf("retained original=%q", original)
+	}
+}
+
+func TestReadDSNOriginalCapsMissingHeaderTerminator(t *testing.T) {
+	r := &limitedDSNReader{Reader: bytes.NewReader(bytes.Repeat([]byte("x"), dsnOriginalLimit*2))}
+	original, err := readDSNOriginal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(original) != dsnOriginalLimit || r.read != dsnOriginalLimit+1 {
+		t.Fatalf("retained=%d read=%d", len(original), r.read)
+	}
+	if !r.closed {
+		t.Fatal("original reader was not closed")
 	}
 }
 

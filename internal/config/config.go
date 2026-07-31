@@ -7,9 +7,12 @@ import (
 	"io"
 	"net"
 	"net/mail"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -57,17 +60,17 @@ type Server struct {
 	MaxConnections            int    `yaml:"max_connections"`
 	MaxConnectionsPerIP       int    `yaml:"max_connections_per_ip"`
 	AuthWorkers               int    `yaml:"auth_workers"`
-	AuthQueue                 int    `yaml:"auth_queue"`
 	MaxQueueMessages          int    `yaml:"max_queue_messages"`
 	MaxQueueBytes             int64  `yaml:"max_queue_bytes"`
 	MinFreeDiskBytes          int64  `yaml:"min_free_disk_bytes"`
 }
 
 type TLS struct {
-	Mode            string `yaml:"mode"`
-	CertificateFile string `yaml:"certificate_file"`
-	PrivateKeyFile  string `yaml:"private_key_file"`
-	MinimumVersion  string `yaml:"minimum_version"`
+	Mode                   string `yaml:"mode"`
+	AllowSelfSignedServing bool   `yaml:"allow_self_signed_serving"`
+	CertificateFile        string `yaml:"certificate_file"`
+	PrivateKeyFile         string `yaml:"private_key_file"`
+	MinimumVersion         string `yaml:"minimum_version"`
 }
 
 type DKIM struct {
@@ -124,14 +127,23 @@ type durationEntry struct {
 }
 
 const (
-	defaultConfigName = "config.yml"
+	defaultConfigName    = "config.yml"
+	MaxMessageBytes      = int64(100 << 20)
+	MaxRecipients        = 1000
+	MaxDeliveryAttempts  = 1000
+	MaxDomainConcurrency = 1024
+	MaxGlobalConcurrency = 4096
+	MaxConnections       = 100000
+	MaxConnectionsPerIP  = 10000
+	MaxAuthWorkers       = 16
+	SPFDNSLookupLimit    = 10
 	// EnvConfigPath overrides the config file path.
 	EnvConfigPath = "OUTBOXD_CONFIG"
 )
 
 // Default returns the default config without an example password hash.
 func Default() *Config {
-	allowPlain := true
+	allowPlain := false
 	return &Config{
 		Server: Server{
 			Hostname:             "mail.example.invalid",
@@ -148,7 +160,6 @@ func Default() *Config {
 			MaxConnections:       256,
 			MaxConnectionsPerIP:  16,
 			AuthWorkers:          4,
-			AuthQueue:            64,
 			MaxQueueMessages:     10000,
 			MaxQueueBytes:        10 << 30,
 			MinFreeDiskBytes:     1 << 30,
@@ -176,7 +187,7 @@ func Default() *Config {
 			},
 		},
 		Delivery: Delivery{
-			TLSMode:               "opportunistic",
+			TLSMode:               "required",
 			AllowPlaintext:        &allowPlain,
 			MaxAttempts:           15,
 			MaximumLifetime:       "120h",
@@ -219,10 +230,9 @@ func LoadFile(path string) (*Config, error) {
 	}
 	cfg.path = abs
 	cfg.baseDir = filepath.Dir(abs)
-
-	raw, err := os.ReadFile(abs)
+	raw, err := ReadCheckedFile(abs, true, false)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("config file: %w", err)
 	}
 	if err := rejectMultiDoc(raw); err != nil {
 		return nil, err
@@ -309,28 +319,12 @@ func EnsurePath(path string) (*Config, bool, error) {
 func (cfg *Config) applyDefaults() {
 	if cfg.Server.DisableSubmission {
 		cfg.Server.SubmissionAddr = ""
-	} else if cfg.Server.SubmissionAddr == "" {
-		cfg.Server.SubmissionAddr = ":587"
 	}
 	if cfg.Server.DisableImplicitTLS {
 		cfg.Server.ImplicitTLSAddr = ""
-	} else if cfg.Server.ImplicitTLSAddr == "" {
-		cfg.Server.ImplicitTLSAddr = ":465"
-	}
-	if cfg.Server.MaxConnections <= 0 {
-		cfg.Server.MaxConnections = 256
-	}
-	if cfg.Server.MaxConnectionsPerIP <= 0 {
-		cfg.Server.MaxConnectionsPerIP = 16
-	}
-	if cfg.Server.AuthWorkers <= 0 {
-		cfg.Server.AuthWorkers = 4
-	}
-	if cfg.Server.AuthQueue <= 0 {
-		cfg.Server.AuthQueue = 64
 	}
 	if cfg.Delivery.TLSMode == "" {
-		cfg.Delivery.TLSMode = "opportunistic"
+		cfg.Delivery.TLSMode = "required"
 	}
 	if cfg.DNS.DMARC == "" {
 		cfg.DNS.DMARC = "none"
@@ -364,7 +358,7 @@ func (d Delivery) PlaintextAllowed() bool {
 	if d.AllowPlaintext != nil {
 		return *d.AllowPlaintext
 	}
-	return d.TLSMode == "opportunistic" || d.TLSMode == "opportunistic_insecure"
+	return false
 }
 
 // InsecureTLSAllowed reports whether STARTTLS without certificate verification is allowed.
@@ -425,24 +419,59 @@ func (cfg *Config) AddUser(user User) error {
 		return err
 	}
 
-	cfg.dataMu.Lock()
-	for i := range cfg.Users {
-		if canonicalUsername(cfg.Users[i].Username) == canonicalUsername(user.Username) {
-			cfg.dataMu.Unlock()
+	path := cfg.path
+	if path == "" {
+		path = defaultConfigName
+	}
+	lock, err := lockConfig(path + ".lock")
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+
+	latest, err := LoadFile(path)
+	if err != nil {
+		return fmt.Errorf("reload config under mutation lock: %w", err)
+	}
+	for i := range latest.Users {
+		if canonicalUsername(latest.Users[i].Username) == canonicalUsername(user.Username) {
 			return fmt.Errorf("duplicate username %q", user.Username)
 		}
 	}
-	cfg.Users = append(cfg.Users, user)
-	cfg.dataMu.Unlock()
-
-	if err := cfg.Init(); err != nil {
-		cfg.dataMu.Lock()
-		cfg.Users = cfg.Users[:len(cfg.Users)-1]
-		cfg.dataMu.Unlock()
-		_ = cfg.Init()
+	latest.Users = append(latest.Users, user)
+	if err := latest.Init(); err != nil {
 		return err
 	}
-	return cfg.Save()
+	if err := latest.Save(); err != nil {
+		return err
+	}
+	cfg.adopt(latest)
+	return nil
+}
+
+func lockConfig(path string) (*disk.FileLock, error) {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		lock, err := disk.Lock(path)
+		if err == nil {
+			return lock, nil
+		}
+		if !errors.Is(err, disk.ErrLocked) || time.Now().After(deadline) {
+			return nil, fmt.Errorf("lock config for mutation: %w", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (cfg *Config) adopt(other *Config) {
+	cfg.dataMu.Lock()
+	defer cfg.dataMu.Unlock()
+	cfg.Server, cfg.TLS, cfg.DKIM, cfg.Delivery, cfg.DNS = other.Server, other.TLS, other.DKIM, other.Delivery, other.DNS
+	cfg.Users = slices.Clone(other.Users)
+	cfg.userLookup = make(map[string]*User, len(cfg.Users))
+	for i := range cfg.Users {
+		cfg.userLookup[canonicalUsername(cfg.Users[i].Username)] = &cfg.Users[i]
+	}
 }
 
 // Save atomically replaces the config file.
@@ -490,12 +519,12 @@ func (cfg *Config) Validate() error {
 		return err
 	}
 
-	if cfg.Server.MaxMessageBytes <= 0 {
-		return errors.New("server.max_message_bytes must be positive")
+	if cfg.Server.MaxMessageBytes <= 0 || cfg.Server.MaxMessageBytes > MaxMessageBytes {
+		return fmt.Errorf("server.max_message_bytes must be between 1 and %d", MaxMessageBytes)
 	}
 
-	if cfg.Server.MaxRecipients <= 0 {
-		return errors.New("server.max_recipients must be positive")
+	if cfg.Server.MaxRecipients <= 0 || cfg.Server.MaxRecipients > MaxRecipients {
+		return fmt.Errorf("server.max_recipients must be between 1 and %d", MaxRecipients)
 	}
 
 	if cfg.Server.MaxMessagesPerHour <= 0 {
@@ -512,11 +541,14 @@ func (cfg *Config) Validate() error {
 	if cfg.Server.SubmissionListenAddr() == "" && cfg.Server.ImplicitTLSListenAddr() == "" {
 		return errors.New("at least one submission listener must be enabled")
 	}
-	if cfg.Server.MaxConnections <= 0 || cfg.Server.MaxConnectionsPerIP <= 0 {
-		return errors.New("connection limits must be positive")
+	if cfg.Server.MaxConnections <= 0 || cfg.Server.MaxConnections > MaxConnections || cfg.Server.MaxConnectionsPerIP <= 0 || cfg.Server.MaxConnectionsPerIP > MaxConnectionsPerIP || cfg.Server.MaxConnectionsPerIP > cfg.Server.MaxConnections {
+		return errors.New("connection limits are invalid or exceed supported bounds")
 	}
-	if cfg.Server.AuthWorkers <= 0 || cfg.Server.AuthQueue <= 0 {
-		return errors.New("auth worker/queue limits must be positive")
+	if cfg.Server.AuthWorkers <= 0 || cfg.Server.AuthWorkers > MaxAuthWorkers {
+		return errors.New("auth worker limit is invalid or exceeds supported bounds")
+	}
+	if cfg.Server.MaxQueueMessages < 0 || cfg.Server.MaxQueueBytes < 0 || cfg.Server.MinFreeDiskBytes < 0 {
+		return errors.New("queue caps and minimum free disk must not be negative")
 	}
 
 	durations := []durationEntry{
@@ -574,6 +606,9 @@ func (cfg *Config) Validate() error {
 	if cfg.DKIM.PrivateKeyFile == "" {
 		return errors.New("dkim.private_key_file must not be empty")
 	}
+	if _, err := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile); err != nil {
+		return fmt.Errorf("dkim.private_key_file: %w", err)
+	}
 
 	hasFromHeader := false
 	seenDKIMHeaders := make(map[string]struct{}, len(cfg.DKIM.Headers))
@@ -607,12 +642,12 @@ func (cfg *Config) Validate() error {
 		return errors.New("delivery.tls_mode=opportunistic_insecure contradicts require_valid_mx_tls_certificate=true")
 	}
 
-	if cfg.Delivery.MaxAttempts <= 0 {
-		return errors.New("delivery.max_attempts must be positive")
+	if cfg.Delivery.MaxAttempts <= 0 || cfg.Delivery.MaxAttempts > MaxDeliveryAttempts {
+		return fmt.Errorf("delivery.max_attempts must be between 1 and %d", MaxDeliveryAttempts)
 	}
 
-	if cfg.Delivery.DomainConcurrency <= 0 || cfg.Delivery.GlobalConcurrency <= 0 {
-		return errors.New("delivery concurrency limits must be positive")
+	if cfg.Delivery.DomainConcurrency <= 0 || cfg.Delivery.DomainConcurrency > MaxDomainConcurrency || cfg.Delivery.GlobalConcurrency <= 0 || cfg.Delivery.GlobalConcurrency > MaxGlobalConcurrency || cfg.Delivery.DomainConcurrency > cfg.Delivery.GlobalConcurrency {
+		return errors.New("delivery concurrency limits are invalid or exceed supported bounds")
 	}
 
 	if cfg.Delivery.BindIPv4 != "" {
@@ -641,6 +676,9 @@ func (cfg *Config) Validate() error {
 	if cfg.DNS.OutputFile == "" {
 		return errors.New("dns.output_file must not be empty")
 	}
+	if _, err := cfg.ResolveGeneratedPath(cfg.DNS.OutputFile); err != nil {
+		return fmt.Errorf("dns.output_file: %w", err)
+	}
 
 	if cfg.DNS.PublicIPv4 != "" && net.ParseIP(cfg.DNS.PublicIPv4).To4() == nil {
 		return fmt.Errorf("invalid public IPv4 address %q", cfg.DNS.PublicIPv4)
@@ -654,12 +692,12 @@ func (cfg *Config) Validate() error {
 	}
 
 	if cfg.DNS.ReportURI != "" {
-		if err := validateReportURIList(cfg.DNS.ReportURI); err != nil {
+		if err := ValidateDMARCReportURIList(cfg.DNS.ReportURI); err != nil {
 			return fmt.Errorf("dns.dmarc_report_uri: %w", err)
 		}
 	}
 	if cfg.DNS.TLSRPTURI != "" {
-		if err := validateReportURIList(cfg.DNS.TLSRPTURI); err != nil {
+		if err := ValidateTLSReportURIList(cfg.DNS.TLSRPTURI); err != nil {
 			return fmt.Errorf("dns.tlsrpt_uri: %w", err)
 		}
 	}
@@ -667,6 +705,9 @@ func (cfg *Config) Validate() error {
 		if err := validateDomain(fmt.Sprintf("dns.spf_includes[%d]", i), inc); err != nil {
 			return err
 		}
+	}
+	if len(cfg.DNS.SPFIncludes) > SPFDNSLookupLimit {
+		return fmt.Errorf("dns.spf_includes exceeds SPF DNS lookup limit of %d", SPFDNSLookupLimit)
 	}
 
 	usernames := make(map[string]struct{}, len(cfg.Users))
@@ -795,6 +836,9 @@ func (cfg *Config) IsReady() error {
 	if enabled == 0 {
 		problems = append(problems, errors.New("configure at least one enabled SMTP user"))
 	}
+	if cfg.TLS.Mode == "self_signed" && !cfg.TLS.AllowSelfSignedServing {
+		problems = append(problems, errors.New("tls.mode=self_signed requires tls.allow_self_signed_serving=true before serving"))
+	}
 
 	return errors.Join(problems...)
 }
@@ -843,6 +887,27 @@ func (cfg Config) ResolvePath(path string) string {
 	}
 
 	return filepath.Join(data, path)
+}
+
+// ResolveGeneratedPath confines generated DKIM and DNS files beneath data_directory.
+func (cfg Config) ResolveGeneratedPath(path string) (string, error) {
+	data, err := filepath.Abs(filepath.Clean(cfg.ResolvedDataDir()))
+	if err != nil {
+		return "", err
+	}
+	target := path
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(data, target)
+	}
+	target, err = filepath.Abs(filepath.Clean(target))
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(data, target)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", errors.New("path must resolve to a file beneath server.data_directory")
+	}
+	return target, nil
 }
 
 // ResolvedDataDir returns the absolute data directory.
@@ -905,8 +970,7 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.server.implicit_tls_addr":             {yaml.HeadComment(` implicit TLS submission listen address; default ":465"; empty disables`)},
 		"$.server.max_connections":               {yaml.HeadComment(" global concurrent submission connections")},
 		"$.server.max_connections_per_ip":        {yaml.HeadComment(" per-IP concurrent submission connections")},
-		"$.server.auth_workers":                  {yaml.HeadComment(" concurrent Argon2id authentications")},
-		"$.server.auth_queue":                    {yaml.HeadComment(" max waiters for an auth worker slot")},
+		"$.server.auth_workers":                  {yaml.HeadComment(" concurrent Argon2id authentications (19 MiB each; maximum 16)")},
 		"$.server.max_queue_messages":            {yaml.HeadComment(" maximum ready queue message count (0 = unlimited)")},
 		"$.server.max_queue_bytes":               {yaml.HeadComment(" maximum ready queue total bytes (0 = unlimited)")},
 		"$.server.min_free_disk_bytes":           {yaml.HeadComment(" refuse submissions when free disk is below this threshold")},
@@ -915,11 +979,12 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.server.write_timeout":                 {yaml.HeadComment(" maximum time spent writing an SMTP response")},
 		"$.server.data_directory":                {yaml.HeadComment(" generated keys, certificates, DNS instructions and queue data; relative to the config file directory")},
 
-		"$.tls":                  {yaml.HeadComment("\n# TLS used by the submission listeners")},
-		"$.tls.mode":             {yaml.HeadComment(` "self_signed" is development-only; use "files" with a publicly trusted certificate in production`)},
-		"$.tls.certificate_file": {yaml.HeadComment(" certificate chain; relative paths are resolved below data_directory")},
-		"$.tls.private_key_file": {yaml.HeadComment(" TLS private key; relative paths are resolved below data_directory")},
-		"$.tls.minimum_version":  {yaml.HeadComment(` minimum accepted TLS version: "1.2" or "1.3"`)},
+		"$.tls":                           {yaml.HeadComment("\n# TLS used by the submission listeners")},
+		"$.tls.mode":                      {yaml.HeadComment(` "self_signed" is development-only; use "files" with a publicly trusted certificate in production`)},
+		"$.tls.allow_self_signed_serving": {yaml.HeadComment(" explicit development-only opt-in required to serve with a self-signed certificate")},
+		"$.tls.certificate_file":          {yaml.HeadComment(" certificate chain; relative paths are resolved below data_directory")},
+		"$.tls.private_key_file":          {yaml.HeadComment(" TLS private key; relative paths are resolved below data_directory")},
+		"$.tls.minimum_version":           {yaml.HeadComment(` minimum accepted TLS version: "1.2" or "1.3"`)},
 
 		"$.dkim":                  {yaml.HeadComment("\n# DKIM signing configuration")},
 		"$.dkim.selector":         {yaml.HeadComment(" DNS selector placed before _domainkey")},
@@ -1029,32 +1094,95 @@ func validateHeaderName(name string) error {
 	return nil
 }
 
-func validateReportURIList(value string) error {
+// ValidateDMARCReportURIList validates DMARC rua syntax, including its optional
+// terminal !digits[unit] report-size suffix.
+func ValidateDMARCReportURIList(value string) error {
+	return validateReportURIList(value, true)
+}
+
+// ValidateTLSReportURIList validates TLS-RPT rua syntax. TLS-RPT does not
+// define DMARC's report-size suffix.
+func ValidateTLSReportURIList(value string) error {
+	return validateReportURIList(value, false)
+}
+
+func validateReportURIList(value string, dmarc bool) error {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
 	for uri := range strings.SplitSeq(value, ",") {
 		uri = strings.TrimSpace(uri)
 		if uri == "" {
-			continue
+			return errors.New("empty report URI entry")
 		}
-		if err := validateReportURI(uri); err != nil {
+		if err := validateReportURI(uri, dmarc); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func validateReportURI(uri string) error {
-	uri = strings.TrimSpace(uri)
-	lower := strings.ToLower(uri)
-	if strings.HasPrefix(lower, "mailto:") {
-		addr := uri[len("mailto:"):]
-		addr, _, _ = strings.Cut(addr, "!")
-		if _, err := mail.ParseAddress(addr); err != nil {
+func validateReportURI(uri string, dmarc bool) error {
+	base := strings.TrimSpace(uri)
+	if dmarc {
+		if suffix := reportSizeRE.FindStringIndex(base); suffix != nil {
+			base = base[:suffix[0]]
+		}
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return fmt.Errorf("invalid report URI %q: %w", uri, err)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "mailto":
+		if u.Host != "" || u.RawQuery != "" || u.Fragment != "" {
 			return fmt.Errorf("invalid mailto URI %q", uri)
 		}
-		return nil
+		addr, err := mail.ParseAddress(u.Opaque)
+		if err != nil || addr.Name != "" || addr.Address != u.Opaque || strings.Count(addr.Address, "@") != 1 {
+			return fmt.Errorf("invalid mailto URI %q", uri)
+		}
+		domain := addr.Address[strings.LastIndexByte(addr.Address, '@')+1:]
+		if err := validateDomain("report mailbox domain", strings.ToLower(domain)); err != nil {
+			return fmt.Errorf("invalid mailto URI %q", uri)
+		}
+	case "https":
+		if u.Host == "" || u.Hostname() == "" || u.User != nil || u.Fragment != "" || u.Opaque != "" {
+			return fmt.Errorf("invalid HTTPS report URI %q", uri)
+		}
+		host := strings.ToLower(u.Hostname())
+		if net.ParseIP(host) == nil {
+			if err := validateDomain("HTTPS report host", host); err != nil {
+				return fmt.Errorf("invalid HTTPS report URI %q", uri)
+			}
+		}
+		if port := u.Port(); port != "" {
+			n, err := strconv.Atoi(port)
+			if err != nil || n < 1 || n > 65535 {
+				return fmt.Errorf("invalid HTTPS report URI port in %q", uri)
+			}
+		}
+	default:
+		return fmt.Errorf("unsupported report URI scheme in %q (use mailto: or https:)", uri)
 	}
-	if strings.HasPrefix(lower, "https://") {
-		return nil
+	return nil
+}
+
+var reportSizeRE = regexp.MustCompile(`(?i)![0-9]+[kmgt]?$`)
+
+// ExpectedSPF returns the effective policy emitted by DNS generation.
+func (cfg *Config) ExpectedSPF() string {
+	var b strings.Builder
+	b.WriteString("v=spf1")
+	if cfg.DNS.PublicIPv4 != "" {
+		fmt.Fprintf(&b, " ip4:%s", cfg.DNS.PublicIPv4)
 	}
-	return fmt.Errorf("unsupported report URI scheme in %q (use mailto: or https:)", uri)
+	if cfg.DNS.PublicIPv6 != "" {
+		fmt.Fprintf(&b, " ip6:%s", cfg.DNS.PublicIPv6)
+	}
+	for _, include := range cfg.DNS.SPFIncludes {
+		fmt.Fprintf(&b, " include:%s", strings.ToLower(strings.TrimSuffix(strings.TrimSpace(include), ".")))
+	}
+	b.WriteString(" -all")
+	return b.String()
 }

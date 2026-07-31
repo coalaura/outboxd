@@ -1,6 +1,7 @@
 package deliver
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -8,8 +9,18 @@ import (
 	"net"
 	"net/textproto"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 )
+
+const (
+	maxSMTPResponseBytes = 64 << 10
+	maxDiagnosticBytes   = 1024
+	maxResponseRead      = 1024
+)
+
+var errSMTPResponseTooLarge = errors.New("SMTP response exceeds size limit")
 
 // SMTPError is a negative SMTP reply.
 type SMTPError struct {
@@ -36,6 +47,8 @@ type Client struct {
 	tls        bool
 	command    time.Duration
 	submission time.Duration
+	bounded    *boundedResponseConn
+	stopWatch  context.CancelFunc
 }
 
 // NewClient wraps an established connection after dial; call Greet next.
@@ -46,13 +59,28 @@ func NewClient(conn net.Conn, command, submission time.Duration) *Client {
 	if submission <= 0 {
 		submission = 12 * time.Minute
 	}
+	bounded := &boundedResponseConn{Conn: conn}
 	return &Client{
 		conn:       conn,
-		text:       textproto.NewConn(conn),
+		text:       textproto.NewConn(bounded),
 		ext:        make(map[string]string),
 		command:    command,
 		submission: submission,
+		bounded:    bounded,
 	}
+}
+
+func (c *Client) bindContext(ctx context.Context) {
+	watch, stop := context.WithCancel(context.Background())
+	c.stopWatch = stop
+	conn := c.conn
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-watch.Done():
+		}
+	}()
 }
 
 // Greet reads the server banner.
@@ -60,6 +88,7 @@ func (c *Client) Greet() error {
 	c.conn.SetDeadline(time.Now().Add(c.command))
 	defer c.conn.SetDeadline(time.Time{})
 
+	c.bounded.reset()
 	_, _, err := c.readResponse(220)
 	return err
 }
@@ -76,6 +105,7 @@ func (c *Client) EHLO(hostname string) error {
 	c.text.StartResponse(id)
 	defer c.text.EndResponse(id)
 
+	c.bounded.reset()
 	_, lines, err := c.readResponseLines(250)
 	if err != nil {
 		return err
@@ -104,7 +134,8 @@ func (c *Client) StartTLS(cfg *tls.Config) error {
 		return err
 	}
 	c.conn = tlsConn
-	c.text = textproto.NewConn(tlsConn)
+	c.bounded = &boundedResponseConn{Conn: tlsConn}
+	c.text = textproto.NewConn(c.bounded)
 	c.tls = true
 	c.ext = make(map[string]string)
 	return nil
@@ -174,6 +205,10 @@ func (c *Client) Quit() error {
 
 // Close aborts the connection.
 func (c *Client) Close() error {
+	if c.stopWatch != nil {
+		c.stopWatch()
+		c.stopWatch = nil
+	}
 	if c.text != nil {
 		return c.text.Close()
 	}
@@ -200,11 +235,11 @@ func (d *dataWriter) Close() error {
 	}
 	d.closed = true
 	err := d.w.Close()
-	d.client.conn.SetDeadline(time.Now().Add(d.client.command))
 	defer d.client.conn.SetDeadline(time.Time{})
 	if err != nil {
 		return err
 	}
+	d.client.bounded.reset()
 	code, msg, rerr := d.client.readResponse(250)
 	if rerr != nil {
 		return rerr
@@ -225,6 +260,7 @@ func (c *Client) cmd(expect int, format string, args ...any) error {
 	}
 	c.text.StartResponse(id)
 	defer c.text.EndResponse(id)
+	c.bounded.reset()
 	_, _, err = c.readResponse(expect)
 	return err
 }
@@ -239,12 +275,15 @@ func (c *Client) readResponse(expect int) (int, string, error) {
 
 func (c *Client) readResponseLines(expect int) (int, []string, error) {
 	code, msg, err := c.text.ReadResponse(expect)
+	if c.bounded.exceededLimit() {
+		return code, nil, errSMTPResponseTooLarge
+	}
 	if err != nil {
 		if tpErr, ok := err.(*textproto.Error); ok {
-			return tpErr.Code, nil, &SMTPError{Code: tpErr.Code, Message: tpErr.Msg}
+			return tpErr.Code, nil, &SMTPError{Code: tpErr.Code, Message: normalizeDiagnostic(tpErr.Msg)}
 		}
 		if code != 0 {
-			return code, nil, &SMTPError{Code: code, Message: msg}
+			return code, nil, &SMTPError{Code: code, Message: normalizeDiagnostic(msg)}
 		}
 		return code, nil, err
 	}
@@ -285,7 +324,74 @@ func permanent(err error) bool {
 func describe(err error) string {
 	var se *SMTPError
 	if errors.As(err, &se) {
-		return fmt.Sprintf("%d %s", se.Code, strings.TrimSpace(se.Message))
+		return normalizeDiagnostic(fmt.Sprintf("%d %s", se.Code, se.Message))
 	}
-	return err.Error()
+	return normalizeDiagnostic(err.Error())
+}
+
+// boundedResponseConn limits one SMTP reply and caps buffered read-ahead.
+type boundedResponseConn struct {
+	net.Conn
+	mu        sync.Mutex
+	remaining int
+	exceeded  bool
+}
+
+func (c *boundedResponseConn) reset() {
+	c.mu.Lock()
+	// Keep one probe byte so a reply of exactly maxSMTPResponseBytes is valid.
+	c.remaining = maxSMTPResponseBytes + 1
+	c.exceeded = false
+	c.mu.Unlock()
+}
+
+func (c *boundedResponseConn) exceededLimit() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.exceeded
+}
+
+func (c *boundedResponseConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	if c.remaining <= 0 {
+		c.mu.Unlock()
+		return 0, errSMTPResponseTooLarge
+	}
+	limit := min(len(p), c.remaining, maxResponseRead)
+	c.mu.Unlock()
+
+	n, err := c.Conn.Read(p[:limit])
+	c.mu.Lock()
+	c.remaining -= n
+	exhausted := c.remaining == 0
+	if exhausted {
+		c.exceeded = true
+	}
+	c.mu.Unlock()
+	if err == nil && exhausted {
+		return n, errSMTPResponseTooLarge
+	}
+	return n, err
+}
+
+func normalizeDiagnostic(s string) string {
+	s = strings.ToValidUTF8(s, "�")
+	var b strings.Builder
+	b.Grow(min(len(s), maxDiagnosticBytes))
+	space := false
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			space = true
+			continue
+		}
+		if space && b.Len() > 0 && b.Len() < maxDiagnosticBytes {
+			b.WriteByte(' ')
+		}
+		space = false
+		if b.Len()+utf8.RuneLen(r) > maxDiagnosticBytes {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return strings.TrimSpace(b.String())
 }

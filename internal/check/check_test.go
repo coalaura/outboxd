@@ -156,6 +156,61 @@ func TestMultipleSPFFail(t *testing.T) {
 	}
 }
 
+func TestSPFEffectivePolicyMismatchFails(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Users = nil
+	r := &fakeResolver{txt: map[string][]string{
+		"example.com":      {"v=spf1 ip4:198.51.100.1 -all"},
+		"mail.example.com": {cfg.ExpectedSPF()},
+	}}
+	results := checkSPF(context.Background(), r, cfg)
+	for _, result := range results {
+		if result.Name == "spf_example.com" && result.Level == Fail && strings.Contains(result.Message, "does not match") {
+			return
+		}
+	}
+	t.Fatal("expected effective SPF mismatch failure")
+}
+
+func TestSPFVersionMustBeExactFirstToken(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Users = nil
+	r := &fakeResolver{txt: map[string][]string{
+		"example.com":      {"v=spf10 " + strings.TrimPrefix(cfg.ExpectedSPF(), "v=spf1 ")},
+		"mail.example.com": {cfg.ExpectedSPF()},
+	}}
+	for _, result := range checkSPF(context.Background(), r, cfg) {
+		if result.Name == "spf_example.com" && result.Level == Fail && strings.Contains(result.Message, "no SPF") {
+			return
+		}
+	}
+	t.Fatal("SPF version prefix was accepted")
+}
+
+func TestDMARCStrictTagParsing(t *testing.T) {
+	cfg := baseCfg()
+	tests := []struct {
+		name   string
+		record string
+	}{
+		{"version prefix", "v=DMARC10; p=none"},
+		{"version not first", "p=none; v=DMARC1"},
+		{"duplicate policy", "v=DMARC1; p=none; p=reject"},
+		{"malformed tag", "v=DMARC1; broken; p=none"},
+		{"invalid policy", "v=DMARC1; p=invalid"},
+		{"invalid rua", "v=DMARC1; p=none; rua=mailto:a@example.com!10x"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			r := &fakeResolver{txt: map[string][]string{"_dmarc.example.com": {test.record}}}
+			results := checkDMARC(context.Background(), r, cfg)
+			if len(results) != 1 || results[0].Level != Fail {
+				t.Fatalf("record %q accepted: %+v", test.record, results)
+			}
+		})
+	}
+}
+
 func TestDKIMKeyMismatch(t *testing.T) {
 	cfg := baseCfg()
 	r := &fakeResolver{
