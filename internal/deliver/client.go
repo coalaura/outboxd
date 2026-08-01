@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -24,8 +25,9 @@ var errSMTPResponseTooLarge = errors.New("SMTP response exceeds size limit")
 
 // SMTPError is a negative SMTP reply.
 type SMTPError struct {
-	Code    int
-	Message string
+	Code         int
+	EnhancedCode string
+	Message      string
 }
 
 func (e *SMTPError) Error() string {
@@ -111,6 +113,18 @@ func (c *Client) EHLO(hostname string) error {
 		return err
 	}
 	c.ext = parseExtensions(lines)
+	return nil
+}
+
+// HELO sends the legacy greeting and clears ESMTP extensions.
+func (c *Client) HELO(hostname string) error {
+	c.conn.SetDeadline(time.Now().Add(c.command))
+	defer c.conn.SetDeadline(time.Time{})
+
+	if err := c.cmd(250, "HELO %s", hostname); err != nil {
+		return err
+	}
+	c.ext = make(map[string]string)
 	return nil
 }
 
@@ -280,10 +294,12 @@ func (c *Client) readResponseLines(expect int) (int, []string, error) {
 	}
 	if err != nil {
 		if tpErr, ok := err.(*textproto.Error); ok {
-			return tpErr.Code, nil, &SMTPError{Code: tpErr.Code, Message: normalizeDiagnostic(tpErr.Msg)}
+			msg := normalizeDiagnostic(tpErr.Msg)
+			return tpErr.Code, nil, &SMTPError{Code: tpErr.Code, EnhancedCode: parseEnhancedCode(tpErr.Code, msg), Message: msg}
 		}
 		if code != 0 {
-			return code, nil, &SMTPError{Code: code, Message: normalizeDiagnostic(msg)}
+			msg = normalizeDiagnostic(msg)
+			return code, nil, &SMTPError{Code: code, EnhancedCode: parseEnhancedCode(code, msg), Message: msg}
 		}
 		return code, nil, err
 	}
@@ -314,6 +330,36 @@ func smtpCode(err error) int {
 		return se.Code
 	}
 	return 0
+}
+
+func smtpEnhancedCode(err error) string {
+	var se *SMTPError
+	if errors.As(err, &se) {
+		return se.EnhancedCode
+	}
+	return ""
+}
+
+func parseEnhancedCode(code int, message string) string {
+	field, _, _ := strings.Cut(strings.TrimSpace(message), " ")
+	parts := strings.Split(field, ".")
+	if len(parts) != 3 || len(parts[0]) != 1 || parts[0][0] < '2' || parts[0][0] > '5' || int(parts[0][0]-'0') != code/100 {
+		return ""
+	}
+	if parts[0] != "2" && parts[0] != "4" && parts[0] != "5" {
+		return ""
+	}
+	for _, part := range parts[1:] {
+		if len(part) < 1 || len(part) > 3 {
+			return ""
+		}
+		for i := range len(part) {
+			if part[i] < '0' || part[i] > '9' {
+				return ""
+			}
+		}
+	}
+	return field
 }
 
 func permanent(err error) bool {
@@ -380,7 +426,7 @@ func normalizeDiagnostic(s string) string {
 	b.Grow(min(len(s), maxDiagnosticBytes))
 	space := false
 	for _, r := range s {
-		if r < 0x20 || r == 0x7f {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
 			space = true
 			continue
 		}

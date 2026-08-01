@@ -1,10 +1,54 @@
 package disk
 
 import (
+	"errors"
+	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
 )
+
+// Use the largest allocation unit supported by common deployment filesystems.
+// This intentionally overestimates usage on typical 4 KiB filesystems so
+// quota admission cannot rely on optimistic apparent sizes.
+const allocationUnit int64 = 64 << 10
+
+// AllocationSize conservatively estimates filesystem allocation for one
+// object from its apparent size. Directory entries and empty files still cost
+// one allocation unit; sparse and compressed files are charged by apparent
+// size rather than trusting platform-specific allocation reporting.
+func AllocationSize(size int64) int64 {
+	if size <= 0 {
+		return allocationUnit
+	}
+	if size > math.MaxInt64-(allocationUnit-1) {
+		return math.MaxInt64
+	}
+	return ((size + allocationUnit - 1) / allocationUnit) * allocationUnit
+}
+
+// AllocatedBytes returns conservative physical usage below root. WalkDir uses
+// Lstat semantics and never follows symbolic links.
+func AllocatedBytes(root string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		charge := AllocationSize(info.Size())
+		if total > math.MaxInt64-charge {
+			return errors.New("filesystem usage overflow")
+		}
+		total += charge
+		return nil
+	})
+	return total, err
+}
 
 // Hooks provide a narrow fault-injection seam for tests. Production code
 // leaves them nil.

@@ -1,11 +1,13 @@
 package certs
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
 	"os"
@@ -104,6 +106,127 @@ func TestPartialPairSelfSignedPreservesConfiguredFile(t *testing.T) {
 				t.Fatalf("missing half was generated: %v", statErr)
 			}
 		})
+	}
+}
+
+func TestSelfSignedGenerationRecoversMarkedPartialPair(t *testing.T) {
+	source := t.TempDir()
+	if err := writeSelfSigned(source, "mail.test.example"); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	k := &Keeper{
+		certificateFile: filepath.Join(dir, "server.crt"),
+		privateKeyFile:  filepath.Join(dir, "server.key"),
+		hostname:        "mail.test.example",
+		mode:            "self_signed",
+	}
+	key, err := os.ReadFile(filepath.Join(source, "server.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := os.ReadFile(filepath.Join(source, "server.crt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(k.generationMarker(), []byte(generationMarkerText), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(k.privateKeyFile, key, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(k.certificateStage(), cert, 0644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, created, err := ensureWithDir(t, dir, "self_signed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created || loaded.certificate == nil {
+		t.Fatal("marked partial generation was not recovered")
+	}
+	for _, path := range []string{k.generationMarker(), k.certificateStage(), k.privateKeyStage()} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("generation artifact remains at %s: %v", path, err)
+		}
+	}
+}
+
+func TestSelfSignedGenerationRecoversMarkerWithSingleStage(t *testing.T) {
+	dir := t.TempDir()
+	k := &Keeper{
+		certificateFile: filepath.Join(dir, "server.crt"),
+		privateKeyFile:  filepath.Join(dir, "server.key"),
+		hostname:        "mail.test.example",
+		mode:            "self_signed",
+	}
+	if err := os.WriteFile(k.generationMarker(), []byte(generationMarkerText), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(k.privateKeyStage(), []byte("interrupted key stage"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, created, err := ensureWithDir(t, dir, "self_signed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created || loaded.certificate == nil {
+		t.Fatal("incomplete marked generation was not replaced")
+	}
+	for _, path := range []string{k.generationMarker(), k.certificateStage(), k.privateKeyStage()} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("generation artifact remains at %s: %v", path, err)
+		}
+	}
+}
+
+func TestSelfSignedGenerationReplacesInvalidStagedPair(t *testing.T) {
+	dir := t.TempDir()
+	k := &Keeper{
+		certificateFile: filepath.Join(dir, "server.crt"),
+		privateKeyFile:  filepath.Join(dir, "server.key"),
+		hostname:        "mail.test.example",
+		mode:            "self_signed",
+	}
+	if err := os.WriteFile(k.generationMarker(), []byte(generationMarkerText), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(k.privateKeyStage(), []byte("truncated key"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(k.certificateStage(), []byte("truncated certificate"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, created, err := ensureWithDir(t, dir, "self_signed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created || loaded.certificate == nil {
+		t.Fatal("invalid marker-owned stages were not replaced")
+	}
+}
+
+func TestSelfSignedRecoveryPreservesFinalFileWithIncompleteMarker(t *testing.T) {
+	dir := t.TempDir()
+	k := &Keeper{
+		certificateFile: filepath.Join(dir, "server.crt"),
+		privateKeyFile:  filepath.Join(dir, "server.key"),
+		hostname:        "mail.test.example",
+		mode:            "self_signed",
+	}
+	if err := os.WriteFile(k.generationMarker(), []byte(generationMarkerText), 0600); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("operator certificate")
+	if err := os.WriteFile(k.certificateFile, body, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ensureWithDir(t, dir, "self_signed"); err == nil {
+		t.Fatal("incomplete generation with final file succeeded")
+	}
+	got, err := os.ReadFile(k.certificateFile)
+	if err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("final operator file changed: body=%q err=%v", got, err)
 	}
 }
 
@@ -241,6 +364,108 @@ func TestCheckRejectsInvalidServingCertificates(t *testing.T) {
 			cfg.TLS.PrivateKeyFile = filepath.Join(dir, "server.key")
 			if err := Check(cfg); err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("Check error=%v want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestCheckVerifiesTrustChainWithInjectedRoots(t *testing.T) {
+	dir := t.TempDir()
+	roots := writeTestChain(t, dir)
+	cfg := config.Default()
+	cfg.Server.Hostname = "mail.test.example"
+	cfg.TLS.Mode = "files"
+	cfg.TLS.CertificateFile = filepath.Join(dir, "server.crt")
+	cfg.TLS.PrivateKeyFile = filepath.Join(dir, "server.key")
+	if err := CheckWithRoots(cfg, roots); err != nil {
+		t.Fatalf("trusted chain rejected: %v", err)
+	}
+	if err := CheckWithRoots(cfg, x509.NewCertPool()); err == nil || !strings.Contains(err.Error(), "unknown authority") {
+		t.Fatalf("untrusted chain accepted: %v", err)
+	}
+	chain, err := os.ReadFile(filepath.Join(dir, "server.crt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, _ := pem.Decode(chain)
+	if err := os.WriteFile(filepath.Join(dir, "server.crt"), pem.EncodeToMemory(leaf), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckWithRoots(cfg, roots); err == nil || !strings.Contains(err.Error(), "unknown authority") {
+		t.Fatalf("missing intermediate accepted: %v", err)
+	}
+}
+
+func writeTestChain(t *testing.T, dir string) *x509.CertPool {
+	t.Helper()
+	now := time.Now()
+	newKey := func() *ecdsa.PrivateKey {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return key
+	}
+	rootKey, intermediateKey, leafKey := newKey(), newKey(), newKey()
+	root := &x509.Certificate{SerialNumber: big.NewInt(10), Subject: pkix.Name{CommonName: "test root"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	rootDER, err := x509.CreateCertificate(rand.Reader, root, root, &rootKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootCert, err := x509.ParseCertificate(rootDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intermediate := &x509.Certificate{SerialNumber: big.NewInt(11), Subject: pkix.Name{CommonName: "test intermediate"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	intermediateDER, err := x509.CreateCertificate(rand.Reader, intermediate, rootCert, &intermediateKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intermediateCert, err := x509.ParseCertificate(intermediateDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf := &x509.Certificate{SerialNumber: big.NewInt(12), DNSNames: []string{"mail.test.example"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leaf, intermediateCert, &leafKey.PublicKey, intermediateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
+	certPEM = append(certPEM, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: intermediateDER})...)
+	keyDER, err := x509.MarshalPKCS8PrivateKey(leafKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "server.crt"), certPEM, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "server.key"), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(rootCert)
+	return roots
+}
+
+func TestCertificateReadLimit(t *testing.T) {
+	for _, name := range []string{"server.crt", "server.key"} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := writeSelfSigned(dir, "mail.test.example"); err != nil {
+				t.Fatal(err)
+			}
+			maximum := maxPrivateKeyBytes
+			mode := os.FileMode(0600)
+			if name == "server.crt" {
+				maximum = maxCertificateBytes
+				mode = 0644
+			}
+			if err := os.WriteFile(filepath.Join(dir, name), make([]byte, maximum+1), mode); err != nil {
+				t.Fatal(err)
+			}
+			k := &Keeper{certificateFile: filepath.Join(dir, "server.crt"), privateKeyFile: filepath.Join(dir, "server.key"), mode: "files"}
+			if _, err := k.load(); err == nil || !strings.Contains(err.Error(), "read limit") {
+				t.Fatalf("oversized %s error=%v", name, err)
 			}
 		})
 	}

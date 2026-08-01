@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/coalaura/outboxd/internal/config"
 	"github.com/coalaura/outboxd/internal/queue"
 )
 
@@ -23,5 +25,33 @@ func TestReportQueueIssuesEscapesTerminalControls(t *testing.T) {
 	if !strings.Contains(got, `corrupt queue entry: bad\x0aentry`) ||
 		!strings.Contains(got, `queue maintenance warning: warn\x09entry`) {
 		t.Fatalf("unexpected report: %q", got)
+	}
+}
+
+func TestAdministrativeCommandsRequireExactArity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yml")
+	if _, _, err := config.EnsurePath(path); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{"dead list extra", func() error { return dead(path, []string{"list", "extra"}) }},
+		{"dead show missing", func() error { return dead(path, []string{"show"}) }},
+		{"dead show extra", func() error { return dead(path, []string{"show", "id", "extra"}) }},
+		{"dead retry extra", func() error { return dead(path, []string{"retry", "id", "extra"}) }},
+		{"dead export extra", func() error { return dead(path, []string{"export", "id", "extra"}) }},
+		{"dead delete missing", func() error { return dead(path, []string{"delete"}) }},
+		{"corrupt list extra", func() error { return corrupt(path, []string{"list", "extra"}) }},
+		{"corrupt delete missing", func() error { return corrupt(path, []string{"delete"}) }},
+		{"corrupt delete extra", func() error { return corrupt(path, []string{"delete", "name", "extra"}) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.call(); err == nil || !strings.Contains(err.Error(), "usage:") {
+				t.Fatalf("error=%v want usage error", err)
+			}
+		})
 	}
 }

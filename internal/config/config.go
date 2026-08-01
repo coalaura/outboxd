@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/mail"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,8 +21,11 @@ import (
 
 	"github.com/coalaura/outboxd/internal/disk"
 	"github.com/coalaura/outboxd/internal/passwd"
+	"github.com/coalaura/outboxd/internal/queue"
 	"github.com/goccy/go-yaml"
 )
+
+const maxConfigFileBytes = 1 << 20
 
 type Config struct {
 	dataMu *sync.RWMutex
@@ -62,7 +66,11 @@ type Server struct {
 	AuthWorkers               int    `yaml:"auth_workers"`
 	MaxQueueMessages          int    `yaml:"max_queue_messages"`
 	MaxQueueBytes             int64  `yaml:"max_queue_bytes"`
+	MaxSpoolBytes             int64  `yaml:"max_spool_bytes"`
+	SpoolEmergencyBytes       int64  `yaml:"spool_emergency_bytes"`
 	MinFreeDiskBytes          int64  `yaml:"min_free_disk_bytes"`
+	DeadRetention             string `yaml:"dead_retention"`
+	CorruptRetention          string `yaml:"corrupt_retention"`
 }
 
 type TLS struct {
@@ -162,7 +170,11 @@ func Default() *Config {
 			AuthWorkers:          4,
 			MaxQueueMessages:     10000,
 			MaxQueueBytes:        10 << 30,
+			MaxSpoolBytes:        16 << 30,
+			SpoolEmergencyBytes:  512 << 20,
 			MinFreeDiskBytes:     1 << 30,
+			DeadRetention:        "720h",
+			CorruptRetention:     "336h",
 		},
 		TLS: TLS{
 			Mode:            "self_signed",
@@ -230,7 +242,7 @@ func LoadFile(path string) (*Config, error) {
 	}
 	cfg.path = abs
 	cfg.baseDir = filepath.Dir(abs)
-	raw, err := ReadCheckedFile(abs, true, false)
+	raw, err := ReadCheckedFile(abs, true, false, maxConfigFileBytes)
 	if err != nil {
 		return nil, fmt.Errorf("config file: %w", err)
 	}
@@ -550,16 +562,27 @@ func (cfg *Config) Validate() error {
 	if cfg.Server.MaxQueueMessages < 0 || cfg.Server.MaxQueueBytes < 0 || cfg.Server.MinFreeDiskBytes < 0 {
 		return errors.New("queue caps and minimum free disk must not be negative")
 	}
+	if cfg.Server.MaxSpoolBytes <= 0 {
+		return errors.New("server.max_spool_bytes must be positive")
+	}
+	if cfg.Server.SpoolEmergencyBytes < queue.MinimumSpoolEmergencyBytes || cfg.Server.SpoolEmergencyBytes >= cfg.Server.MaxSpoolBytes {
+		return fmt.Errorf("server.spool_emergency_bytes must be at least %d bytes and smaller than max_spool_bytes", queue.MinimumSpoolEmergencyBytes)
+	}
 
 	durations := []durationEntry{
 		{"server.read_timeout", cfg.Server.ReadTimeout},
 		{"server.write_timeout", cfg.Server.WriteTimeout},
+		{"server.dead_retention", cfg.Server.DeadRetention},
+		{"server.corrupt_retention", cfg.Server.CorruptRetention},
 		{"delivery.maximum_lifetime", cfg.Delivery.MaximumLifetime},
 		{"delivery.initial_retry_delay", cfg.Delivery.InitialRetryDelay},
 		{"delivery.maximum_retry_delay", cfg.Delivery.MaximumRetryDelay},
 		{"delivery.connection_timeout", cfg.Delivery.ConnectionTimeout},
 		{"delivery.command_timeout", cfg.Delivery.CommandTimeout},
 		{"delivery.submission_timeout", cfg.Delivery.SubmissionTimeout},
+	}
+	if Duration(cfg.Server.DeadRetention) <= 0 || Duration(cfg.Server.CorruptRetention) <= 0 {
+		return errors.New("server.dead_retention and server.corrupt_retention must be positive")
 	}
 
 	for _, duration := range durations {
@@ -651,9 +674,11 @@ func (cfg *Config) Validate() error {
 	}
 
 	if cfg.Delivery.BindIPv4 != "" {
-		if ip := net.ParseIP(cfg.Delivery.BindIPv4); ip == nil || ip.To4() == nil {
+		ip, err := netip.ParseAddr(cfg.Delivery.BindIPv4)
+		if err != nil || !ip.Is4() {
 			return fmt.Errorf("invalid delivery.bind_ipv4 %q", cfg.Delivery.BindIPv4)
 		}
+		cfg.Delivery.BindIPv4 = ip.String()
 	}
 	if cfg.Delivery.BindIPv6 != "" {
 		ip := net.ParseIP(cfg.Delivery.BindIPv6)
@@ -680,8 +705,12 @@ func (cfg *Config) Validate() error {
 		return fmt.Errorf("dns.output_file: %w", err)
 	}
 
-	if cfg.DNS.PublicIPv4 != "" && net.ParseIP(cfg.DNS.PublicIPv4).To4() == nil {
-		return fmt.Errorf("invalid public IPv4 address %q", cfg.DNS.PublicIPv4)
+	if cfg.DNS.PublicIPv4 != "" {
+		ip, err := netip.ParseAddr(cfg.DNS.PublicIPv4)
+		if err != nil || !ip.Is4() {
+			return fmt.Errorf("invalid public IPv4 address %q", cfg.DNS.PublicIPv4)
+		}
+		cfg.DNS.PublicIPv4 = ip.String()
 	}
 
 	if cfg.DNS.PublicIPv6 != "" {
@@ -972,8 +1001,12 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.server.max_connections_per_ip":        {yaml.HeadComment(" per-IP concurrent submission connections")},
 		"$.server.auth_workers":                  {yaml.HeadComment(" concurrent Argon2id authentications (19 MiB each; maximum 16)")},
 		"$.server.max_queue_messages":            {yaml.HeadComment(" maximum ready queue message count (0 = unlimited)")},
-		"$.server.max_queue_bytes":               {yaml.HeadComment(" maximum ready queue total bytes (0 = unlimited)")},
+		"$.server.max_queue_bytes":               {yaml.HeadComment(" logical quota for ready message bodies only (0 = unlimited)")},
+		"$.server.max_spool_bytes":               {yaml.HeadComment(" hard physical quota across ready, tmp, dsn, dead, corrupt, and trash")},
+		"$.server.spool_emergency_bytes":         {yaml.HeadComment(" physical headroom reserved from submissions for DSNs and state transitions")},
 		"$.server.min_free_disk_bytes":           {yaml.HeadComment(" refuse submissions when free disk is below this threshold")},
+		"$.server.dead_retention":                {yaml.HeadComment(" positive retention for dead letters before automatic pruning")},
+		"$.server.corrupt_retention":             {yaml.HeadComment(" positive retention for quarantined entries before automatic pruning")},
 		"$.server.include_client_ip_in_received": {yaml.HeadComment(" include the submitting client's IP address in Received headers")},
 		"$.server.read_timeout":                  {yaml.HeadComment(" maximum time spent waiting for an SMTP command")},
 		"$.server.write_timeout":                 {yaml.HeadComment(" maximum time spent writing an SMTP response")},
@@ -1175,7 +1208,9 @@ func (cfg *Config) ExpectedSPF() string {
 	var b strings.Builder
 	b.WriteString("v=spf1")
 	if cfg.DNS.PublicIPv4 != "" {
-		fmt.Fprintf(&b, " ip4:%s", cfg.DNS.PublicIPv4)
+		if ip, err := netip.ParseAddr(cfg.DNS.PublicIPv4); err == nil && ip.Is4() {
+			fmt.Fprintf(&b, " ip4:%s", ip.String())
+		}
 	}
 	if cfg.DNS.PublicIPv6 != "" {
 		fmt.Fprintf(&b, " ip6:%s", cfg.DNS.PublicIPv6)

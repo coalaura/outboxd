@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -90,12 +91,15 @@ type fakeMX struct {
 	// done closed when the accept loop stops.
 	done chan struct{}
 
-	startTLS   bool
-	extUTF8    bool
-	ext8bit    bool
-	cert       tls.Certificate
-	brokenTLS  bool // handshake fails after 220
-	startTLSEr bool // STARTTLS command returns 454
+	startTLS        bool
+	extUTF8         bool
+	ext8bit         bool
+	cert            tls.Certificate
+	brokenTLS       bool // handshake fails after 220
+	startTLSEr      bool // STARTTLS command returns 454
+	initialEHLOCode int
+	postTLSEHLOCode int
+	rcptReply       string
 
 	// captureBody records DATA octets when true.
 	captureBody bool
@@ -169,6 +173,14 @@ func (mx *fakeMX) handle(c net.Conn, log *sessionLog) {
 		upper := strings.ToUpper(raw)
 		switch {
 		case strings.HasPrefix(upper, "EHLO"):
+			code := mx.initialEHLOCode
+			if secured {
+				code = mx.postTLSEHLOCode
+			}
+			if code != 0 {
+				write(fmt.Sprintf("%d rejected\r\n", code))
+				continue
+			}
 			write("250-mx.test\r\n")
 			if mx.startTLS && !secured {
 				write("250-STARTTLS\r\n")
@@ -217,7 +229,11 @@ func (mx *fakeMX) handle(c net.Conn, log *sessionLog) {
 			log.mu.Lock()
 			log.rcptLines = append(log.rcptLines, raw)
 			log.mu.Unlock()
-			write("250 OK\r\n")
+			if mx.rcptReply != "" {
+				write(mx.rcptReply + "\r\n")
+			} else {
+				write("250 OK\r\n")
+			}
 		case strings.HasPrefix(upper, "DATA"):
 			log.mu.Lock()
 			log.data = true
@@ -583,6 +599,118 @@ func TestTLSAbsentPlainAllowed(t *testing.T) {
 	<-done
 	if mx.conns.Load() != 1 {
 		t.Fatalf("conns=%d", mx.conns.Load())
+	}
+}
+
+func TestInitialEHLOFallbackToHELO(t *testing.T) {
+	for _, code := range []int{500, 502, 504} {
+		t.Run(fmt.Sprint(code), func(t *testing.T) {
+			mx := &fakeMX{initialEHLOCode: code}
+			addr := startFakeMX(t, mx)
+			q := openQueue(t)
+			d := deliver.New(deliverCfg(), q, memLog{})
+			wireMX(t, d, "ex.com", "mx.ex.com", addr)
+			addEnvelope(t, q, fmt.Sprintf("helo-%d", code), "a@ex.com", "b@ex.com", "ex.com", false, false, nil)
+			cancel, done := runDeliverer(t, d)
+			await(t, mx.dataDone, 3*time.Second, "DATA")
+			cancel()
+			<-done
+			commands := mx.snapshots()[0].Commands
+			if len(commands) < 2 || !strings.HasPrefix(strings.ToUpper(commands[1]), "HELO ") {
+				t.Fatalf("commands=%v", commands)
+			}
+		})
+	}
+}
+
+func TestInitialEHLODoesNotFallbackWhenUnsafe(t *testing.T) {
+	tests := []struct {
+		name     string
+		code     int
+		utf8     bool
+		eightBit bool
+		required bool
+	}{
+		{name: "policy failure", code: 550},
+		{name: "transient failure", code: 421},
+		{name: "SMTPUTF8 required", code: 500, utf8: true},
+		{name: "8BITMIME required", code: 500, eightBit: true},
+		{name: "TLS required", code: 500, required: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mx := &fakeMX{initialEHLOCode: tt.code}
+			addr := startFakeMX(t, mx)
+			q := openQueue(t)
+			cfg := deliverCfg()
+			if tt.required {
+				allow := false
+				cfg.Delivery.TLSMode = "required"
+				cfg.Delivery.AllowPlaintext = &allow
+			}
+			cfg.Delivery.MaxAttempts = 1
+			d := deliver.New(cfg, q, memLog{})
+			wireMX(t, d, "ex.com", "mx.ex.com", addr)
+			addEnvelope(t, q, "no-helo", "a@ex.com", "b@ex.com", "ex.com", tt.utf8, tt.eightBit, nil)
+			cancel, done := runDeliverer(t, d)
+			awaitSession(t, mx, 3*time.Second)
+			cancel()
+			<-done
+			for _, command := range mx.snapshots()[0].Commands {
+				if strings.HasPrefix(strings.ToUpper(command), "HELO ") {
+					t.Fatalf("unsafe HELO fallback: %v", mx.snapshots()[0].Commands)
+				}
+			}
+		})
+	}
+}
+
+func TestPostSTARTTLSEHLODoesNotFallback(t *testing.T) {
+	cert, pool, _ := mintCert(t, "mx.ex.com")
+	mx := &fakeMX{startTLS: true, cert: cert, postTLSEHLOCode: 500}
+	addr := startFakeMX(t, mx)
+	q := openQueue(t)
+	cfg := deliverCfg()
+	cfg.Delivery.MaxAttempts = 1
+	d := deliver.New(cfg, q, memLog{})
+	d.SetTLSRootCAs(pool)
+	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+	addEnvelope(t, q, "post-tls-no-helo", "a@ex.com", "b@ex.com", "ex.com", false, false, nil)
+	cancel, done := runDeliverer(t, d)
+	awaitSession(t, mx, 3*time.Second)
+	cancel()
+	<-done
+	for _, command := range mx.snapshots()[0].Commands {
+		if strings.HasPrefix(strings.ToUpper(command), "HELO ") {
+			t.Fatalf("post-STARTTLS HELO fallback: %v", mx.snapshots()[0].Commands)
+		}
+	}
+}
+
+func TestEnhancedStatusPersisted(t *testing.T) {
+	mx := &fakeMX{rcptReply: "550 5.1.1 no such user"}
+	addr := startFakeMX(t, mx)
+	q := openQueue(t)
+	cfg := deliverCfg()
+	cfg.Delivery.MaxAttempts = 1
+	d := deliver.New(cfg, q, memLog{})
+	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+	addEnvelope(t, q, "enhanced-status", "a@ex.com", "b@ex.com", "ex.com", false, false, nil)
+	cancel, done := runDeliverer(t, d)
+	awaitSession(t, mx, 3*time.Second)
+	cancel()
+	<-done
+	ids, err := q.DeadIDs()
+	if err != nil || len(ids) != 1 {
+		t.Fatalf("DeadIDs=%v err=%v", ids, err)
+	}
+	env, err := q.LoadDead(ids[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := env.Recipients[0]
+	if r.Code != 550 || r.EnhancedCode != "5.1.1" {
+		t.Fatalf("recipient status code=%d enhanced=%q", r.Code, r.EnhancedCode)
 	}
 }
 

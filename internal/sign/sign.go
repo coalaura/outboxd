@@ -16,7 +16,10 @@ import (
 	"github.com/emersion/go-msgauth/dkim"
 )
 
-const keyBits = 2048
+const (
+	keyBits            = 2048
+	maxPrivateKeyBytes = 1 << 20
+)
 
 // Signer produces DKIM-Signature header fields for outgoing messages.
 type Signer struct {
@@ -113,7 +116,7 @@ func (s *Signer) Record() string {
 }
 
 func ensureKey(path string) (*rsa.PrivateKey, bool, error) {
-	body, err := config.ReadCheckedFile(path, true, false)
+	body, err := config.ReadCheckedFile(path, true, false, maxPrivateKeyBytes)
 	if err == nil {
 		key, err := parseKey(body)
 
@@ -142,7 +145,7 @@ func ensureKey(path string) (*rsa.PrivateKey, bool, error) {
 	if err != nil {
 		// Another process may have won the create race; adopt their key.
 		if errors.Is(err, os.ErrExist) {
-			body, readErr := config.ReadCheckedFile(path, true, false)
+			body, readErr := config.ReadCheckedFile(path, true, false, maxPrivateKeyBytes)
 			if readErr != nil {
 				return nil, false, readErr
 			}
@@ -156,7 +159,7 @@ func ensureKey(path string) (*rsa.PrivateKey, bool, error) {
 }
 
 func loadKey(path string) (*rsa.PrivateKey, error) {
-	body, err := config.ReadCheckedFile(path, true, false)
+	body, err := config.ReadCheckedFile(path, true, false, maxPrivateKeyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("read dkim private key: %w", err)
 	}
@@ -175,7 +178,11 @@ func parseKey(body []byte) (*rsa.PrivateKey, error) {
 
 	switch block.Type {
 	case "RSA PRIVATE KEY":
-		return x509.ParsePKCS1PrivateKey(block.Bytes)
+		key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		return validateKey(key)
 	case "PRIVATE KEY":
 		parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
 		if err != nil {
@@ -187,8 +194,18 @@ func parseKey(body []byte) (*rsa.PrivateKey, error) {
 			return nil, fmt.Errorf("unsupported dkim key type %T", parsed)
 		}
 
-		return key, nil
+		return validateKey(key)
 	}
 
 	return nil, fmt.Errorf("unsupported PEM block %q", block.Type)
+}
+
+func validateKey(key *rsa.PrivateKey) (*rsa.PrivateKey, error) {
+	if key.N == nil || key.N.BitLen() < keyBits {
+		return nil, fmt.Errorf("dkim RSA key must be at least %d bits", keyBits)
+	}
+	if err := key.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid dkim RSA private key: %w", err)
+	}
+	return key, nil
 }

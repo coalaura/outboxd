@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/coalaura/outboxd/internal/passwd"
+	"github.com/coalaura/outboxd/internal/queue"
 )
 
 func writeYAML(t *testing.T, dir, name, body string) string {
@@ -253,6 +254,12 @@ func TestResourceBoundaries(t *testing.T) {
 		{"auth workers", func(c *Config) { c.Server.AuthWorkers = MaxAuthWorkers + 1 }},
 		{"negative queue messages", func(c *Config) { c.Server.MaxQueueMessages = -1 }},
 		{"negative queue bytes", func(c *Config) { c.Server.MaxQueueBytes = -1 }},
+		{"missing spool cap", func(c *Config) { c.Server.MaxSpoolBytes = 0 }},
+		{"missing emergency reserve", func(c *Config) { c.Server.SpoolEmergencyBytes = 0 }},
+		{"undersized emergency reserve", func(c *Config) { c.Server.SpoolEmergencyBytes = queue.MinimumSpoolEmergencyBytes - 1 }},
+		{"emergency consumes spool", func(c *Config) { c.Server.SpoolEmergencyBytes = c.Server.MaxSpoolBytes }},
+		{"zero dead retention", func(c *Config) { c.Server.DeadRetention = "0s" }},
+		{"zero corrupt retention", func(c *Config) { c.Server.CorruptRetention = "0s" }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -277,6 +284,29 @@ func TestResourceBoundaries(t *testing.T) {
 	max.Delivery.GlobalConcurrency = MaxGlobalConcurrency
 	if err := max.Validate(); err != nil {
 		t.Fatalf("inclusive maximum boundaries invalid: %v", err)
+	}
+}
+
+func TestIPv4FieldsRejectMappedIPv6(t *testing.T) {
+	for _, set := range []func(*Config){
+		func(cfg *Config) { cfg.DNS.PublicIPv4 = "::ffff:192.0.2.1" },
+		func(cfg *Config) { cfg.Delivery.BindIPv4 = "::ffff:192.0.2.1" },
+	} {
+		cfg := Default()
+		set(cfg)
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("IPv4-mapped IPv6 accepted as IPv4")
+		}
+	}
+}
+
+func TestConfigReadLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yml")
+	if err := os.WriteFile(path, make([]byte, maxConfigFileBytes+1), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadFile(path); err == nil || !strings.Contains(err.Error(), "read limit") {
+		t.Fatalf("oversized config error=%v", err)
 	}
 }
 

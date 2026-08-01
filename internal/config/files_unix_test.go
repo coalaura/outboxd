@@ -55,3 +55,17 @@ func TestGeneratedSymlinkParentRejectedUnix(t *testing.T) {
 		t.Fatal("symlinked generated parent accepted")
 	}
 }
+
+func TestReadCheckedFileLimitUnix(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bounded")
+	if err := os.WriteFile(path, []byte("12345"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadCheckedFile(path, true, false, 4); err == nil {
+		t.Fatal("oversized checked file accepted")
+	}
+	body, err := ReadCheckedFile(path, true, false, 5)
+	if err != nil || string(body) != "12345" {
+		t.Fatalf("exact-limit read body=%q err=%v", body, err)
+	}
+}

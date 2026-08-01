@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coalaura/outboxd/internal/config"
 	"github.com/coalaura/outboxd/internal/disk"
@@ -217,6 +218,34 @@ func TestReadDSNOriginalCapsMissingHeaderTerminator(t *testing.T) {
 	}
 	if !r.closed {
 		t.Fatal("original reader was not closed")
+	}
+}
+
+func TestBuildDSNUsesEnhancedStatusAndFallback(t *testing.T) {
+	env := &queue.Envelope{
+		ID: "status-dsn", Sender: "alice@example.com",
+		Recipients: []queue.Recipient{
+			{Address: "enhanced@example.com", Status: queue.StatusFailed, Code: 550, EnhancedCode: "5.1.1", Detail: "550 5.1.1 missing"},
+			{Address: "basic@example.com", Status: queue.StatusFailed, Code: 554, Detail: "554 rejected"},
+			{Address: "unknown@example.com", Status: queue.StatusFailed, Detail: "failed"},
+		},
+	}
+	msg, err := buildDSN("mail.test", env, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []string{"Status: 5.1.1\r\n", "Status: 5.0.0\r\n"} {
+		if !bytes.Contains(msg, []byte(status)) {
+			t.Fatalf("missing %q in DSN", status)
+		}
+	}
+}
+
+func TestSanitizeHeaderPreservesValidUTF8AtLimit(t *testing.T) {
+	in := strings.Repeat("a", 199) + "é"
+	got := sanitizeHeader(in)
+	if !utf8.ValidString(got) || len(got) > 200 {
+		t.Fatalf("sanitizeHeader returned invalid boundary: %q", got)
 	}
 }
 

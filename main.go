@@ -8,7 +8,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -21,7 +20,6 @@ import (
 	"github.com/coalaura/outboxd/internal/deliver"
 	"github.com/coalaura/outboxd/internal/disk"
 	"github.com/coalaura/outboxd/internal/queue"
-	"github.com/coalaura/outboxd/internal/records"
 	"github.com/coalaura/outboxd/internal/sign"
 	"github.com/coalaura/outboxd/internal/smtpd"
 	"github.com/coalaura/plain"
@@ -41,15 +39,29 @@ func main() {
 	case "user":
 		log.MustFail(user(configPath, args[1:]))
 	case "dns":
+		if len(args) != 1 {
+			log.MustFail(errors.New("usage: outboxd dns"))
+			return
+		}
 		log.MustFail(dns(configPath))
 	case "check":
+		if len(args) != 1 {
+			log.MustFail(errors.New("usage: outboxd check"))
+			return
+		}
 		log.MustFail(runCheck(configPath))
 	case "dead":
 		log.MustFail(dead(configPath, args[1:]))
+	case "corrupt":
+		log.MustFail(corrupt(configPath, args[1:]))
 	case "serve":
+		if len(args) != 1 {
+			log.MustFail(errors.New("usage: outboxd serve"))
+			return
+		}
 		log.MustFail(serve(configPath))
 	default:
-		log.MustFail(fmt.Errorf("unknown command %q, expected user, dns, check, dead, or serve (default)", args[0]))
+		log.MustFail(fmt.Errorf("unknown command %q, expected user, dns, check, dead, corrupt, or serve (default)", args[0]))
 	}
 }
 
@@ -104,9 +116,13 @@ func serve(configPath string) error {
 
 	// Exclusive spool lock is daemon ownership: hold it before writing keys/certs.
 	spool, err := queue.Open(cfg.ResolvePath("queue"), queue.Limits{
-		MaxMessages: cfg.Server.MaxQueueMessages,
-		MaxBytes:    cfg.Server.MaxQueueBytes,
-		MinFreeDisk: cfg.Server.MinFreeDiskBytes,
+		MaxMessages:         cfg.Server.MaxQueueMessages,
+		MaxBytes:            cfg.Server.MaxQueueBytes,
+		MaxSpoolBytes:       cfg.Server.MaxSpoolBytes,
+		SpoolEmergencyBytes: cfg.Server.SpoolEmergencyBytes,
+		MinFreeDisk:         cfg.Server.MinFreeDiskBytes,
+		DeadRetention:       config.Duration(cfg.Server.DeadRetention),
+		CorruptRetention:    config.Duration(cfg.Server.CorruptRetention),
 	})
 	if err != nil {
 		return err
@@ -120,6 +136,7 @@ func serve(configPath string) error {
 	for _, warning := range spool.Warnings {
 		log.Warnln("queue maintenance warning:", escapeControl(warning.Error()))
 	}
+	logSpoolStats(spool)
 
 	log.Println("Ensuring DKIM keys...")
 
@@ -145,15 +162,6 @@ func serve(configPath string) error {
 	keeper.SetReloadErrorHandler(func(err error) {
 		log.Warnln("TLS certificate reload failed:", escapeControl(err.Error()))
 	})
-
-	log.Println("Writing DNS instructions...")
-
-	path, _, err := records.Write(cfg, signer.Record())
-	if err != nil {
-		return err
-	}
-
-	log.Printf("Wrote DNS instructions to %s\n", strconv.Quote(path))
 
 	log.Println("Starting server...")
 
@@ -186,6 +194,25 @@ func serve(configPath string) error {
 		errs[1] = deliverer.Run(ctx)
 	})
 
+	wg.Go(func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				dead, corrupt, err := spool.Prune(now)
+				if err != nil {
+					log.Warnln("queue prune failed:", escapeControl(err.Error()))
+				} else if dead+corrupt > 0 {
+					log.Printf("Pruned %d dead and %d corrupt queue entries\n", dead, corrupt)
+				}
+				logSpoolStats(spool)
+			}
+		}
+	})
+
 	log.Println("Server ready")
 
 	wg.Wait()
@@ -193,6 +220,16 @@ func serve(configPath string) error {
 	log.Warnln("Stopped")
 
 	return errors.Join(errs[0], errs[1])
+}
+
+func logSpoolStats(spool *queue.Queue) {
+	stats := spool.SpoolStats()
+	message := fmt.Sprintf("Spool physical usage: %d bytes used, %d reserved, %d hard limit", stats.Used, stats.Reserved, stats.Limit)
+	if stats.HighWater {
+		log.Warnln("HIGH WATER:", message)
+		return
+	}
+	log.Println(message)
 }
 
 // verifyBindAddresses ensures configured outbound bind IPs exist on this host.

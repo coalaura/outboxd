@@ -311,7 +311,7 @@ func checkDKIM(ctx context.Context, r Resolver, cfg *config.Config, key *DKIMKey
 		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("no DKIM TXT at %s", name)}}
 	}
 	if len(dkim) > 1 {
-		return []Result{{Name: checkName, Level: Warn, Message: fmt.Sprintf("multiple DKIM TXT at %s", name)}}
+		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("multiple DKIM TXT at %s", name)}}
 	}
 
 	if key == nil || key.PublicKey == "" {
@@ -374,10 +374,9 @@ func checkDMARC(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 	level := Pass
 	msg := fmt.Sprintf("DMARC p=%s", p)
 	if p != want {
-		level = Warn
-		msg = fmt.Sprintf("DMARC p=%s (config dmarc_policy=%s)", p, want)
-	}
-	if p == "none" {
+		level = Fail
+		msg = fmt.Sprintf("DMARC p=%s does not match config dmarc_policy=%s", p, want)
+	} else if p == "none" {
 		level = Warn
 		msg = "DMARC p=none (monitor only); stage to quarantine/reject after verifying alignment"
 	}
@@ -435,6 +434,20 @@ func checkEnvelopeMX(ctx context.Context, r Resolver, cfg *config.Config) []Resu
 		name := "envelope_mx_" + d
 		mxs, err := r.LookupMX(ctx, d)
 		if err == nil && len(mxs) > 0 {
+			null := 0
+			for _, mx := range mxs {
+				if mx != nil && strings.TrimSpace(mx.Host) == "." {
+					null++
+				}
+			}
+			if null > 0 {
+				message := fmt.Sprintf("%s publishes a null MX and does not accept bounces", d)
+				if len(mxs) > 1 || null > 1 {
+					message = fmt.Sprintf("%s publishes an invalid null MX mixed with other MX records", d)
+				}
+				rs = append(rs, Result{Name: name, Level: Fail, Message: message})
+				continue
+			}
 			rs = append(rs, Result{Name: name, Level: Pass, Message: fmt.Sprintf("%s has MX", d)})
 			continue
 		}

@@ -146,6 +146,12 @@ func (s *session) Rcpt(to string, opts *smtp.RcptOptions) error {
 }
 
 func (s *session) Data(r io.Reader) error {
+	// go-smtp starts Data on the first BDAT chunk. Its per-command deadline can
+	// be renewed by later commands, so independently bound the whole Data call.
+	conn := s.conn.Conn()
+	timer := time.AfterFunc(s.server.dataTimeout(), func() { _ = conn.Close() })
+	defer timer.Stop()
+
 	if s.sender == "" || len(s.recipients) == 0 {
 		return &smtp.SMTPError{
 			Code:         503,

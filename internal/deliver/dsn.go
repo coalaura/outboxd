@@ -9,6 +9,7 @@ import (
 	"io"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coalaura/outboxd/internal/mailbox"
 	"github.com/coalaura/outboxd/internal/queue"
@@ -157,7 +158,7 @@ func buildDSN(hostname string, env *queue.Envelope, original []byte) ([]byte, er
 		report.WriteString("\r\n")
 		fmt.Fprintf(&report, "Final-Recipient: rfc822; %s\r\n", r.Address)
 		report.WriteString("Action: failed\r\n")
-		report.WriteString("Status: 5.0.0\r\n")
+		fmt.Fprintf(&report, "Status: %s\r\n", dsnStatus(r))
 		if r.Detail != "" {
 			fmt.Fprintf(&report, "Diagnostic-Code: smtp; %s\r\n", sanitizeHeader(r.Detail))
 		}
@@ -213,6 +214,16 @@ func buildDSN(hostname string, env *queue.Envelope, original []byte) ([]byte, er
 	return out.Bytes(), nil
 }
 
+func dsnStatus(r queue.Recipient) string {
+	if r.EnhancedCode != "" && parseEnhancedCode(r.Code, r.EnhancedCode) == r.EnhancedCode {
+		return r.EnhancedCode
+	}
+	if class := r.Code / 100; class == 4 || class == 5 {
+		return fmt.Sprintf("%d.0.0", class)
+	}
+	return "5.0.0"
+}
+
 func randomBoundary() (string, error) {
 	var b [12]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -226,6 +237,9 @@ func sanitizeHeader(s string) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	if len(s) > 200 {
 		s = s[:200]
+		for !utf8.ValidString(s) {
+			s = s[:len(s)-1]
+		}
 	}
 	return s
 }

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -21,7 +22,12 @@ import (
 	"github.com/coalaura/outboxd/internal/disk"
 )
 
-const reloadInterval = time.Minute
+const (
+	reloadInterval       = time.Minute
+	maxCertificateBytes  = 4 << 20
+	maxPrivateKeyBytes   = 1 << 20
+	generationMarkerText = "outboxd self-signed tls generation\n"
+)
 
 // Keeper serves the submission certificate and picks up renewals without a
 // restart, which matters for operator-managed file rotations.
@@ -89,8 +95,20 @@ func Load(cfg *config.Config) (*Keeper, error) {
 
 // Check validates the configured serving certificate without modifying files.
 func Check(cfg *config.Config) error {
-	_, err := Load(cfg)
-	return err
+	return CheckWithRoots(cfg, nil)
+}
+
+// CheckWithRoots verifies the configured serving chain. A nil pool uses the
+// operating system roots; tests can provide a deterministic trust store.
+func CheckWithRoots(cfg *config.Config, roots *x509.CertPool) error {
+	keeper, err := Load(cfg)
+	if err != nil {
+		return err
+	}
+	keeper.mu.Lock()
+	certificate := keeper.certificate
+	keeper.mu.Unlock()
+	return verifyChain(certificate, keeper.hostname, roots, time.Now())
 }
 
 func configuredKeeper(cfg *config.Config) (*Keeper, error) {
@@ -136,6 +154,18 @@ func (k *Keeper) ensureFiles() (bool, error) {
 	}
 	// tls.mode=self_signed is development-only (untrusted leaf for local clients).
 	if k.mode == "self_signed" {
+		if _, err := os.Stat(k.generationMarker()); err == nil {
+			complete, err := k.recoverGeneration()
+			if err != nil {
+				return false, err
+			}
+			if complete {
+				return true, nil
+			}
+			return true, k.generate(k.hostname)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
 		if certOK && keyOK {
 			return false, nil
 		}
@@ -331,6 +361,35 @@ func validateCertificate(certificate *tls.Certificate, hostname string) error {
 	return nil
 }
 
+func verifyChain(certificate *tls.Certificate, hostname string, roots *x509.CertPool, now time.Time) error {
+	if certificate == nil || len(certificate.Certificate) == 0 {
+		return errors.New("tls certificate chain is empty")
+	}
+	leaf, err := x509.ParseCertificate(certificate.Certificate[0])
+	if err != nil {
+		return fmt.Errorf("parse leaf certificate: %w", err)
+	}
+	intermediates := x509.NewCertPool()
+	for _, raw := range certificate.Certificate[1:] {
+		intermediate, err := x509.ParseCertificate(raw)
+		if err != nil {
+			return fmt.Errorf("parse intermediate certificate: %w", err)
+		}
+		intermediates.AddCert(intermediate)
+	}
+	_, err = leaf.Verify(x509.VerifyOptions{
+		DNSName:       hostname,
+		Roots:         roots,
+		Intermediates: intermediates,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		CurrentTime:   now,
+	})
+	if err != nil {
+		return fmt.Errorf("verify tls certificate chain: %w", err)
+	}
+	return nil
+}
+
 func matchKey(leaf *x509.Certificate, key any) error {
 	type publicKeyer interface {
 		Public() crypto.PublicKey
@@ -377,11 +436,11 @@ func leafHasServerAuth(leaf *x509.Certificate) error {
 func (k *Keeper) readPair() ([]byte, []byte, [sha256.Size]byte, error) {
 	var fingerprint [sha256.Size]byte
 	allowSymlink := k.mode == "files"
-	certPEM, err := config.ReadCheckedFile(k.certificateFile, false, allowSymlink)
+	certPEM, err := config.ReadCheckedFile(k.certificateFile, false, allowSymlink, maxCertificateBytes)
 	if err != nil {
 		return nil, nil, fingerprint, fmt.Errorf("tls certificate: %w", err)
 	}
-	keyPEM, err := config.ReadCheckedFile(k.privateKeyFile, true, allowSymlink)
+	keyPEM, err := config.ReadCheckedFile(k.privateKeyFile, true, allowSymlink, maxPrivateKeyBytes)
 	if err != nil {
 		return nil, nil, fingerprint, fmt.Errorf("tls private key: %w", err)
 	}
@@ -451,17 +510,144 @@ func (k *Keeper) generate(hostname string) error {
 		return err
 	}
 
-	err = disk.WriteExclusive(k.privateKeyFile, pem.EncodeToMemory(&pem.Block{
+	keyPEM := pem.EncodeToMemory(&pem.Block{
 		Type:  "PRIVATE KEY",
 		Bytes: encoded,
-	}), 0600)
-
-	if err != nil {
-		return err
-	}
-
-	return disk.WriteExclusive(k.certificateFile, pem.EncodeToMemory(&pem.Block{
+	})
+	certPEM := pem.EncodeToMemory(&pem.Block{
 		Type:  "CERTIFICATE",
 		Bytes: body,
-	}), 0644)
+	})
+
+	for _, path := range []string{k.privateKeyStage(), k.certificateStage()} {
+		if _, err := os.Lstat(path); err == nil {
+			return fmt.Errorf("self-signed tls staging file %q already exists", path)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	if err := disk.WriteExclusive(k.generationMarker(), []byte(generationMarkerText), 0600); err != nil {
+		return err
+	}
+	if err := disk.WriteExclusive(k.privateKeyStage(), keyPEM, 0600); err != nil {
+		return err
+	}
+	if err := disk.WriteExclusive(k.certificateStage(), certPEM, 0644); err != nil {
+		return err
+	}
+	if err := disk.Rename(k.privateKeyStage(), k.privateKeyFile); err != nil {
+		return err
+	}
+	if err := disk.Rename(k.certificateStage(), k.certificateFile); err != nil {
+		return err
+	}
+	return removeDurable(k.generationMarker())
+}
+
+func (k *Keeper) generationMarker() string { return k.certificateFile + ".outboxd-generation" }
+func (k *Keeper) certificateStage() string { return k.certificateFile + ".outboxd-stage" }
+func (k *Keeper) privateKeyStage() string  { return k.privateKeyFile + ".outboxd-stage" }
+
+func (k *Keeper) recoverGeneration() (bool, error) {
+	targets := []struct {
+		path  string
+		stage string
+	}{
+		{k.privateKeyFile, k.privateKeyStage()},
+		{k.certificateFile, k.certificateStage()},
+	}
+	present := 0
+	available := 0
+	finals := 0
+	for _, target := range targets {
+		_, targetErr := os.Stat(target.path)
+		_, stageErr := os.Stat(target.stage)
+		if targetErr == nil || stageErr == nil {
+			available++
+		}
+		if targetErr == nil {
+			finals++
+		}
+		if targetErr != nil && !errors.Is(targetErr, os.ErrNotExist) {
+			return false, targetErr
+		}
+		if stageErr != nil && !errors.Is(stageErr, os.ErrNotExist) {
+			return false, stageErr
+		}
+	}
+	if available != len(targets) {
+		if finals != 0 {
+			return false, errors.New("incomplete marked self-signed tls generation cannot be recovered without replacing a final file")
+		}
+		return false, k.discardGenerationStages()
+	}
+	certPath := k.certificateFile
+	if _, err := os.Stat(certPath); errors.Is(err, os.ErrNotExist) {
+		certPath = k.certificateStage()
+	}
+	keyPath := k.privateKeyFile
+	if _, err := os.Stat(keyPath); errors.Is(err, os.ErrNotExist) {
+		keyPath = k.privateKeyStage()
+	}
+	certPEM, certErr := config.ReadCheckedFile(certPath, false, false, maxCertificateBytes)
+	keyPEM, keyErr := config.ReadCheckedFile(keyPath, true, false, maxPrivateKeyBytes)
+	if certErr != nil || keyErr != nil {
+		if finals == 0 {
+			return false, k.discardGenerationStages()
+		}
+		return false, fmt.Errorf("validate interrupted self-signed generation: %w", errors.Join(certErr, keyErr))
+	}
+	if _, err := k.parsePair(certPEM, keyPEM); err != nil {
+		if finals == 0 {
+			return false, k.discardGenerationStages()
+		}
+		return false, fmt.Errorf("validate interrupted self-signed generation: %w", err)
+	}
+	for _, target := range targets {
+		_, targetErr := os.Stat(target.path)
+		_, stageErr := os.Stat(target.stage)
+		if targetErr == nil {
+			present++
+			if stageErr == nil {
+				if err := removeDurable(target.stage); err != nil {
+					return false, err
+				}
+			}
+			continue
+		}
+		if stageErr == nil {
+			if err := disk.Rename(target.stage, target.path); err != nil {
+				return false, err
+			}
+			present++
+		}
+	}
+	if present == len(targets) {
+		return true, removeDurable(k.generationMarker())
+	}
+	return false, errors.New("incomplete marked self-signed tls generation cannot be recovered")
+}
+
+func (k *Keeper) discardGenerationStages() error {
+	for _, stage := range []string{k.privateKeyStage(), k.certificateStage()} {
+		if err := removeIfExistsDurable(stage); err != nil {
+			return err
+		}
+	}
+	return removeDurable(k.generationMarker())
+}
+
+func removeIfExistsDurable(path string) error {
+	err := removeDurable(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func removeDurable(path string) error {
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	return disk.Sync(filepath.Dir(path))
 }

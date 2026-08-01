@@ -381,6 +381,52 @@ func TestDataProcessingSemaphoreNonblockingAndReleased(t *testing.T) {
 	third.readCode(t, 250)
 }
 
+func TestIncompleteBDATAbsoluteDeadlineReleasesWorker(t *testing.T) {
+	const password = "bdat-deadline-password"
+	srv, cfg, _, _, pool := testServerWithUser(t, password)
+	cfg.Server.ReadTimeout = "150ms"
+	srv.dataWork = make(chan struct{}, 1)
+	runTestSubmission(t, srv)
+
+	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
+	cl.authPlain(t, "alice", password)
+	cl.cmd(t, "MAIL FROM:<Alice.Sender@test.example>", 250)
+	cl.cmd(t, "RCPT TO:<dest@example.com>", 250)
+	cl.cmd(t, "BDAT 0", 250)
+
+	deadline := time.Now().Add(time.Second)
+	for len(srv.dataWork) != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(srv.dataWork) != 1 {
+		t.Fatal("BDAT did not acquire DATA worker")
+	}
+
+	// NOOP refreshes go-smtp's command deadline, but must not renew Data's timer.
+	for range 3 {
+		time.Sleep(40 * time.Millisecond)
+		cl.cmd(t, "NOOP", 250)
+	}
+	time.Sleep(60 * time.Millisecond)
+	cl.expectClosed(t)
+	cl.close()
+
+	deadline = time.Now().Add(time.Second)
+	for len(srv.dataWork) != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(srv.dataWork) != 0 {
+		t.Fatal("DATA worker remained held after BDAT deadline")
+	}
+
+	next := dialSTARTTLS(t, srv.starttls.Addr, pool)
+	defer next.close()
+	next.authPlain(t, "alice", password)
+	beginMessage(t, next, "")
+	writeMessage(next, "ordinary DATA after BDAT cleanup")
+	next.readCode(t, 250)
+}
+
 func TestMalformedDataConsumesSubmissionBudget(t *testing.T) {
 	const password = "malformed-rate-password"
 	srv, _, _, _, pool := testServerWithUser(t, password)

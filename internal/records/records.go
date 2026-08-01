@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strconv"
@@ -35,12 +36,14 @@ func Build(cfg *config.Config, dkim string) []Record {
 	records := make([]Record, 0, 8)
 
 	if cfg.DNS.PublicIPv4 != "" {
-		records = append(records, Record{
-			Name:    hostname,
-			Type:    "A",
-			Value:   cfg.DNS.PublicIPv4,
-			Purpose: "Public IPv4 address of the SMTP hostname",
-		})
+		if ip, err := netip.ParseAddr(cfg.DNS.PublicIPv4); err == nil && ip.Is4() {
+			records = append(records, Record{
+				Name:    hostname,
+				Type:    "A",
+				Value:   ip.String(),
+				Purpose: "Public IPv4 address of the SMTP hostname",
+			})
+		}
 	}
 
 	if cfg.DNS.PublicIPv6 != "" {

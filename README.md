@@ -22,7 +22,8 @@ outboxd -config /etc/outboxd/config.yml          # serve
 outboxd -config ... user add alice alice@example.com
 outboxd -config ... dns
 outboxd -config ... check
-outboxd -config ... dead list|show|retry|export <id>
+outboxd -config ... dead list|show|retry|export|delete <id>
+outboxd -config ... corrupt list|delete <name>
 ```
 
 ## Submission vs delivery
@@ -59,7 +60,8 @@ On Unix, the config and generated DKIM private key must be regular, non-symlink 
 
 - On-disk spool under the data directory: **at-least-once** delivery. A crash between a successful remote DATA response and local `Finish` can redeliver; receivers must tolerate duplicates.
 - Exhausted or permanently failed messages move to the **dead-letter** area (`outboxd dead …`).
-- Quotas: `max_queue_messages`, `max_queue_bytes`, `min_free_disk_bytes`, plus per-user hourly message/recipient limits.
+- `max_queue_bytes` is the logical ready-message body quota. `max_spool_bytes` is the required hard physical quota across ready, tmp, DSN, dead, corrupt, and trash; `spool_emergency_bytes` is unavailable to ordinary submissions but available to DSNs and necessary state transitions. No write may cross the hard quota or `min_free_disk_bytes` floor.
+- Positive `dead_retention` and `corrupt_retention` bound retained failures. Startup and hourly pruning use crash-safe trash transitions; operators can also delete dead/corrupt entries explicitly.
 
 ## Configuration
 
@@ -77,7 +79,8 @@ outboxd [-config path]              # run submission + delivery
 outboxd user add <user> [senders…]  # append user via config.AddUser
 outboxd dns                         # write and print DNS instructions
 outboxd check                       # PASS/WARN/FAIL deployment checks
-outboxd dead list|show|retry|export
+outboxd dead list|show|retry|export|delete
+outboxd corrupt list|delete
 ```
 
 `OUTBOXD_CONFIG` overrides the default `config.yml` path when `-config` is omitted.

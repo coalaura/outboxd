@@ -19,7 +19,10 @@ import (
 	"github.com/coalaura/outboxd/internal/queue"
 )
 
-const lifetimeDetail = "maximum queue lifetime exceeded"
+const (
+	lifetimeDetail    = "maximum queue lifetime exceeded"
+	storageRetryDelay = 30 * time.Second
+)
 
 // Logger receives operational messages.
 type Logger interface {
@@ -261,6 +264,11 @@ func (d *Deliverer) Run(ctx context.Context) error {
 		wg.Go(func() {
 			defer func() { <-d.active }()
 			if err := d.attempt(ctx, envelope); err != nil {
+				if queue.IsStoragePressure(err) {
+					d.queue.RequeueAfter(envelope, storageRetryDelay)
+					d.log.Printf("storage pressure handling %s; retrying queue state in %s: %s\n", envelope.ID, storageRetryDelay, err)
+					return
+				}
 				d.setFatal(err)
 				cancel()
 			}
@@ -552,7 +560,7 @@ func (d *Deliverer) releaseGlobal() {
 }
 
 func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host string, indexes []int) (bool, error) {
-	client, err := d.connect(ctx, host)
+	client, err := d.connect(ctx, host, !envelope.SMTPUTF8 && !envelope.EightBit)
 	if err != nil {
 		return false, err
 	}
@@ -584,7 +592,7 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 			return false, err
 		}
 		if permanent(err) {
-			d.reject(envelope, indexes, describe(err))
+			d.rejectSMTP(envelope, indexes, err)
 			return true, nil
 		}
 		return false, err
@@ -602,8 +610,7 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 			continue
 		}
 		if permanent(err) {
-			recipient.Status = queue.StatusFailed
-			recipient.Detail = describe(err)
+			d.rejectSMTP(envelope, []int{index}, err)
 			continue
 		}
 		recipient.Detail = describe(err)
@@ -627,7 +634,7 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 	dw, err := client.Data()
 	if err != nil {
 		if permanent(err) {
-			d.reject(envelope, accepted, describe(err))
+			d.rejectSMTP(envelope, accepted, err)
 			return true, nil
 		}
 		return false, err
@@ -641,7 +648,7 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 	}
 	if err := dw.Close(); err != nil {
 		if permanent(err) {
-			d.reject(envelope, accepted, describe(err))
+			d.rejectSMTP(envelope, accepted, err)
 			return true, nil
 		}
 		return false, err
@@ -657,7 +664,7 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 	return true, nil
 }
 
-func (d *Deliverer) connect(ctx context.Context, host string) (*Client, error) {
+func (d *Deliverer) connect(ctx context.Context, host string, noExtensions bool) (*Client, error) {
 	ips, err := d.lookupHostIPs(ctx, host)
 	if err != nil {
 		return nil, err
@@ -674,7 +681,7 @@ func (d *Deliverer) connect(ctx context.Context, host string) (*Client, error) {
 			continue
 		}
 		sawPublic = true
-		client, err := d.dialAndSession(ctx, host, ip)
+		client, err := d.dialAndSession(ctx, host, ip, noExtensions)
 		if err == nil {
 			return client, nil
 		}
@@ -800,7 +807,7 @@ var restrictedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("ff00::/8"),
 }
 
-func (d *Deliverer) dialAndSession(ctx context.Context, mxHost string, ip net.IP) (*Client, error) {
+func (d *Deliverer) dialAndSession(ctx context.Context, mxHost string, ip net.IP, noExtensions bool) (*Client, error) {
 	// Policy is fixed before dialing. Never reconnect with a weaker verification policy.
 	policy := d.effectiveTLS()
 
@@ -829,8 +836,16 @@ func (d *Deliverer) dialAndSession(ctx context.Context, mxHost string, ip net.IP
 		return nil, err
 	}
 	if err := client.EHLO(d.cfg.Server.Hostname); err != nil {
-		client.Close()
-		return nil, err
+		code := smtpCode(err)
+		if !policy.allowPlaintext || !noExtensions || (code != 500 && code != 502 && code != 504) {
+			client.Close()
+			return nil, err
+		}
+		if err := client.HELO(d.cfg.Server.Hostname); err != nil {
+			client.Close()
+			return nil, err
+		}
+		return client, nil
 	}
 
 	hasTLS, _ := client.Extension("STARTTLS")
@@ -943,6 +958,19 @@ func (d *Deliverer) reject(envelope *queue.Envelope, indexes []int, detail strin
 		recipient := &envelope.Recipients[index]
 		recipient.Status = queue.StatusFailed
 		recipient.Detail = detail
+	}
+}
+
+func (d *Deliverer) rejectSMTP(envelope *queue.Envelope, indexes []int, err error) {
+	detail := describe(err)
+	code := smtpCode(err)
+	enhanced := smtpEnhancedCode(err)
+	for _, index := range indexes {
+		recipient := &envelope.Recipients[index]
+		recipient.Status = queue.StatusFailed
+		recipient.Detail = detail
+		recipient.Code = code
+		recipient.EnhancedCode = enhanced
 	}
 }
 

@@ -66,6 +66,7 @@ const (
 	dataMemoryCopies   = int64(8)
 	dataMemoryOverhead = int64(1 << 20)
 	maxDataWorkers     = 8
+	defaultDataTimeout = 5 * time.Minute
 )
 
 // shutdownTimeout bounds graceful Shutdown during Run.
@@ -418,6 +419,14 @@ func (s *Server) acquireDataSlot() bool {
 
 func (s *Server) releaseDataSlot() {
 	<-s.dataWork
+}
+
+func (s *Server) dataTimeout() time.Duration {
+	timeout := config.Duration(s.cfg.Server.ReadTimeout)
+	if timeout <= 0 {
+		return defaultDataTimeout
+	}
+	return timeout
 }
 
 // address normalizes an SMTP mailbox while preserving local-part case.

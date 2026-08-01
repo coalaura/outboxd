@@ -555,6 +555,63 @@ func TestInvalidRecipientStatusRejected(t *testing.T) {
 	}
 }
 
+func TestInvalidEnhancedRecipientStatusRejected(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	env := testEnv("invalid-enhanced-status")
+	env.Recipients[0].Code = 550
+	env.Recipients[0].EnhancedCode = "4.1.1"
+	if err := q.Add(env, []byte("body")); err == nil {
+		t.Fatal("accepted enhanced status whose class conflicts with basic code")
+	}
+}
+
+func TestEnhancedRecipientStatusRequiresBasicCode(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	env := testEnv("enhanced-without-basic")
+	env.Recipients[0].EnhancedCode = "5.1.1"
+	if err := q.Add(env, []byte("body")); err == nil {
+		t.Fatal("accepted enhanced status without basic SMTP code")
+	}
+}
+
+func TestRecipientStatusRejectsContradictorySMTPCode(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	tests := []struct {
+		status Status
+		code   int
+	}{
+		{"", 550},
+		{StatusPending, 451},
+		{StatusSent, 550},
+		{StatusFailed, 250},
+		{StatusFailed, 451},
+	}
+	for i, tt := range tests {
+		env := testEnv(fmt.Sprintf("contradictory-status-%d", i))
+		env.Recipients[0].Status = tt.status
+		env.Recipients[0].Code = tt.code
+		if err := q.Add(env, []byte("body")); err == nil {
+			t.Fatalf("accepted status=%s code=%d", tt.status, tt.code)
+		}
+	}
+}
+
+func TestRecipientDetailRejectsDisplayControls(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	for i, detail := range []string{"line\nfeed", "bidi\u202eoverride", "zero\u200bwidth", "separator\u2028line"} {
+		env := testEnv(fmt.Sprintf("detail-control-%d", i))
+		env.Recipients[0].Status = StatusFailed
+		env.Recipients[0].Detail = detail
+		if err := q.Add(env, []byte("body")); err == nil {
+			t.Fatalf("accepted detail %q", detail)
+		}
+	}
+}
+
 func TestRetryPersistenceFailureStillRecoverable(t *testing.T) {
 	clearHooks(t)
 	root := t.TempDir()
@@ -2451,8 +2508,16 @@ func TestOpenQuarantinesReadyDeadCollision(t *testing.T) {
 	dead.Size = 4
 	deadDir := writeQueueEntry(t, root, dirDead, dead, []byte("dead"))
 
-	if _, err := Open(root, Limits{}); !errors.Is(err, ErrIDConflict) {
-		t.Fatalf("Open error=%v want ErrIDConflict", err)
+	q2, err := Open(root, Limits{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = q2.Close() })
+	if q2.Len() != 0 {
+		t.Fatalf("conflicting ID was scheduled: Len=%d", q2.Len())
+	}
+	if len(q2.Corrupt) == 0 || !strings.Contains(q2.Corrupt[0].Error(), "BLOCKED") {
+		t.Fatalf("conflict was not prominently reported: %v", q2.Corrupt)
 	}
 	if _, err := os.Stat(deadDir); err != nil {
 		t.Fatalf("dead entry changed: %v", err)
@@ -3151,6 +3216,289 @@ func TestReservationCheckedArithmeticAndFreeDiskDefault(t *testing.T) {
 	q.mu.Unlock()
 	if err := q.Reserve(0); !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("overflowing count Reserve error=%v", err)
+	}
+}
+
+func TestPhysicalSpoolCountsEveryNamespace(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	before := q.SpoolStats().Used
+	for _, dir := range []string{q.ready, q.tmp, q.dsn, q.dead, q.corr, q.trash} {
+		if err := os.WriteFile(filepath.Join(dir, "usage"), []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := q.refreshSpoolUsage(); err != nil {
+		t.Fatal(err)
+	}
+	after := q.SpoolStats().Used
+	if after-before < 6*disk.AllocationSize(1) {
+		t.Fatalf("physical usage increase=%d want at least %d", after-before, 6*disk.AllocationSize(1))
+	}
+}
+
+func TestDeadCyclingDoesNotReleasePhysicalQuota(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	body := []byte("body")
+	first := testEnv("dead-cycle-one")
+	if err := q.Add(first, body); err != nil {
+		t.Fatal(err)
+	}
+	used := q.SpoolStats().Used
+	q.limits.MaxSpoolBytes = used + 3*disk.AllocationSize(0) + terminalSpoolReserve
+	q.limits.SpoolEmergencyBytes = 3*disk.AllocationSize(0) + terminalSpoolReserve
+	if err := q.Bury(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Add(testEnv("dead-cycle-two"), body); !errors.Is(err, ErrSpoolFull) {
+		t.Fatalf("Add after Bury error=%v want ErrSpoolFull", err)
+	}
+	if err := q.DeleteDead(first.ID); err != nil {
+		t.Fatal(err)
+	}
+	q.limits.MaxSpoolBytes = q.SpoolStats().Used + estimateEntryAllocation(int64(len(body)), maxEnvelopeMetadata) + q.limits.SpoolEmergencyBytes
+	if err := q.Add(testEnv("dead-cycle-two"), body); err != nil {
+		t.Fatalf("Add after DeleteDead: %v", err)
+	}
+}
+
+func TestDSNCanUseEmergencySpoolReserve(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	source := testEnv("emergency-dsn-source")
+	if err := q.Add(source, []byte("source")); err != nil {
+		t.Fatal(err)
+	}
+	dsn := testDSN(source)
+	meta, err := marshalEnvelope(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	need := estimateEntryAllocation(3, len(meta)) + disk.AllocationSize(maxEnvelopeMetadata) + disk.AllocationSize(0)
+	used := q.SpoolStats().Used
+	q.limits.MaxSpoolBytes = used + need + terminalSpoolReserve
+	q.limits.SpoolEmergencyBytes = need + terminalSpoolReserve
+	if err := q.Add(testEnv("ordinary-blocked"), []byte("dsn")); !errors.Is(err, ErrSpoolFull) {
+		t.Fatalf("ordinary Add error=%v want ErrSpoolFull", err)
+	}
+	if err := q.AddDSN(source, dsn, []byte("dsn")); err != nil {
+		t.Fatalf("AddDSN using emergency reserve: %v", err)
+	}
+	if err := q.Finish(source); err != nil {
+		t.Fatalf("Finish source after emergency DSN: %v", err)
+	}
+}
+
+func TestOrdinaryReservationPreservesEmergencyFreeSpace(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{
+		MinFreeDisk:         100,
+		SpoolEmergencyBytes: 50,
+	})
+	q.FreeDisk = func(string) (int64, error) { return 149, nil }
+	if err := q.Reserve(0); !errors.Is(err, ErrInsufficientDisk) {
+		t.Fatalf("ordinary Reserve error=%v want ErrInsufficientDisk", err)
+	}
+
+	q.mu.Lock()
+	err := q.reservePhysicalLocked(49, true)
+	q.mu.Unlock()
+	if err != nil {
+		t.Fatalf("emergency reservation: %v", err)
+	}
+	q.mu.Lock()
+	if q.reserved != 0 {
+		t.Fatalf("physical-only reservation consumed %d logical slots", q.reserved)
+	}
+	q.spoolReserved = 0
+	q.mu.Unlock()
+}
+
+func TestPhysicalReservationsAreConcurrentSafe(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	q.limits.MaxSpoolBytes = q.SpoolStats().Used + 100
+	errs := make(chan error, 2)
+	start := make(chan struct{})
+	for range 2 {
+		go func() {
+			<-start
+			errs <- q.Reserve(60)
+		}()
+	}
+	close(start)
+	var successes, full int
+	for range 2 {
+		if err := <-errs; err == nil {
+			successes++
+		} else if errors.Is(err, ErrSpoolFull) {
+			full++
+		} else {
+			t.Fatal(err)
+		}
+	}
+	if successes != 1 || full != 1 {
+		t.Fatalf("successes=%d full=%d", successes, full)
+	}
+	q.ReleaseReserve(60)
+}
+
+func TestAddReservesMetadataAndFilesystemOverhead(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	q.limits.MaxSpoolBytes = q.SpoolStats().Used + disk.AllocationSize(1)
+	if err := q.Add(testEnv("metadata-overhead"), []byte("x")); !errors.Is(err, ErrSpoolFull) {
+		t.Fatalf("Add error=%v want ErrSpoolFull", err)
+	}
+}
+
+func TestAcceptedAddStaysWithinPhysicalLimit(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	env := testEnv("physical-hard-limit")
+	data := []byte("body")
+	env.Size = int64(len(data))
+	env.Incarnation = strings.Repeat("a", 32)
+	env.Revision = 1
+	meta, err := marshalEnvelope(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.limits.MaxSpoolBytes = q.SpoolStats().Used + estimateEntryAllocation(int64(len(data)), len(meta))
+	added := testEnv(env.ID)
+	if err := q.Add(added, data); err != nil {
+		t.Fatal(err)
+	}
+	stats := q.SpoolStats()
+	if stats.Used > stats.Limit {
+		t.Fatalf("physical usage exceeded hard limit: used=%d limit=%d", stats.Used, stats.Limit)
+	}
+	q.limits.SpoolEmergencyBytes = 0
+	q.limits.MaxSpoolBytes = stats.Used
+	if err := q.Finish(added); err != nil {
+		t.Fatalf("Finish at hard physical limit: %v", err)
+	}
+}
+
+func TestPruneAndExplicitDelete(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{DeadRetention: time.Hour, CorruptRetention: time.Hour})
+	dead := testEnv("retained-dead")
+	if err := q.Add(dead, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Bury(dead); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(filepath.Join(q.dead, dead.ID), old, old); err != nil {
+		t.Fatal(err)
+	}
+	corrupt := filepath.Join(q.corr, "old-corrupt")
+	if err := os.WriteFile(corrupt, []byte("bad"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(corrupt, old, old); err != nil {
+		t.Fatal(err)
+	}
+	deadCount, corruptCount, err := q.Prune(time.Now())
+	if err != nil || deadCount != 1 || corruptCount != 1 {
+		t.Fatalf("Prune dead=%d corrupt=%d err=%v", deadCount, corruptCount, err)
+	}
+	second := testEnv("explicit-dead")
+	if err := q.Add(second, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Bury(second); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.DeleteDead(second.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(q.dead, second.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dead entry remains: %v", err)
+	}
+}
+
+func TestFailedQuarantineBlocksBadEntryAndLoadsValidEntry(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	for _, dir := range []string{dirReady, dirDead, dirTmp, dirDSN, dirCorrupt, dirTrash} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	valid := testEnv("valid-beside-bad")
+	valid.Size = 4
+	writeQueueEntry(t, root, dirReady, valid, []byte("body"))
+	bad := filepath.Join(root, dirReady, "bad-entry")
+	if err := os.MkdirAll(bad, 0700); err != nil {
+		t.Fatal(err)
+	}
+	disk.SetHooks(disk.Hooks{BeforeRename: func(oldpath, _ string) error {
+		if filepath.Clean(oldpath) == filepath.Clean(bad) {
+			return errors.New("quarantine unavailable")
+		}
+		return nil
+	}})
+	q, err := Open(root, Limits{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	if q.Len() != 1 {
+		t.Fatalf("loaded=%d want 1", q.Len())
+	}
+	if len(q.Corrupt) == 0 || !strings.Contains(q.Corrupt[0].Error(), "QUARANTINE FAILED; BLOCKED") {
+		t.Fatalf("missing prominent quarantine issue: %v", q.Corrupt)
+	}
+	if err := q.Add(testEnv("bad-entry"), []byte("replacement")); !errors.Is(err, ErrIDConflict) {
+		t.Fatalf("Add over blocked entry error=%v want ErrIDConflict", err)
+	}
+	if _, err := os.Stat(bad); err != nil {
+		t.Fatalf("blocked evidence was removed: %v", err)
+	}
+}
+
+func TestFailedInvalidDeadQuarantineDoesNotAbortRecovery(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	for _, dir := range []string{dirReady, dirDead, dirTmp, dirDSN, dirCorrupt, dirTrash} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	blocked := testEnv("blocked-dead-collision")
+	blocked.Size = 4
+	writeQueueEntry(t, root, dirReady, blocked, []byte("body"))
+	deadDir := filepath.Join(root, dirDead, blocked.ID)
+	if err := os.MkdirAll(deadDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	valid := testEnv("valid-beside-dead")
+	valid.Size = 4
+	writeQueueEntry(t, root, dirReady, valid, []byte("body"))
+	disk.SetHooks(disk.Hooks{BeforeRename: func(oldpath, _ string) error {
+		if filepath.Clean(oldpath) == filepath.Clean(deadDir) {
+			return errors.New("dead quarantine unavailable")
+		}
+		return nil
+	}})
+
+	q, err := Open(root, Limits{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	if q.Len() != 1 {
+		t.Fatalf("Len=%d want only unrelated valid entry", q.Len())
+	}
+	if err := q.Add(testEnv(blocked.ID), []byte("replacement")); !errors.Is(err, ErrIDConflict) {
+		t.Fatalf("Add over blocked collision error=%v want ErrIDConflict", err)
+	}
+	if len(q.Corrupt) == 0 || !strings.Contains(q.Corrupt[len(q.Corrupt)-1].Error(), "QUARANTINE FAILED; BLOCKED") {
+		t.Fatalf("missing blocked collision report: %v", q.Corrupt)
 	}
 }
 

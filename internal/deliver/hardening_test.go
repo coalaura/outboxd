@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/coalaura/outboxd/internal/queue"
@@ -232,7 +233,7 @@ func TestEstablishedSessionClosesPromptlyOnCancel(t *testing.T) {
 	}))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { _, err := d.dialAndSession(ctx, "mx.ex.com", net.ParseIP("127.0.0.1")); done <- err }()
+	go func() { _, err := d.dialAndSession(ctx, "mx.ex.com", net.ParseIP("127.0.0.1"), true); done <- err }()
 	<-connected
 	cancel()
 	select {
@@ -379,18 +380,38 @@ func TestSubmissionDeadlineIncludesFinalDataResponse(t *testing.T) {
 }
 
 func TestNormalizeDiagnostic(t *testing.T) {
-	in := "bad\r\n\x00\x1f\x7f" + string([]byte{0xff}) + strings.Repeat("é", maxDiagnosticBytes)
+	in := "bad\r\n\x00\x1f\x7f\u0085\u009b\u200b\u2028\u2029\u202e" + string([]byte{0xff}) + strings.Repeat("é", maxDiagnosticBytes)
 	got := normalizeDiagnostic(in)
 	if !utf8.ValidString(got) || len(got) > maxDiagnosticBytes {
 		t.Fatalf("invalid normalized diagnostic: valid=%v bytes=%d", utf8.ValidString(got), len(got))
 	}
 	for _, r := range got {
-		if r < 0x20 || r == 0x7f {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
 			t.Fatalf("control %U remains in %q", r, got)
 		}
 	}
 	if strings.ContainsAny(got, "\r\n") {
 		t.Fatalf("multiline diagnostic: %q", got)
+	}
+}
+
+func TestParseEnhancedCode(t *testing.T) {
+	tests := []struct {
+		code    int
+		message string
+		want    string
+	}{
+		{550, "5.1.1 no such user", "5.1.1"},
+		{451, "4.7.12 deferred", "4.7.12"},
+		{550, "4.1.1 wrong class", ""},
+		{550, "5.1000.1 too wide", ""},
+		{550, "5.1 missing component", ""},
+		{550, "rejected without enhanced code", ""},
+	}
+	for _, tt := range tests {
+		if got := parseEnhancedCode(tt.code, tt.message); got != tt.want {
+			t.Errorf("parseEnhancedCode(%d, %q)=%q want %q", tt.code, tt.message, got, tt.want)
+		}
 	}
 }
 

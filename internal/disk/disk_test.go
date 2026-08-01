@@ -59,6 +59,36 @@ func TestMkdirDurablePropagatesParentSyncFailure(t *testing.T) {
 	}
 }
 
+func TestAllocatedBytesDoesNotFollowSymlinks(t *testing.T) {
+	root := t.TempDir()
+	external := filepath.Join(t.TempDir(), "external")
+	if err := os.Mkdir(external, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(external, "large"), make([]byte, 1<<20), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(root, "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	used, err := AllocatedBytes(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used >= 1<<20 {
+		t.Fatalf("usage %d followed external symlink", used)
+	}
+}
+
+func TestAllocationSizeUsesConservativeUnit(t *testing.T) {
+	if got := AllocationSize(1); got != 64<<10 {
+		t.Fatalf("AllocationSize(1)=%d want %d", got, 64<<10)
+	}
+	if got := AllocationSize((64 << 10) + 1); got != 128<<10 {
+		t.Fatalf("AllocationSize(unit+1)=%d want %d", got, 128<<10)
+	}
+}
+
 func TestRenameSyncsDestinationBeforeSource(t *testing.T) {
 	resetHooks(t)
 	root := t.TempDir()

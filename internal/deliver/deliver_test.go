@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -30,6 +31,29 @@ type memLog struct{}
 
 func (memLog) Printf(string, ...any) {}
 func (memLog) Println(...any)        {}
+
+type recordingLog struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *recordingLog) Printf(format string, values ...any) {
+	l.mu.Lock()
+	l.lines = append(l.lines, fmt.Sprintf(format, values...))
+	l.mu.Unlock()
+}
+
+func (l *recordingLog) Println(values ...any) {
+	l.mu.Lock()
+	l.lines = append(l.lines, fmt.Sprintln(values...))
+	l.mu.Unlock()
+}
+
+func (l *recordingLog) contains(value string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Contains(strings.Join(l.lines, ""), value)
+}
 
 type fakeResolver struct {
 	mx  map[string][]*net.MX
@@ -122,6 +146,32 @@ func addMsg(t *testing.T, q *queue.Queue, id, domain, rcpt string) {
 	body := []byte("From: sender@example.com\r\nTo: " + rcpt + "\r\nSubject: t\r\n\r\nHi\r\n")
 	if err := q.Add(env, body); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestStoragePressureIsNonfatalAndBackedOff(t *testing.T) {
+	root := t.TempDir()
+	q, err := queue.Open(root, queue.Limits{MinFreeDisk: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	addMsg(t, q, "storage-pressure", "missing.invalid", "user@missing.invalid")
+	q.FreeDisk = func(string) (int64, error) { return 0, nil }
+
+	logger := new(recordingLog)
+	d := deliver.New(testConfig(), q, logger)
+	d.SetResolver(&fakeResolver{mx: map[string][]*net.MX{}, ips: map[string][]net.IP{}})
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := d.Run(ctx); err != nil {
+		t.Fatalf("Run returned storage pressure as fatal: %v", err)
+	}
+	if !logger.contains("storage pressure") {
+		t.Fatalf("storage pressure was not logged")
+	}
+	if q.Len() != 1 {
+		t.Fatalf("queued messages=%d want 1 recoverable message", q.Len())
 	}
 }
 

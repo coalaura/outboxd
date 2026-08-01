@@ -24,13 +24,20 @@ func CheckFile(path string, private bool) error {
 
 // ReadCheckedFile validates the opened final handle before reading it. Windows
 // mode bits do not represent DACLs; deployments must restrict private-file ACLs.
-func ReadCheckedFile(path string, private, allowSymlink bool) ([]byte, error) {
+func ReadCheckedFile(path string, private, allowSymlink bool, maximum int64) ([]byte, error) {
 	file, err := openChecked(path, allowSymlink)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-	return io.ReadAll(file)
+	body, err := io.ReadAll(io.LimitReader(file, maximum+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > maximum {
+		return nil, fmt.Errorf("%q exceeds %d-byte read limit", path, maximum)
+	}
+	return body, nil
 }
 
 func openChecked(path string, allowSymlink bool) (*os.File, error) {

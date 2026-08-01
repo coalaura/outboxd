@@ -237,6 +237,54 @@ func TestDKIMKeyMismatch(t *testing.T) {
 	t.Fatal("expected dkim fail")
 }
 
+func TestDuplicateDKIMFails(t *testing.T) {
+	cfg := baseCfg()
+	r := &fakeResolver{txt: map[string][]string{
+		"mail._domainkey.example.com": {"v=DKIM1; p=AAAA", "v=DKIM1; p=BBBB"},
+	}}
+	result := checkDKIM(context.Background(), r, cfg, nil)[0]
+	if result.Level != Fail {
+		t.Fatalf("duplicate DKIM level=%s", result.Level)
+	}
+}
+
+func TestDMARCConfiguredPolicyMismatchFails(t *testing.T) {
+	cfg := baseCfg()
+	for _, test := range []struct {
+		policy string
+		level  Level
+	}{
+		{"none", Warn},
+		{"reject", Fail},
+	} {
+		r := &fakeResolver{txt: map[string][]string{
+			"_dmarc.example.com": {"v=DMARC1; p=" + test.policy + "; rua=mailto:dmarc@reports.example.net"},
+		}}
+		result := checkDMARC(context.Background(), r, cfg)[0]
+		if result.Level != test.level {
+			t.Fatalf("published p=%s level=%s want %s: %s", test.policy, result.Level, test.level, result.Message)
+		}
+	}
+}
+
+func TestNullMXFailsWithoutImplicitFallback(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Users = nil
+	for _, mxs := range [][]*net.MX{
+		{{Host: ".", Pref: 0}},
+		{{Host: ".", Pref: 0}, {Host: "mx.example.com.", Pref: 10}},
+	} {
+		r := &fakeResolver{
+			mx:  map[string][]*net.MX{"example.com": mxs},
+			ips: map[string][]net.IPAddr{"example.com": {{IP: net.ParseIP("203.0.113.10")}}},
+		}
+		result := checkEnvelopeMX(context.Background(), r, cfg)[0]
+		if result.Level != Fail || !strings.Contains(result.Message, "null MX") {
+			t.Fatalf("null MX accepted: %+v", result)
+		}
+	}
+}
+
 func TestEnvelopeImplicitMX(t *testing.T) {
 	cfg := baseCfg()
 	// only apex domain in senders

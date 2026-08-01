@@ -58,6 +58,18 @@ func TestSPFForSenderDomainsAndIncludes(t *testing.T) {
 	}
 }
 
+func TestMappedIPv6IsNotEmittedAsIPv4(t *testing.T) {
+	cfg := config.Default()
+	cfg.Server.Hostname = "mail.example.com"
+	cfg.Server.Domain = "example.com"
+	cfg.DNS.PublicIPv4 = "::ffff:192.0.2.1"
+	for _, record := range Build(cfg, "v=DKIM1; p=x") {
+		if record.Type == "A" || strings.Contains(record.Value, "ip4:") {
+			t.Fatalf("mapped IPv6 emitted as IPv4: %+v", record)
+		}
+	}
+}
+
 func TestTLSRPTSeparateFromDMARC(t *testing.T) {
 	cfg := config.Default()
 	cfg.Server.Hostname = "mail.example.com"
