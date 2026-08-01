@@ -16,28 +16,28 @@ func TestPrivateFileSecurityUnix(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := CheckFile(path, true)
+	err = CheckFile(path, true)
 	if err == nil {
 		t.Fatal("group/other-accessible private file accepted")
 	}
 
-	err := os.Chmod(path, 0600)
+	err = os.Chmod(path, 0600)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err := CheckFile(path, true)
+	err = CheckFile(path, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	link := filepath.Join(dir, "link")
-	err := os.Symlink(path, link)
+	err = os.Symlink(path, link)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err := CheckFile(link, true)
+	err = CheckFile(link, true)
 	if err == nil {
 		t.Fatal("symlinked private file accepted")
 	}
@@ -52,12 +52,12 @@ func TestGeneratedSymlinkParentRejectedUnix(t *testing.T) {
 	}
 
 	data := filepath.Join(dir, "data")
-	err := os.Mkdir(data, 0700)
+	err = os.Mkdir(data, 0700)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err := os.Symlink(realDir, filepath.Join(data, "keys"))
+	err = os.Symlink(realDir, filepath.Join(data, "keys"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestReadCheckedFileLimitUnix(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := ReadCheckedFile(path, true, false, 4)
+	_, err = ReadCheckedFile(path, true, false, 4)
 	if err == nil {
 		t.Fatal("oversized checked file accepted")
 	}

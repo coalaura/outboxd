@@ -374,6 +374,42 @@ func TestAddFaultInjectionRecoverable(t *testing.T) {
 	}
 }
 
+func TestFailedAddQuarantineRemainsPhysicallyAccounted(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	id := "accounted-quarantine"
+	before := q.SpoolStats().Used
+	disk.SetHooks(disk.Hooks{
+		BeforeSyncFile: func(path string) error {
+			if filepath.Clean(path) == filepath.Join(root, dirReady, id, addStateName) {
+				return errors.New("inject acceptance sync failure")
+			}
+
+			return nil
+		},
+	})
+
+	err := q.Add(testEnv(id), []byte("body\r\n"))
+	if err == nil {
+		t.Fatal("expected Add error")
+	}
+
+	disk.SetHooks(disk.Hooks{})
+	if q.SpoolStats().Used <= before {
+		t.Fatalf("failed Add usage=%d want greater than %d", q.SpoolStats().Used, before)
+	}
+
+	ids, err := q.CorruptIDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(ids) != 1 {
+		t.Fatalf("corrupt IDs=%v want one retained entry", ids)
+	}
+}
+
 func TestRecoverTmpNeverPromotesCompleteUncommittedAdd(t *testing.T) {
 	clearHooks(t)
 
@@ -1783,9 +1819,9 @@ func TestMinFreeDiskIncludesConcurrentReservations(t *testing.T) {
 
 	first := make(chan error, 1)
 	second := make(chan error, 1)
-	go func() { first <- q.Reserve(60) }()
+	go func() { first <- reserveForTest(q, 60) }()
 	<-entered
-	go func() { second <- q.Reserve(40) }()
+	go func() { second <- reserveForTest(q, 40) }()
 	close(release)
 
 	err := <-first
@@ -1798,7 +1834,7 @@ func TestMinFreeDiskIncludesConcurrentReservations(t *testing.T) {
 		t.Fatalf("second Reserve error=%v want ErrInsufficientDisk", err)
 	}
 
-	q.ReleaseReserve(60)
+	releaseForTest(q, 60)
 }
 
 func TestMinFreeDiskIncludesReservationsForExemptDSN(t *testing.T) {
@@ -1811,12 +1847,12 @@ func TestMinFreeDiskIncludesReservationsForExemptDSN(t *testing.T) {
 	}
 
 	q.FreeDisk = func(string) (int64, error) { return 100, nil }
-	err = q.Reserve(85)
+	err = reserveForTest(q, 85)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { q.ReleaseReserve(85) })
+	t.Cleanup(func() { releaseForTest(q, 85) })
 
 	err = q.AddDSN(source, testDSN(source), []byte("123456"))
 	if !errors.Is(err, ErrInsufficientDisk) {
@@ -2696,10 +2732,6 @@ func TestOpenReadOnlyAlongsideLocked(t *testing.T) {
 		t.Fatalf("Add want ErrReadOnly got %v", err)
 	}
 
-	err = ro.Reserve(1)
-	if !errors.Is(err, ErrReadOnly) {
-		t.Fatalf("Reserve want ErrReadOnly got %v", err)
-	}
 }
 
 func TestCorruptNeverDeletedSilently(t *testing.T) {
@@ -3957,14 +3989,14 @@ func TestReservationCheckedArithmeticAndFreeDiskDefault(t *testing.T) {
 		t.Fatal("Open did not initialize FreeDisk")
 	}
 
-	err := q.Reserve(-1)
+	err := reserveForTest(q, -1)
 	if err == nil {
 		t.Fatal("negative Reserve succeeded")
 	}
 
 	q.FreeDisk = func(string) (int64, error) { return math.MaxInt64, nil }
 	q.limits.MinFreeDisk = math.MaxInt64
-	err = q.Reserve(1)
+	err = reserveForTest(q, 1)
 	if !errors.Is(err, ErrInsufficientDisk) {
 		t.Fatalf("overflowing MinFreeDisk Reserve error=%v", err)
 	}
@@ -3974,7 +4006,7 @@ func TestReservationCheckedArithmeticAndFreeDiskDefault(t *testing.T) {
 	q.bytes = math.MaxInt64
 	q.mu.Unlock()
 
-	err = q.Reserve(1)
+	err = reserveForTest(q, 1)
 	if !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("overflowing byte Reserve error=%v", err)
 	}
@@ -3984,7 +4016,7 @@ func TestReservationCheckedArithmeticAndFreeDiskDefault(t *testing.T) {
 	q.count = math.MaxInt
 	q.mu.Unlock()
 
-	err = q.Reserve(0)
+	err = reserveForTest(q, 0)
 	if !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("overflowing count Reserve error=%v", err)
 	}
@@ -4084,20 +4116,52 @@ func TestDSNCanUseEmergencySpoolReserve(t *testing.T) {
 	}
 }
 
+func TestEmergencyDSNRetainsCapacityToBurySource(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	source := testEnv("emergency-dsn-bury-source")
+	err := q.Add(source, []byte("source"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dsn := testDSN(source)
+	meta, err := marshalEnvelope(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	need := estimateEntryAllocation(3, len(meta)) + disk.AllocationSize(maxEnvelopeMetadata) + disk.AllocationSize(0)
+	used := q.SpoolStats().Used
+	q.limits.MaxSpoolBytes = used + need + terminalSpoolReserve
+	q.limits.SpoolEmergencyBytes = need + terminalSpoolReserve
+	err = q.AddDSN(source, dsn, []byte("dsn"))
+	if err != nil {
+		t.Fatalf("AddDSN using emergency reserve: %v", err)
+	}
+
+	source.Recipients[0].Status = StatusFailed
+	source.Recipients[0].Detail = "permanent failure"
+	err = q.Bury(source)
+	if err != nil {
+		t.Fatalf("Bury source after emergency DSN: %v", err)
+	}
+}
+
 func TestOrdinaryReservationPreservesEmergencyFreeSpace(t *testing.T) {
 	clearHooks(t)
 	q := mustOpen(t, t.TempDir(), Limits{
 		MinFreeDisk:         100,
-		SpoolEmergencyBytes: 50,
+		SpoolEmergencyBytes: terminalSpoolReserve + 50,
 	})
-	q.FreeDisk = func(string) (int64, error) { return 149, nil }
-	err := q.Reserve(0)
+	q.FreeDisk = func(string) (int64, error) { return 100 + terminalSpoolReserve + 49, nil }
+	err := reserveForTest(q, 0)
 	if !errors.Is(err, ErrInsufficientDisk) {
 		t.Fatalf("ordinary Reserve error=%v want ErrInsufficientDisk", err)
 	}
 
 	q.mu.Lock()
-	err = q.reservePhysicalLocked(49, true)
+	err = q.reservePhysicalLocked(49, true, false)
 	q.mu.Unlock()
 
 	if err != nil {
@@ -4124,7 +4188,7 @@ func TestPhysicalReservationsAreConcurrentSafe(t *testing.T) {
 	for range 2 {
 		go func() {
 			<-start
-			errs <- q.Reserve(60)
+			errs <- reserveForTest(q, 60)
 		}()
 	}
 
@@ -4146,7 +4210,19 @@ func TestPhysicalReservationsAreConcurrentSafe(t *testing.T) {
 		t.Fatalf("successes=%d full=%d", successes, full)
 	}
 
-	q.ReleaseReserve(60)
+	releaseForTest(q, 60)
+}
+
+func reserveForTest(q *Queue, size int64) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.reserveLocked(size, size, false, false)
+}
+
+func releaseForTest(q *Queue, size int64) {
+	q.mu.Lock()
+	q.releaseReserveLocked(size, size)
+	q.mu.Unlock()
 }
 
 func TestAddReservesMetadataAndFilesystemOverhead(t *testing.T) {

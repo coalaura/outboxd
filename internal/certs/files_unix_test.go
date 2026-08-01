@@ -16,33 +16,33 @@ func TestEnsureRejectsAccessibleAndAllowsOperatorSymlinkUnix(t *testing.T) {
 	}
 
 	key := filepath.Join(dir, "server.key")
-	err := os.Chmod(key, 0640)
+	err = os.Chmod(key, 0640)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, _, err := ensureWithDir(t, dir, "files")
+	_, _, err = ensureWithDir(t, dir, "files")
 	if err == nil {
 		t.Fatal("group-accessible TLS key accepted")
 	}
 
-	err := os.Chmod(key, 0600)
+	err = os.Chmod(key, 0600)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	real := filepath.Join(dir, "real.key")
-	err := os.Rename(key, real)
+	err = os.Rename(key, real)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err := os.Symlink(real, key)
+	err = os.Symlink(real, key)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, _, err := ensureWithDir(t, dir, "files")
+	_, _, err = ensureWithDir(t, dir, "files")
 	if err != nil {
 		t.Fatalf("operator-managed symlink to secure regular key rejected: %v", err)
 	}

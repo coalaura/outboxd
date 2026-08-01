@@ -286,11 +286,7 @@ func validDate(value string) bool {
 	}
 
 	_, err := mail.ParseDate(value)
-	if err != nil {
-		return false
-	}
-
-	return true
+	return err == nil
 }
 
 func validMessageID(value string) bool {

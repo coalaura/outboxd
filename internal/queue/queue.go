@@ -66,7 +66,7 @@ const (
 // source metadata replacement, and a terminal namespace transition.
 const MinimumSpoolEmergencyBytes int64 = 16 << 20
 
-var terminalSpoolReserve = 4 * disk.AllocationSize(0)
+var terminalSpoolReserve = disk.AllocationSize(maxEnvelopeMetadata+disk.AllocationSize(0)) + disk.AllocationSize(0)
 
 const (
 	metaName       = "meta.json"
@@ -315,26 +315,6 @@ func (q *Queue) SpoolStats() PhysicalStats {
 	return stats
 }
 
-// Reserve holds capacity for an in-progress Add so concurrent submissions
-// cannot overshoot quotas. Release with ReleaseReserve if Add is abandoned.
-func (q *Queue) Reserve(size int64) error {
-	err := q.beginOperation()
-	if err != nil {
-		return err
-	}
-
-	defer q.endOperation()
-
-	err = q.rejectReadOnly()
-	if err != nil {
-		return err
-	}
-
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.reserveLocked(size, size, false, false)
-}
-
 // reserveLocked checks logical and physical quotas. Emergency operations may
 // consume the configured reserve but never the hard spool or free-space floor.
 func (q *Queue) reserveLocked(size, physical int64, exempt, emergency bool) error {
@@ -376,7 +356,7 @@ func (q *Queue) reserveLocked(size, physical int64, exempt, emergency bool) erro
 		}
 	}
 
-	err := q.reservePhysicalLocked(physical, emergency)
+	err := q.reservePhysicalLocked(physical, emergency, false)
 	if err != nil {
 		return err
 	}
@@ -384,18 +364,6 @@ func (q *Queue) reserveLocked(size, physical int64, exempt, emergency bool) erro
 	q.reserved++
 	q.resBytes = reservedBytes
 	return nil
-}
-
-// ReleaseReserve undoes Reserve.
-func (q *Queue) ReleaseReserve(size int64) {
-	if q == nil || q.beginOperation() != nil {
-		return
-	}
-
-	defer q.endOperation()
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.releaseReserveLocked(size, size)
 }
 
 func (q *Queue) releaseReserveLocked(size, physical int64) {
@@ -448,9 +416,9 @@ func estimateEntryAllocation(bodySize int64, metadataSize int) int64 {
 	return total
 }
 
-func (q *Queue) holdPhysical(bytes int64, emergency bool) (func(), error) {
+func (q *Queue) holdPhysical(bytes int64, terminal bool) (func(), error) {
 	q.mu.Lock()
-	err := q.reservePhysicalLocked(bytes, emergency)
+	err := q.reservePhysicalLocked(bytes, true, terminal)
 	q.mu.Unlock()
 
 	if err != nil {
@@ -504,7 +472,7 @@ func (q *Queue) removePhysical(bytes int64) {
 	q.mu.Unlock()
 }
 
-func (q *Queue) reservePhysicalLocked(physical int64, emergency bool) error {
+func (q *Queue) reservePhysicalLocked(physical int64, emergency, terminal bool) error {
 	if physical < 0 {
 		return errors.New("negative physical reservation size")
 	}
@@ -523,7 +491,7 @@ func (q *Queue) reservePhysicalLocked(physical int64, emergency bool) error {
 		limit := q.limits.MaxSpoolBytes
 		if !emergency {
 			limit -= q.limits.SpoolEmergencyBytes
-		} else {
+		} else if !terminal {
 			// Always retain enough room for ready -> trash -> removal. Operations
 			// that only free space do not reserve and may use this final margin.
 			limit -= terminalSpoolReserve
@@ -543,6 +511,11 @@ func (q *Queue) reservePhysicalLocked(physical int64, emergency bool) error {
 		floor := q.limits.MinFreeDisk
 		if !emergency {
 			floor, ok = checkedAddInt64(floor, q.limits.SpoolEmergencyBytes)
+			if !ok {
+				return ErrInsufficientDisk
+			}
+		} else if !terminal {
+			floor, ok = checkedAddInt64(floor, terminalSpoolReserve)
 			if !ok {
 				return ErrInsufficientDisk
 			}
@@ -867,9 +840,20 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 	q.mu.Unlock()
 
 	held := true
+	physicalHeld := physical
+	commitPhysical := func() {
+		if physicalHeld == 0 {
+			return
+		}
+
+		q.mu.Lock()
+		q.commitPhysicalLocked(physicalHeld)
+		q.mu.Unlock()
+		physicalHeld = 0
+	}
 	defer func() {
 		if held {
-			q.releaseReserve(envelope.Size, physical)
+			q.releaseReserve(envelope.Size, physicalHeld)
 		}
 	}()
 
@@ -888,8 +872,13 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 	success := false
 	defer func() {
 		if !success {
-			_ = os.RemoveAll(tmpDir)
-			_ = disk.Sync(q.tmp)
+			removeErr := os.RemoveAll(tmpDir)
+			syncErr := disk.Sync(q.tmp)
+			_, tmpErr := os.Lstat(tmpDir)
+			_, readyErr := os.Lstat(readyDir)
+			if removeErr != nil || syncErr != nil || tmpErr == nil || readyErr == nil {
+				commitPhysical()
+			}
 		}
 	}()
 
@@ -924,6 +913,9 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 	err = acceptAdd(filepath.Join(readyDir, addStateName))
 	if err != nil {
 		abortErr := q.quarantineDir(readyDir, envelope.ID+"-uncommitted")
+		// Quarantine intentionally retains the failed entry. If quarantine itself
+		// failed, the entry may remain in either namespace and must still be charged.
+		commitPhysical()
 		if abortErr == nil {
 			return err
 		} else {
@@ -943,8 +935,9 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 	mutationHeld = false
 
 	q.mu.Lock()
-	q.releaseReserveLocked(envelope.Size, physical)
-	q.addPhysicalLocked(physical)
+	q.commitPhysicalLocked(physicalHeld)
+	physicalHeld = 0
+	q.releaseReserveLocked(envelope.Size, 0)
 	q.noteAddedLocked(envelope)
 	delete(q.transitioning, envelope.ID)
 	delete(q.requeues, envelope.ID)
@@ -1160,6 +1153,16 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 	q.mu.Unlock()
 	held := true
 	physicalHeld := physical
+	commitPhysical := func() {
+		if physicalHeld == 0 {
+			return
+		}
+
+		q.mu.Lock()
+		q.commitPhysicalLocked(physicalHeld)
+		q.mu.Unlock()
+		physicalHeld = 0
+	}
 	defer func() {
 		if held {
 			q.releaseReserve(dsn.Size, physicalHeld)
@@ -1174,8 +1177,11 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 	cleanup := true
 	defer func() {
 		if cleanup {
-			_ = os.RemoveAll(stageDir)
-			_ = disk.Sync(q.dsn)
+			removeErr := os.RemoveAll(stageDir)
+			syncErr := disk.Sync(q.dsn)
+			if removeErr != nil || syncErr != nil {
+				commitPhysical()
+			}
 		}
 	}()
 
@@ -1211,10 +1217,7 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 
 	// The accepted stage remains recoverable across every later error. Move its
 	// conservative reservation into committed usage before linking the source.
-	q.mu.Lock()
-	q.commitPhysicalLocked(physicalHeld)
-	q.mu.Unlock()
-	physicalHeld = 0
+	commitPhysical()
 
 	storeErr := q.storeReady(&linked)
 	if storeErr != nil && linked.Revision == source.Revision {
@@ -1544,7 +1547,7 @@ func (q *Queue) Retry(envelope *Envelope) error {
 		return err
 	}
 
-	release, err := q.holdPhysical(disk.AllocationSize(int64(len(meta))+disk.AllocationSize(0))+disk.AllocationSize(0), true)
+	release, err := q.holdPhysical(disk.AllocationSize(int64(len(meta))+disk.AllocationSize(0))+disk.AllocationSize(0), false)
 	if err != nil {
 		publish()
 		return err

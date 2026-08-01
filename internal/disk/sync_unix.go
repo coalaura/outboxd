@@ -29,7 +29,7 @@ func Sync(path string) error {
 		return err
 	}
 
-	h := currentHooks()
+	h = currentHooks()
 	if h.AfterSyncDir != nil {
 		return h.AfterSyncDir(path)
 	}
