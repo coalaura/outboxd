@@ -58,14 +58,7 @@ func (d *Deliverer) ensureDSN(envelope *queue.Envelope) error {
 		return fmt.Errorf("dsn recipient domain: %w", err)
 	}
 
-	needUTF8 := false
-
-	for i := 0; i < len(envelope.Sender); i++ {
-		if envelope.Sender[i] >= 0x80 {
-			needUTF8 = true
-			break
-		}
-	}
+	needUTF8 := dsnReportUTF8(envelope)
 
 	// EightBit is required only when transmitted bytes contain high-bit octets,
 	// not merely because a part declares an 8bit transfer encoding.
@@ -153,6 +146,18 @@ func buildDSN(hostname string, env *queue.Envelope, original []byte) ([]byte, er
 	}
 
 	now := time.Now().UTC()
+	arrival := env.Created.UTC()
+	global := dsnReportUTF8(env)
+	reportType := "delivery-status"
+	statusMediaType := "message/delivery-status"
+	addressType := "rfc822"
+	originalMediaType := "message/rfc822"
+	if global {
+		reportType = "global-delivery-status"
+		statusMediaType = "message/global-delivery-status"
+		addressType = "utf-8"
+		originalMediaType = "message/global"
+	}
 	msgID := fmt.Sprintf("<%s@%s>", dsnEnvelopeID(env.ID, env.Incarnation, env.DSNGeneration), hostname)
 
 	var human bytes.Buffer
@@ -166,12 +171,12 @@ func buildDSN(hostname string, env *queue.Envelope, original []byte) ([]byte, er
 
 	var report bytes.Buffer
 	fmt.Fprintf(&report, "Reporting-MTA: dns; %s\r\n", hostname)
-	fmt.Fprintf(&report, "Arrival-Date: %s\r\n", now.Format(time.RFC1123Z))
+	fmt.Fprintf(&report, "Arrival-Date: %s\r\n", arrival.Format(time.RFC1123Z))
 	fmt.Fprintf(&report, "X-Original-Envelope-ID: %s\r\n", env.ID)
 
 	for _, r := range failed {
 		report.WriteString("\r\n")
-		fmt.Fprintf(&report, "Final-Recipient: rfc822; %s\r\n", r.Address)
+		fmt.Fprintf(&report, "Final-Recipient: %s; %s\r\n", addressType, r.Address)
 		report.WriteString("Action: failed\r\n")
 		fmt.Fprintf(&report, "Status: %s\r\n", dsnStatus(r))
 
@@ -199,7 +204,7 @@ func buildDSN(hostname string, env *queue.Envelope, original []byte) ([]byte, er
 	fmt.Fprintf(&out, "Date: %s\r\n", now.Format(time.RFC1123Z))
 	fmt.Fprintf(&out, "Message-ID: %s\r\n", msgID)
 	out.WriteString("MIME-Version: 1.0\r\n")
-	fmt.Fprintf(&out, "Content-Type: multipart/report; report-type=delivery-status;\r\n\tboundary=\"%s\"\r\n", boundary)
+	fmt.Fprintf(&out, "Content-Type: multipart/report; report-type=%s;\r\n\tboundary=\"%s\"\r\n", reportType, boundary)
 	out.WriteString("Auto-Submitted: auto-replied\r\n")
 	out.WriteString("\r\n")
 
@@ -214,7 +219,7 @@ func buildDSN(hostname string, env *queue.Envelope, original []byte) ([]byte, er
 	}
 
 	fmt.Fprintf(&out, "\r\n--%s\r\n", boundary)
-	out.WriteString("Content-Type: message/delivery-status\r\n")
+	fmt.Fprintf(&out, "Content-Type: %s\r\n", statusMediaType)
 	out.WriteString("Content-Description: Delivery report\r\n\r\n")
 	out.Write(report.Bytes())
 
@@ -223,7 +228,7 @@ func buildDSN(hostname string, env *queue.Envelope, original []byte) ([]byte, er
 	}
 
 	fmt.Fprintf(&out, "\r\n--%s\r\n", boundary)
-	out.WriteString("Content-Type: message/rfc822\r\n")
+	fmt.Fprintf(&out, "Content-Type: %s\r\n", originalMediaType)
 	out.WriteString("Content-Description: Undelivered Message\r\n\r\n")
 	out.Write(orig)
 
@@ -234,6 +239,31 @@ func buildDSN(hostname string, env *queue.Envelope, original []byte) ([]byte, er
 	fmt.Fprintf(&out, "\r\n--%s--\r\n", boundary)
 
 	return out.Bytes(), nil
+}
+
+func dsnReportUTF8(env *queue.Envelope) bool {
+	if env.SMTPUTF8 || hasHighOctet(env.Sender) {
+		return true
+	}
+
+	for i := range env.Recipients {
+		r := &env.Recipients[i]
+		if r.Status == queue.StatusFailed && (hasHighOctet(r.Address) || hasHighOctet(r.Detail)) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func hasHighOctet(value string) bool {
+	for i := 0; i < len(value); i++ {
+		if value[i] >= 0x80 {
+			return true
+		}
+	}
+
+	return false
 }
 
 func dsnStatus(r queue.Recipient) string {

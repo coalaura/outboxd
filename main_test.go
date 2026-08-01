@@ -112,6 +112,129 @@ func TestRunCheckDoesNotGenerateMissingDKIMKey(t *testing.T) {
 	}
 }
 
+func TestProvisionCreatesDKIMKeyOnce(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yml")
+
+	if err := provision(configPath); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.LoadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keyPath, err := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err = os.Stat(keyPath); !os.IsNotExist(err) {
+		t.Fatalf("first provision must stop after creating config: %v", err)
+	}
+
+	if err = provision(configPath); err != nil {
+		t.Fatal(err)
+	}
+
+	before, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err = provision(configPath); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(after) != string(before) {
+		t.Fatal("repeated provision replaced DKIM identity")
+	}
+}
+
+func TestServeDoesNotGenerateMissingDKIMKeyOrReplaceDNS(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	cfg, _, err := config.EnsurePath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hash, err := passwd.Hash("test-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.Server.Hostname = "mail.example.com"
+	cfg.Server.Domain = "example.com"
+	cfg.DNS.PublicIPv4 = "203.0.113.10"
+	cfg.TLS.AllowSelfSignedServing = true
+	cfg.Users = []config.User{{Username: "alice", PasswordHash: hash, AllowedSenders: []string{"alice@example.com"}, Enabled: true}}
+	if err = cfg.Init(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err = cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	dnsPath, err := cfg.ResolveGeneratedPath(cfg.DNS.OutputFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err = disk.Write(dnsPath, []byte("published identity\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	provisionOwnershipFiles(t, cfg)
+
+	keyPath, err := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = serve(path)
+	if err == nil || !strings.Contains(err.Error(), "DKIM") {
+		t.Fatalf("serve with missing DKIM key error=%v", err)
+	}
+
+	if _, err = os.Stat(keyPath); !os.IsNotExist(err) {
+		t.Fatalf("serve generated missing DKIM key: %v", err)
+	}
+
+	body, err := os.ReadFile(dnsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(body) != "published identity\n" {
+		t.Fatalf("serve replaced DNS output: %q", body)
+	}
+}
+
+func TestServeMissingConfigDoesNotCreateIt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "missing.yml")
+
+	err := serve(path)
+	if err == nil {
+		t.Fatal("serve with missing config succeeded")
+	}
+
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("serve created missing config: %v", statErr)
+	}
+
+	if _, statErr := os.Stat(path + ".outboxd.lock"); !os.IsNotExist(statErr) {
+		t.Fatalf("serve created ownership lock for missing config: %v", statErr)
+	}
+}
+
 func TestRunCheckMissingTLSDoesNotMutateFilesystem(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
@@ -195,6 +318,22 @@ func filesystemSnapshot(t *testing.T, root string) []string {
 	return snapshot
 }
 
+func provisionOwnershipFiles(t *testing.T, cfg *config.Config) {
+	t.Helper()
+	if err := disk.Mkdir(cfg.ResolvePath("queue")); err != nil {
+		t.Fatal(err)
+	}
+
+	lock, err := disk.Lock(cfg.Path() + ".outboxd.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err = lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestEscapeControl(t *testing.T) {
 	got := escapeControl("a\n\tb")
 	if got != `a\x0a\x09b` {
@@ -203,7 +342,7 @@ func TestEscapeControl(t *testing.T) {
 }
 
 func TestServeLocksQueueBeforeGeneratingAssets(t *testing.T) {
-	// serve must take exclusive queue ownership before writing DKIM/TLS/DNS assets.
+	// serve must take exclusive queue ownership before writing TLS assets.
 	cfgDir := t.TempDir()
 	hash, err := passwd.Hash("test-password-123")
 	if err != nil {
@@ -239,6 +378,12 @@ func TestServeLocksQueueBeforeGeneratingAssets(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	_, _, err = sign.Ensure(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisionOwnershipFiles(t, cfg)
+
 	held, err := queue.Open(cfg.ResolvePath("queue"), queue.Limits{})
 	if err != nil {
 		t.Fatal(err)
@@ -246,12 +391,11 @@ func TestServeLocksQueueBeforeGeneratingAssets(t *testing.T) {
 
 	defer held.Close()
 
-	dkimKey := cfg.ResolvePath(cfg.DKIM.PrivateKeyFile)
 	tlsCert := cfg.ResolvePath(cfg.TLS.CertificateFile)
 	tlsKey := cfg.ResolvePath(cfg.TLS.PrivateKeyFile)
 	dnsOut := cfg.ResolvePath(cfg.DNS.OutputFile)
 
-	for _, p := range []string{dkimKey, tlsCert, tlsKey, dnsOut} {
+	for _, p := range []string{tlsCert, tlsKey, dnsOut} {
 
 		_, err = os.Stat(p)
 		if !os.IsNotExist(err) {
@@ -264,7 +408,7 @@ func TestServeLocksQueueBeforeGeneratingAssets(t *testing.T) {
 		t.Fatalf("serve want ErrLocked, got %v", err)
 	}
 
-	for _, p := range []string{dkimKey, tlsCert, tlsKey, dnsOut} {
+	for _, p := range []string{tlsCert, tlsKey, dnsOut} {
 
 		_, err = os.Stat(p)
 		if !os.IsNotExist(err) {

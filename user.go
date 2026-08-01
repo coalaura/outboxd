@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/coalaura/outboxd/internal/config"
@@ -45,7 +46,7 @@ func user(configPath string, arguments []string) error {
 		Enabled:        true,
 	}
 
-	cfg, created, err := loadConfig(configPath)
+	cfg, created, err := ensureConfig(configPath)
 	if err != nil {
 		return err
 	}
@@ -61,7 +62,7 @@ func user(configPath string, arguments []string) error {
 
 	var out strings.Builder
 	out.Grow(256)
-	fmt.Fprintf(&out, "Added user %q to %q\n", escapeControl(entry.Username), cfg.Path())
+	fmt.Fprintf(&out, "Added user %q to %q. Restart outboxd for this change to take effect.\n", escapeControl(entry.Username), cfg.Path())
 
 	if generated {
 		fmt.Fprintf(&out, "\nGenerated password (store it now; shown once):\n\n  %s\n", password)
@@ -143,11 +144,5 @@ func readPassword(r io.Reader, maxBytes int) (string, error) {
 }
 
 func containsByte(b []byte, c byte) bool {
-	for _, x := range b {
-		if x == c {
-			return true
-		}
-	}
-
-	return false
+	return slices.Contains(b, c)
 }

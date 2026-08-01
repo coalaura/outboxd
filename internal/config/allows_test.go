@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 type allowedSenderCase struct {
 	addr string
@@ -54,5 +57,16 @@ func TestUserValidateWildcardSender(t *testing.T) {
 
 	if !u.Allows("someone@example.com") {
 		t.Fatal("wildcard should match")
+	}
+}
+
+func TestAllowedSenderUsesStrictMailboxLimits(t *testing.T) {
+	u := User{
+		Username:       "alice",
+		PasswordHash:   "$argon2id$placeholder",
+		AllowedSenders: []string{strings.Repeat("a", 65) + "@example.com"},
+	}
+	if err := u.Validate(); err == nil {
+		t.Fatal("overlong configured sender accepted")
 	}
 }

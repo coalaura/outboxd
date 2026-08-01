@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coalaura/outboxd/internal/passwd"
 	"github.com/coalaura/outboxd/internal/queue"
@@ -60,7 +61,7 @@ tls:
 dkim:
   selector: mail
   private_key_file: dkim/mail.key
-  headers: [From]
+  headers: [From, Sender]
 delivery:
   tls_mode: opportunistic
   max_attempts: 5
@@ -109,7 +110,7 @@ tls:
 dkim:
   selector: mail
   private_key_file: dkim/mail.key
-  headers: [From]
+  headers: [From, Sender]
 delivery:
   max_attempts: 5
   maximum_lifetime: 24h
@@ -317,6 +318,178 @@ func TestResourceBoundaries(t *testing.T) {
 	err = max.Validate()
 	if err != nil {
 		t.Fatalf("inclusive maximum boundaries invalid: %v", err)
+	}
+}
+
+func TestRateAndBurstBoundaries(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	tests := []struct {
+		name string
+		max  int
+		set  func(*Config, int)
+		zero bool
+	}{
+		{"message rate", MaxMessagesPerHour, func(c *Config, value int) { c.Server.MaxMessagesPerHour = value }, false},
+		{"recipient rate", MaxRecipientsPerHour, func(c *Config, value int) { c.Server.MaxRecipientsPerHour = value }, false},
+		{"message burst", MaxMessageBurst, func(c *Config, value int) {
+			c.Server.MaxMessagesPerHour = MaxMessagesPerHour
+			c.Server.MessageBurst = value
+		}, true},
+		{"recipient burst", MaxRecipientBurst, func(c *Config, value int) {
+			c.Server.MaxRecipientsPerHour = MaxRecipientsPerHour
+			c.Server.RecipientBurst = value
+		}, true},
+	}
+
+	for _, tt := range tests {
+		for _, boundary := range []struct {
+			name  string
+			value int
+			valid bool
+		}{
+			{"negative", -1, false},
+			{"zero", 0, tt.zero},
+			{"maximum", tt.max, true},
+			{"maximum plus one", tt.max + 1, false},
+			{"integer maximum", maxInt, false},
+		} {
+			t.Run(tt.name+"/"+boundary.name, func(t *testing.T) {
+				cfg := Default()
+				tt.set(cfg, boundary.value)
+
+				err := cfg.Validate()
+				if (err == nil) != boundary.valid {
+					t.Fatalf("value=%d valid=%v err=%v", boundary.value, boundary.valid, err)
+				}
+			})
+		}
+	}
+}
+
+func TestDeliveryAttemptBoundaries(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		value int
+		valid bool
+	}{
+		{"negative", -1, false},
+		{"zero", 0, false},
+		{"maximum", MaxDeliveryAttempts, true},
+		{"maximum plus one", MaxDeliveryAttempts + 1, false},
+		{"integer maximum", int(^uint(0) >> 1), false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Default()
+			cfg.Delivery.MaxAttempts = tt.value
+
+			err := cfg.Validate()
+			if (err == nil) != tt.valid {
+				t.Fatalf("value=%d valid=%v err=%v", tt.value, tt.valid, err)
+			}
+		})
+	}
+}
+
+func TestDurationBoundaries(t *testing.T) {
+	tests := []struct {
+		name string
+		max  time.Duration
+		set  func(*Config, string)
+	}{
+		{"server read", MaxSMTPReadTimeout, func(c *Config, value string) { c.Server.ReadTimeout = value }},
+		{"server write", MaxSMTPWriteTimeout, func(c *Config, value string) { c.Server.WriteTimeout = value }},
+		{"dead retention", MaxDeadRetention, func(c *Config, value string) { c.Server.DeadRetention = value }},
+		{"corrupt retention", MaxCorruptRetention, func(c *Config, value string) { c.Server.CorruptRetention = value }},
+		{"delivery lifetime", MaxDeliveryLifetime, func(c *Config, value string) { c.Delivery.MaximumLifetime = value }},
+		{"initial retry", MaxInitialRetryDelay, func(c *Config, value string) {
+			c.Delivery.InitialRetryDelay = value
+			c.Delivery.MaximumRetryDelay = MaxInitialRetryDelay.String()
+		}},
+		{"maximum retry", MaxRetryDelay, func(c *Config, value string) {
+			c.Delivery.MaximumRetryDelay = value
+			c.Delivery.MaximumLifetime = MaxRetryDelay.String()
+		}},
+		{"delivery connection", MaxDeliveryConnectionTimeout, func(c *Config, value string) { c.Delivery.ConnectionTimeout = value }},
+		{"delivery command", MaxDeliveryCommandTimeout, func(c *Config, value string) { c.Delivery.CommandTimeout = value }},
+		{"delivery submission", MaxDeliverySubmissionTimeout, func(c *Config, value string) { c.Delivery.SubmissionTimeout = value }},
+	}
+
+	for _, tt := range tests {
+		for _, boundary := range []struct {
+			name  string
+			value string
+			valid bool
+		}{
+			{"negative", "-1ns", false},
+			{"zero", "0s", false},
+			{"maximum", tt.max.String(), true},
+			{"maximum plus one", (tt.max + time.Nanosecond).String(), false},
+			{"overflow adjacent", "2562048h", false},
+		} {
+			t.Run(tt.name+"/"+boundary.name, func(t *testing.T) {
+				cfg := Default()
+				tt.set(cfg, boundary.value)
+
+				err := cfg.Validate()
+				if (err == nil) != boundary.valid {
+					t.Fatalf("value=%q valid=%v err=%v", boundary.value, boundary.valid, err)
+				}
+			})
+		}
+	}
+}
+
+func TestResourceRelationships(t *testing.T) {
+	tests := []resourceBoundaryCase{
+		{"message burst exceeds rate", func(c *Config) {
+			c.Server.MaxMessagesPerHour = 10
+			c.Server.MessageBurst = 11
+		}},
+		{"recipient burst exceeds rate", func(c *Config) {
+			c.Server.MaxRecipientsPerHour = 10
+			c.Server.RecipientBurst = 11
+		}},
+		{"submission shorter than command", func(c *Config) {
+			c.Delivery.CommandTimeout = "2m"
+			c.Delivery.SubmissionTimeout = "1m"
+		}},
+		{"connection longer than command", func(c *Config) {
+			c.Delivery.ConnectionTimeout = "2m"
+			c.Delivery.CommandTimeout = "1m"
+		}},
+		{"connection exceeds lifetime", func(c *Config) {
+			c.Delivery.MaximumLifetime = "1m"
+			c.Delivery.InitialRetryDelay = "1s"
+			c.Delivery.MaximumRetryDelay = "1s"
+			c.Delivery.ConnectionTimeout = "2m"
+			c.Delivery.CommandTimeout = "1m"
+			c.Delivery.SubmissionTimeout = "1m"
+		}},
+		{"command exceeds lifetime", func(c *Config) {
+			c.Delivery.MaximumLifetime = "1m"
+			c.Delivery.InitialRetryDelay = "1s"
+			c.Delivery.MaximumRetryDelay = "1s"
+			c.Delivery.CommandTimeout = "2m"
+			c.Delivery.SubmissionTimeout = "2m"
+		}},
+		{"submission exceeds lifetime", func(c *Config) {
+			c.Delivery.MaximumLifetime = "1m"
+			c.Delivery.InitialRetryDelay = "1s"
+			c.Delivery.MaximumRetryDelay = "1s"
+			c.Delivery.CommandTimeout = "1m"
+			c.Delivery.SubmissionTimeout = "2m"
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Default()
+			tt.set(cfg)
+
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("expected validation failure")
+			}
+		})
 	}
 }
 
@@ -594,5 +767,18 @@ func TestValidatePHCViaUser(t *testing.T) {
 	err := cfg.Validate()
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDKIMHeadersRequireSender(t *testing.T) {
+	cfg := Default()
+	cfg.Server.Hostname = "mail.example.com"
+	cfg.Server.Domain = "example.com"
+	cfg.DKIM.Headers = []string{"From"}
+	cfg.initializeRuntime()
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "must contain Sender") {
+		t.Fatalf("err=%v", err)
 	}
 }

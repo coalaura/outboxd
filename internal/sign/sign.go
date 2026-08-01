@@ -29,7 +29,8 @@ type Signer struct {
 	PublicKey string
 }
 
-// Ensure loads the DKIM key, generating one when it does not exist yet.
+// Ensure explicitly provisions the DKIM key, generating it only when it does
+// not exist yet. Operational paths must use Load instead.
 func Ensure(cfg *config.Config) (*Signer, bool, error) {
 	path, err := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
 	if err != nil {

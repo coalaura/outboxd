@@ -63,9 +63,11 @@ const (
 
 	// Account conservatively for ReadAll capacity growth, newline normalization
 	// up to twice the input size, prepared output, and the signed copy.
-	dataMemoryBudget   = int64(512 << 20)
-	dataMemoryCopies   = int64(8)
-	dataMemoryOverhead = int64(1 << 20)
+	dataMemoryBudget = int64(512 << 20)
+	dataMemoryCopies = int64(8)
+	// Include bounded field/slice/map/string bookkeeping in addition to buffers.
+	dataParserOverhead = int64(1000 * 128)
+	dataMemoryOverhead = int64(1<<20) + dataParserOverhead
 	maxDataWorkers     = 8
 	defaultDataTimeout = 5 * time.Minute
 )
@@ -87,9 +89,10 @@ type Server struct {
 	signer *sign.Signer
 	log    Logger
 
-	connLimit *connectionLimiter
-	authLimit *authLimiter
-	rates     *submissionLimiter
+	connLimit   *connectionLimiter
+	connections *connectionTracker
+	authLimit   *authLimiter
+	rates       *submissionLimiter
 
 	// Bound concurrent Argon2id derivations (worker slots).
 	hashing chan struct{}
@@ -133,15 +136,16 @@ func New(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signer, spool *q
 	}
 
 	srv := &Server{
-		cfg:       cfg,
-		queue:     spool,
-		signer:    signer,
-		log:       log,
-		connLimit: newConnectionLimiter(cfg.Server.MaxConnections, cfg.Server.MaxConnectionsPerIP),
-		authLimit: newAuthLimiter(),
-		rates:     newSubmissionLimiter(cfg.Server.MaxMessagesPerHour, cfg.Server.MaxRecipientsPerHour, msgBurst, rcptBurst),
-		hashing:   make(chan struct{}, authWorkers),
-		dataWork:  make(chan struct{}, dataWorkers),
+		cfg:         cfg,
+		queue:       spool,
+		signer:      signer,
+		log:         log,
+		connLimit:   newConnectionLimiter(cfg.Server.MaxConnections, cfg.Server.MaxConnectionsPerIP),
+		connections: newConnectionTracker(),
+		authLimit:   newAuthLimiter(),
+		rates:       newSubmissionLimiter(cfg.Server.MaxMessagesPerHour, cfg.Server.MaxRecipientsPerHour, msgBurst, rcptBurst),
+		hashing:     make(chan struct{}, authWorkers),
+		dataWork:    make(chan struct{}, dataWorkers),
 	}
 
 	srv.starttls = srv.newSMTP(cfg, keeper)
@@ -188,10 +192,7 @@ func burstDefault(hourly int) int {
 		return 1
 	}
 
-	b := hourly / 60
-	if b < 1 {
-		b = 1
-	}
+	b := max(hourly/60, 1)
 
 	if b > hourly {
 		b = hourly
@@ -204,7 +205,7 @@ func (s *Server) newSMTP(cfg *config.Config, keeper *certs.Keeper) *smtp.Server 
 	server := smtp.NewServer(smtp.BackendFunc(s.session))
 	server.Domain = cfg.Server.Hostname
 	server.TLSConfig = keeper.Config()
-	server.MaxMessageBytes = incrementLimit(cfg.Server.MaxMessageBytes)
+	server.MaxMessageBytes = cfg.Server.MaxMessageBytes
 	server.MaxRecipients = cfg.Server.MaxRecipients
 	server.ReadTimeout = config.Duration(cfg.Server.ReadTimeout)
 	server.WriteTimeout = config.Duration(cfg.Server.WriteTimeout)
@@ -359,6 +360,8 @@ func (s *Server) Run(ctx context.Context) error {
 				}
 			}
 
+			s.connections.closeAll()
+
 			// Ensure accept loops unblock even if Shutdown times out.
 			if s.starttlsListener != nil {
 				_ = s.starttlsListener.Close()
@@ -390,11 +393,13 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	if s.starttlsListener != nil {
-		serveOne("starttls", newLimitListener(s.starttlsListener, s.connLimit), s.starttls)
+		ln := newTrackListener(newLimitListener(s.starttlsListener, s.connLimit), s.connections)
+		serveOne("starttls", ln, s.starttls)
 	}
 
 	if s.implicitListener != nil {
-		ln := tls.NewListener(newLimitListener(s.implicitListener, s.connLimit), s.implicit.TLSConfig)
+		tracked := newTrackListener(newLimitListener(s.implicitListener, s.connLimit), s.connections)
+		ln := tls.NewListener(tracked, s.implicit.TLSConfig)
 		serveOne("implicit", ln, s.implicit)
 	}
 

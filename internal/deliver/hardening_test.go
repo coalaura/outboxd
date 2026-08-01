@@ -4,9 +4,12 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode"
@@ -19,6 +22,39 @@ type enhancedCodeCase struct {
 	code    int
 	message string
 	want    string
+}
+
+type domainErrorResolver struct{}
+
+func (domainErrorResolver) LookupMX(_ context.Context, name string) ([]*net.MX, error) {
+	return nil, errors.New("temporary DNS failure for " + name)
+}
+
+func (domainErrorResolver) LookupNetIP(context.Context, string, string) ([]net.IP, error) {
+	return nil, errors.New("unexpected address lookup")
+}
+
+type captureLog struct {
+	mu    sync.Mutex
+	lines strings.Builder
+}
+
+func (l *captureLog) Printf(format string, values ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	fmt.Fprintf(&l.lines, format, values...)
+}
+
+func (l *captureLog) Println(values ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	fmt.Fprintln(&l.lines, values...)
+}
+
+func (l *captureLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.lines.String()
 }
 
 func servePlainSMTP(conn net.Conn, accepted chan<- struct{}, dataBytes chan<- string) {
@@ -96,10 +132,26 @@ func TestAttemptCancellationDoesNotConsumeFinalAttempt(t *testing.T) {
 	started := make(chan struct{})
 	d.SetDialer(dialFn(func(context.Context, string, string) (net.Conn, error) {
 		client, server := net.Pipe()
-		close(started)
 		go func() {
 			defer server.Close()
-			_, _ = server.Read(make([]byte, 1))
+			_, _ = io.WriteString(server, "220 mx\r\n")
+			r := bufio.NewReader(server)
+			for {
+				line, err := r.ReadString('\n')
+				if err != nil {
+					return
+				}
+				switch {
+				case strings.HasPrefix(line, "EHLO"):
+					_, _ = io.WriteString(server, "250 mx\r\n")
+				case strings.HasPrefix(line, "MAIL"):
+					_, _ = io.WriteString(server, "250 ok\r\n")
+				case strings.HasPrefix(line, "RCPT"):
+					close(started)
+					_, _ = server.Read(make([]byte, 1))
+					return
+				}
+			}
 		}()
 		return client, nil
 	}))
@@ -129,6 +181,9 @@ func TestAttemptCancellationDoesNotConsumeFinalAttempt(t *testing.T) {
 
 	if got.Attempts != 0 || got.Recipients[0].Status != queue.StatusPending {
 		t.Fatalf("attempts=%d recipient=%+v", got.Attempts, got.Recipients[0])
+	}
+	if got.Recipients[0].Detail != "" || got.LastError != "" {
+		t.Fatalf("cancellation diagnostics persisted: recipient=%q last=%q", got.Recipients[0].Detail, got.LastError)
 	}
 
 	if got.NextAttempt.After(time.Now()) {
@@ -237,14 +292,410 @@ func TestDataCopyErrorAbortsWithoutTerminator(t *testing.T) {
 	env := hardeningEnvelope("copy-error", time.Now(), queue.Recipient{
 		Address: "r@ex.com", Domain: "ex.com", Status: queue.StatusPending,
 	})
+	env.Size = 100
 	_, err = d.send(context.Background(), env, "mx.ex.com", []int{0})
-	if err == nil {
-		t.Fatal("expected body read error")
+	if err == nil || err.Error() != "spool read failed" {
+		t.Fatalf("body read error=%v", err)
 	}
 
 	got := <-data
 	if strings.Contains(got, "\r\n.\r\n") || strings.HasSuffix(got, ".\r\n") {
 		t.Fatalf("DATA terminator was sent: %q", got)
+	}
+}
+
+func TestDataLengthMismatchAbortsWithoutTerminator(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		body string
+		want error
+	}{
+		{name: "short", body: "four", want: errBodyTooShort},
+		{name: "long", body: "sixsix", want: errBodyTooLong},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			q, err := queue.Open(t.TempDir(), queue.Limits{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = q.Close() })
+
+			d := New(testDeliverCfg(), q, nopLogger{})
+			ip := net.ParseIP("127.0.0.1")
+			d.SetResolver(&fixedResolver{
+				mx: map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com."}}}, ips: map[string][]net.IP{"mx.ex.com": {ip}},
+			})
+			data := make(chan string, 1)
+			d.SetDialer(dialFn(func(context.Context, string, string) (net.Conn, error) {
+				client, server := net.Pipe()
+				go servePlainSMTP(server, nil, data)
+				return client, nil
+			}))
+			d.reader = func(string) (io.ReadCloser, error) {
+				return io.NopCloser(strings.NewReader(tt.body)), nil
+			}
+			env := hardeningEnvelope("length-"+tt.name, time.Now(), queue.Recipient{
+				Address: "r@ex.com", Domain: "ex.com", Status: queue.StatusPending,
+			})
+			env.Size = 5
+
+			_, err = d.send(context.Background(), env, "mx.ex.com", []int{0})
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("send error=%v want %v", err, tt.want)
+			}
+
+			got := <-data
+			if strings.Contains(got, "\r\n.\r\n") || strings.HasSuffix(got, ".\r\n") {
+				t.Fatalf("DATA terminator was sent: %q", got)
+			}
+		})
+	}
+}
+
+func TestRunDomainAdmissionFairAtMinimumAttemptCapacity(t *testing.T) {
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+
+	cfg := testDeliverCfg()
+	cfg.Delivery.DomainConcurrency = 1
+	cfg.Delivery.GlobalConcurrency = 2
+	cfg.Delivery.CommandTimeout = "30s"
+	d := New(cfg, q, nopLogger{})
+	d.admission = 10 * time.Millisecond
+	if cap(d.active) != 8 {
+		t.Fatalf("attempt capacity=%d want 8", cap(d.active))
+	}
+
+	hotIP := net.ParseIP("127.0.0.1")
+	coldIP := net.ParseIP("127.0.0.2")
+	d.SetResolver(&fixedResolver{
+		mx: map[string][]*net.MX{
+			"hot.test":  {{Host: "mx.hot.test."}},
+			"cold.test": {{Host: "mx.cold.test."}},
+		},
+		ips: map[string][]net.IP{"mx.hot.test": {hotIP}, "mx.cold.test": {coldIP}},
+	})
+
+	coldAccepted := make(chan struct{}, 1)
+	var hotDials atomic.Int32
+	var hotOnce sync.Once
+	hotStarted := make(chan struct{})
+	d.SetDialer(dialFn(func(_ context.Context, _ string, address string) (net.Conn, error) {
+		client, server := net.Pipe()
+		host, _, _ := net.SplitHostPort(address)
+		if host == hotIP.String() {
+			hotDials.Add(1)
+			hotOnce.Do(func() { close(hotStarted) })
+			go func() {
+				defer server.Close()
+				_, _ = server.Read(make([]byte, 1))
+			}()
+		} else {
+			go servePlainSMTP(server, coldAccepted, nil)
+		}
+		return client, nil
+	}))
+
+	now := time.Now()
+	for i := 0; i < cap(d.active); i++ {
+		env := hardeningEnvelope(fmt.Sprintf("hot-%02d", i), now, queue.Recipient{
+			Address: "r@hot.test", Domain: "hot.test", Status: queue.StatusPending,
+		})
+		if err := q.Add(env, []byte("body\r\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cold := hardeningEnvelope("cold", now, queue.Recipient{
+		Address: "r@cold.test", Domain: "cold.test", Status: queue.StatusPending,
+	})
+	if err := q.Add(cold, []byte("body\r\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+	select {
+	case <-hotStarted:
+	case <-time.After(time.Second):
+		cancel()
+		<-done
+		t.Fatal("hot-domain attempt did not start")
+	}
+	select {
+	case <-coldAccepted:
+	case <-time.After(2 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("cold domain was starved by hot-domain waiters")
+	}
+	if got := hotDials.Load(); got != 1 {
+		cancel()
+		<-done
+		t.Fatalf("hot-domain dials=%d want 1", got)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < cap(d.active); i++ {
+		ctx, stop := context.WithTimeout(context.Background(), time.Second)
+		env, err := q.Next(ctx)
+		stop()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if env.Attempts != 0 {
+			t.Fatalf("admission/cancellation consumed attempt for %s: %d", env.ID, env.Attempts)
+		}
+	}
+}
+
+func TestRunMixedDomainAdmissionDoesNotCaptureLaterDomainCapacity(t *testing.T) {
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+
+	cfg := testDeliverCfg()
+	cfg.Delivery.DomainConcurrency = 1
+	cfg.Delivery.CommandTimeout = "30s"
+	d := New(cfg, q, nopLogger{})
+	firstIP := net.ParseIP("127.0.0.1")
+	d.SetResolver(&fixedResolver{
+		mx: map[string][]*net.MX{
+			"first.test": {{Host: "mx.first.test."}},
+			"later.test": {{Host: "mx.later.test."}},
+		},
+		ips: map[string][]net.IP{
+			"mx.first.test": {firstIP},
+			"mx.later.test": {net.ParseIP("127.0.0.2")},
+		},
+	})
+	firstStarted := make(chan struct{})
+	d.SetDialer(dialFn(func(context.Context, string, string) (net.Conn, error) {
+		client, server := net.Pipe()
+		close(firstStarted)
+		go func() {
+			defer server.Close()
+			_, _ = server.Read(make([]byte, 1))
+		}()
+		return client, nil
+	}))
+
+	now := time.Now()
+	env := hardeningEnvelope("mixed-admission", now,
+		queue.Recipient{Address: "a@first.test", Domain: "first.test", Status: queue.StatusPending},
+		queue.Recipient{Address: "b@later.test", Domain: "later.test", Status: queue.StatusPending},
+	)
+	if err := q.Add(env, []byte("body\r\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		cancel()
+		<-done
+		t.Fatal("first domain did not start")
+	}
+
+	if !d.domains.tryAcquire("later.test") {
+		cancel()
+		<-done
+		t.Fatal("slow first domain captured later domain capacity")
+	}
+	d.domains.release("later.test")
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAttemptTemporaryFirstDomainAndBusyLaterConsumesAttemptWithBackoff(t *testing.T) {
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+
+	cfg := testDeliverCfg()
+	cfg.Delivery.DomainConcurrency = 1
+	cfg.Delivery.InitialRetryDelay = "1h"
+	cfg.Delivery.MaximumRetryDelay = "1h"
+	d := New(cfg, q, nopLogger{})
+	d.SetResolver(domainErrorResolver{})
+	if !d.domains.tryAcquire("busy.test") {
+		t.Fatal("failed to reserve busy domain")
+	}
+
+	now := time.Now()
+	env := &queue.Envelope{
+		ID: "later-domain-contention", Username: "u", Sender: "sender@example.com",
+		Recipients: []queue.Recipient{
+			{Address: "a@temporary.test", Domain: "temporary.test", Status: queue.StatusPending},
+			{Address: "b@busy.test", Domain: "busy.test", Status: queue.StatusPending},
+		},
+		Created: now, NextAttempt: now,
+	}
+	if err := q.Add(env, []byte("body\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.attempt(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got.Attempts != 1 {
+		t.Fatalf("attempt accounting=%d want 1", got.Attempts)
+	}
+	if got.Recipients[0].Status != queue.StatusPending || !strings.Contains(got.Recipients[0].Detail, "temporary DNS failure") {
+		t.Fatalf("first domain outcome not preserved: %+v", got.Recipients[0])
+	}
+	if got.Recipients[1].Status != queue.StatusPending || got.Recipients[1].Detail != "" {
+		t.Fatalf("busy later domain was processed: %+v", got.Recipients[1])
+	}
+	if !strings.Contains(got.LastError, "temporary.test") || !strings.Contains(got.LastError, "busy.test: delivery concurrency unavailable") {
+		t.Fatalf("aggregate diagnostic=%q", got.LastError)
+	}
+	if got.NextAttempt.Before(now.Add(50 * time.Minute)) {
+		t.Fatalf("later-domain contention bypassed normal backoff: %s", got.NextAttempt.Sub(now))
+	}
+	d.domains.release("busy.test")
+}
+
+func TestAttemptAllTemporaryRCPTPreservesDetailsAndAggregateDiagnostic(t *testing.T) {
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+
+	cfg := testDeliverCfg()
+	log := new(captureLog)
+	d := New(cfg, q, log)
+	ip := net.ParseIP("127.0.0.1")
+	d.SetResolver(&fixedResolver{
+		mx:  map[string][]*net.MX{"temp.test": {{Host: "mx.temp.test."}}},
+		ips: map[string][]net.IP{"mx.temp.test": {ip}},
+	})
+	d.SetDialer(dialFn(func(context.Context, string, string) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			_, _ = io.WriteString(server, "220 mx\r\n")
+			r := bufio.NewReader(server)
+			for {
+				line, err := r.ReadString('\n')
+				if err != nil {
+					return
+				}
+				switch {
+				case strings.HasPrefix(line, "EHLO"):
+					_, _ = io.WriteString(server, "250 mx\r\n")
+				case strings.HasPrefix(line, "MAIL"):
+					_, _ = io.WriteString(server, "250 ok\r\n")
+				case strings.HasPrefix(line, "RCPT"):
+					_, _ = io.WriteString(server, "451 4.7.1 greylisted\r\n")
+				case strings.HasPrefix(line, "QUIT"):
+					_, _ = io.WriteString(server, "221 bye\r\n")
+					return
+				}
+			}
+		}()
+		return client, nil
+	}))
+
+	now := time.Now()
+	env := hardeningEnvelope("temporary-rcpt", now,
+		queue.Recipient{Address: "a@temp.test", Domain: "temp.test", Status: queue.StatusPending},
+		queue.Recipient{Address: "b@temp.test", Domain: "temp.test", Status: queue.StatusPending},
+	)
+	if err := q.Add(env, []byte("body\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.attempt(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, recipient := range got.Recipients {
+		if recipient.Status != queue.StatusPending || !strings.Contains(recipient.Detail, "451 4.7.1 greylisted") {
+			t.Fatalf("temporary recipient outcome not preserved: %+v", recipient)
+		}
+	}
+	for _, diagnostic := range []string{"temporary RCPT failures", "a@temp.test", "b@temp.test", "451 4.7.1 greylisted"} {
+		if !strings.Contains(got.LastError, diagnostic) {
+			t.Fatalf("LastError=%q missing %q", got.LastError, diagnostic)
+		}
+		if !strings.Contains(log.String(), diagnostic) {
+			t.Fatalf("log=%q missing %q", log.String(), diagnostic)
+		}
+	}
+}
+
+func TestAttemptPreservesPerDomainDiagnosticsAndAggregateLog(t *testing.T) {
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+
+	cfg := testDeliverCfg()
+	cfg.Delivery.MaxAttempts = 1
+	log := new(captureLog)
+	d := New(cfg, q, log)
+	d.SetResolver(domainErrorResolver{})
+	now := time.Now()
+	env := &queue.Envelope{
+		ID: "domain-diagnostics", Username: "u", Sender: "sender@example.com",
+		Recipients: []queue.Recipient{
+			{Address: "a@a.test", Domain: "a.test", Status: queue.StatusPending},
+			{Address: "b@b.test", Domain: "b.test", Status: queue.StatusPending},
+		},
+		Created: now, NextAttempt: now,
+	}
+	if err := q.Add(env, []byte("body\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.attempt(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(got.Recipients[0].Detail, "a.test") || strings.Contains(got.Recipients[0].Detail, "b.test") {
+		t.Fatalf("first recipient detail copied across domains: %q", got.Recipients[0].Detail)
+	}
+	if !strings.Contains(got.Recipients[1].Detail, "b.test") || strings.Contains(got.Recipients[1].Detail, "a.test") {
+		t.Fatalf("second recipient detail copied across domains: %q", got.Recipients[1].Detail)
+	}
+	for _, recipient := range got.Recipients {
+		if recipient.EnhancedCode != terminalEnhancedCode {
+			t.Fatalf("recipient missing exhaustion status: %+v", recipient)
+		}
+	}
+	if !strings.Contains(got.LastError, "a.test") || !strings.Contains(got.LastError, "b.test") {
+		t.Fatalf("aggregate diagnostic=%q", got.LastError)
+	}
+	if output := log.String(); !strings.Contains(output, "a.test") || !strings.Contains(output, "b.test") {
+		t.Fatalf("aggregate log missing domain diagnostics: %q", output)
 	}
 }
 
@@ -324,7 +775,7 @@ func TestAttemptSessionCappedAtQueueLifetime(t *testing.T) {
 		t.Fatal("queue lifetime did not cap session")
 	}
 
-	if got.Recipients[0].Status != queue.StatusFailed || got.Recipients[0].Detail != lifetimeDetail {
+	if got.Recipients[0].Status != queue.StatusFailed || got.Recipients[0].Detail != lifetimeDetail || got.Recipients[0].EnhancedCode != terminalEnhancedCode {
 		t.Fatalf("recipient=%+v", got.Recipients[0])
 	}
 }
@@ -366,7 +817,7 @@ func TestSMTPResponseBounds(t *testing.T) {
 			r := bufio.NewReader(server)
 			_, _ = r.ReadString('\n')
 
-			for i := 0; i < maxSMTPResponseBytes/8+1; i++ {
+			for range maxSMTPResponseBytes/8 + 1 {
 				_, err := io.WriteString(server, "250-xxx\r\n")
 				if err != nil {
 					return

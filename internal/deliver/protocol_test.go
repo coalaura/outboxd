@@ -156,12 +156,10 @@ func (mx *fakeMX) serve() {
 		mx.mu.Lock()
 		mx.sessions = append(mx.sessions, log)
 		mx.mu.Unlock()
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			mx.handle(c, log)
 			mx.sessionDone <- struct{}{}
-		}()
+		})
 	}
 }
 

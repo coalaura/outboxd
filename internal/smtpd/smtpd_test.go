@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"io"
 	"math"
 	"net"
 	"os"
@@ -30,6 +31,23 @@ type testLog struct{}
 func (testLog) Printf(string, ...any) {}
 func (testLog) Println(...any)        {}
 
+type pausedAcceptListener struct {
+	net.Listener
+	accepted chan struct{}
+	resume   chan struct{}
+}
+
+func (l *pausedAcceptListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	close(l.accepted)
+	<-l.resume
+	return conn, nil
+}
+
 func testServerParts(t *testing.T) (*config.Config, *certs.Keeper, *queue.Queue) {
 	t.Helper()
 	base := t.TempDir()
@@ -46,7 +64,7 @@ func testServerParts(t *testing.T) (*config.Config, *certs.Keeper, *queue.Queue)
 		"  submission_addr: \"127.0.0.1:0\"\n  implicit_tls_addr: \"127.0.0.1:0\"\n" +
 		"  max_connections: 16\n  max_connections_per_ip: 4\n  auth_workers: 2\n" +
 		"tls:\n  mode: self_signed\n  certificate_file: tls/server.crt\n  private_key_file: tls/server.key\n  minimum_version: \"1.2\"\n" +
-		"dkim:\n  selector: mail\n  private_key_file: dkim/mail.key\n  headers:\n    - From\n    - To\n    - Subject\n    - Date\n    - Message-ID\n" +
+		"dkim:\n  selector: mail\n  private_key_file: dkim/mail.key\n  headers:\n    - From\n    - Sender\n    - To\n    - Subject\n    - Date\n    - Message-ID\n" +
 		"delivery:\n  tls_mode: opportunistic\n  max_attempts: 3\n  maximum_lifetime: 1h\n  initial_retry_delay: 1s\n  maximum_retry_delay: 1m\n" +
 		"  domain_concurrency: 1\n  global_concurrency: 2\n  connection_timeout: 5s\n  command_timeout: 30s\n  submission_timeout: 1m\n" +
 		"dns:\n  dmarc_policy: none\n  output_file: dns-records.txt\n"
@@ -259,13 +277,83 @@ func TestGracefulShutdownTimeoutPath(t *testing.T) {
 		t.Fatal("Run must return deadline/timeout error; got nil")
 	}
 
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := br.ReadByte(); err == nil {
+		t.Fatal("active SMTP connection survived graceful shutdown timeout")
+	}
+
 	low := strings.ToLower(runErr.Error())
 	if !errors.Is(runErr, context.DeadlineExceeded) &&
 		!strings.Contains(low, "deadline") && !strings.Contains(low, "timeout") {
 		t.Fatalf("expected deadline/timeout in error, got %v", runErr)
 	}
 
-	_ = conn.Close()
+}
+
+func TestGracefulShutdownRejectsAcceptedConnectionBeforeTracking(t *testing.T) {
+	cfg, k, spool := testServerParts(t)
+	cfg.Server.DisableImplicitTLS = true
+	cfg.Server.ImplicitTLSAddr = ""
+	srv := New(cfg, k, nil, spool, testLog{})
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+
+	accepted := make(chan struct{})
+	resume := make(chan struct{})
+	srv.starttlsListener = &pausedAcceptListener{
+		Listener: srv.starttlsListener,
+		accepted: accepted,
+		resume:   resume,
+	}
+
+	shutdownComplete := make(chan struct{})
+	srv.shutdownContext = func(parent context.Context) (context.Context, context.CancelFunc) {
+		ctx, cancel := context.WithCancel(parent)
+		return ctx, func() {
+			cancel()
+			close(shutdownComplete)
+		}
+	}
+
+	entered := waitServeEntered(t, srv)
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- srv.Run(ctx) }()
+	awaitCh(t, entered, 3*time.Second, "serve entered")
+
+	conn, err := net.DialTimeout("tcp", srv.starttls.Addr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	awaitCh(t, accepted, 3*time.Second, "accepted connection")
+	cancel()
+	awaitCh(t, shutdownComplete, 3*time.Second, "successful graceful shutdown")
+	close(resume)
+
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		_ = conn.Close()
+		select {
+		case <-runDone:
+		case <-time.After(3 * time.Second):
+			t.Fatal("server did not exit after late connection cleanup")
+		}
+		t.Fatal("connection accepted before tracking survived successful graceful shutdown")
+	}
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run returned error after successful graceful shutdown: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return after rejecting late accepted connection")
+	}
 }
 
 func TestNoLeakedWaiterOnListenerFail(t *testing.T) {
@@ -277,8 +365,7 @@ func TestNoLeakedWaiterOnListenerFail(t *testing.T) {
 	}
 
 	entered := waitServeEntered(t, srv)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	done := make(chan error, 1)
 	go func() { done <- srv.Run(ctx) }()
 	awaitCh(t, entered, 3*time.Second, "serve entered")
@@ -309,6 +396,23 @@ func TestConnectionLimitSaturation(t *testing.T) {
 
 	if !lim.acquire("1.2.3.4") {
 		t.Fatal("after release")
+	}
+}
+
+func TestAllowDataTerminatorReaderGuards(t *testing.T) {
+	if err := allowDataTerminator(strings.NewReader("message"), 7); err == nil {
+		t.Fatal("unknown DATA reader was accepted")
+	}
+
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	if err := allowDataTerminator(reader, 7); err != nil {
+		t.Fatalf("BDAT pipe reader rejected: %v", err)
+	}
+
+	if err := allowDataTerminator(strings.NewReader("unlimited"), 0); err != nil {
+		t.Fatalf("unlimited reader rejected: %v", err)
 	}
 }
 

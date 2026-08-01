@@ -20,8 +20,16 @@ import (
 )
 
 const (
-	lifetimeDetail    = "maximum queue lifetime exceeded"
-	storageRetryDelay = 30 * time.Second
+	lifetimeDetail             = "maximum queue lifetime exceeded"
+	exhaustedDetail            = "delivery attempts exhausted"
+	terminalEnhancedCode       = "5.4.7"
+	storageRetryDelay          = 30 * time.Second
+	defaultAdmissionRetryDelay = 30 * time.Second
+)
+
+var (
+	errBodyTooShort = errors.New("queued body shorter than envelope size")
+	errBodyTooLong  = errors.New("queued body longer than envelope size")
 )
 
 // Logger receives operational messages.
@@ -124,7 +132,8 @@ type Deliverer struct {
 	// Production defaults to a light shuffle. Tests may replace it for deterministic order.
 	orderIPs func([]net.IP)
 
-	// active bounds concurrent attempt goroutines (including domain waiters).
+	// active bounds concurrent attempt goroutines. Run admits the first pending
+	// domain before spawning, so these slots are never consumed by domain waiters.
 	active  chan struct{}
 	global  chan struct{}
 	domains *domainLimiter
@@ -135,6 +144,7 @@ type Deliverer struct {
 	initial    time.Duration
 	maximum    time.Duration
 	connTO     time.Duration
+	admission  time.Duration
 
 	allowlist map[string]struct{}
 
@@ -156,12 +166,9 @@ func New(cfg *config.Config, spool *queue.Queue, log Logger) *Deliverer {
 
 // NewWithSigner is New with an optional DKIM signer for failure DSNs.
 func NewWithSigner(cfg *config.Config, spool *queue.Queue, log Logger, signer Signer) *Deliverer {
-	// Cap attempt workers above global MX concurrency so domain waiters
-	// do not block scheduling, but prevent unbounded goroutine growth.
-	attemptLimit := cfg.Delivery.GlobalConcurrency * 4
-	if attemptLimit < 8 {
-		attemptLimit = 8
-	}
+	// Cap attempt workers above global MX concurrency while preventing unbounded
+	// goroutine growth.
+	attemptLimit := max(cfg.Delivery.GlobalConcurrency*4, 8)
 
 	d := &Deliverer{
 		cfg:    cfg,
@@ -187,6 +194,7 @@ func NewWithSigner(cfg *config.Config, spool *queue.Queue, log Logger, signer Si
 		initial:    config.Duration(cfg.Delivery.InitialRetryDelay),
 		maximum:    config.Duration(cfg.Delivery.MaximumRetryDelay),
 		connTO:     config.Duration(cfg.Delivery.ConnectionTimeout),
+		admission:  defaultAdmissionRetryDelay,
 
 		allowlist: make(map[string]struct{}),
 	}
@@ -265,10 +273,18 @@ func (d *Deliverer) Run(ctx context.Context) error {
 			return nil
 		}
 
-		// Bound concurrent attempt goroutines (domain wait does not hold MX slots).
+		admittedDomain := nextPendingDomain(envelope)
+		if !d.domains.tryAcquire(admittedDomain) {
+			// Admission is an in-memory scheduling decision, not a delivery attempt.
+			d.queue.RequeueAfter(envelope, d.admission)
+			continue
+		}
+
+		// Bound concurrent attempt goroutines after domain-aware admission.
 		select {
 		case d.active <- struct{}{}:
 		case <-ctx.Done():
+			d.domains.release(admittedDomain)
 			d.queue.Requeue(envelope)
 
 			ferr := d.fatalErr()
@@ -282,7 +298,7 @@ func (d *Deliverer) Run(ctx context.Context) error {
 		wg.Go(func() {
 			defer func() { <-d.active }()
 
-			err = d.attempt(ctx, envelope)
+			err := d.attemptAdmitted(ctx, envelope, admittedDomain)
 			if err != nil {
 				if queue.IsStoragePressure(err) {
 					d.queue.RequeueAfter(envelope, storageRetryDelay)
@@ -295,6 +311,17 @@ func (d *Deliverer) Run(ctx context.Context) error {
 			}
 		})
 	}
+}
+
+func nextPendingDomain(envelope *queue.Envelope) string {
+	for i := range envelope.Recipients {
+		recipient := &envelope.Recipients[i]
+		if recipient.Status == queue.StatusPending {
+			return recipient.Domain
+		}
+	}
+
+	return ""
 }
 
 func (d *Deliverer) setFatal(err error) {
@@ -313,6 +340,27 @@ func (d *Deliverer) fatalErr() error {
 }
 
 func (d *Deliverer) attempt(ctx context.Context, envelope *queue.Envelope) error {
+	domain := nextPendingDomain(envelope)
+	if !d.domains.tryAcquire(domain) {
+		envelope.NextAttempt = time.Now().Add(d.admission)
+		d.log.Printf("rescheduling %s for domain capacity in %s\n", envelope.ID, d.admission)
+		if err := d.queue.Retry(envelope); err != nil {
+			return fmt.Errorf("reschedule %s for domain capacity: %w", envelope.ID, err)
+		}
+		return nil
+	}
+
+	return d.attemptAdmitted(ctx, envelope, domain)
+}
+
+func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelope, admittedDomain string) error {
+	heldDomain := admittedDomain
+	defer func() {
+		if heldDomain != "" {
+			d.domains.release(heldDomain)
+		}
+	}()
+
 	if ctx.Err() != nil {
 		d.queue.Requeue(envelope)
 		return nil
@@ -355,25 +403,51 @@ func (d *Deliverer) attempt(ctx context.Context, envelope *queue.Envelope) error
 		groups[recipient.Domain] = append(groups[recipient.Domain], i)
 	}
 
-	// Fairness: acquire domain first without holding a global connection slot.
+	diagnostics := make([]string, 0, len(groupOrder))
+
 	for _, domain := range groupOrder {
 		indexes := groups[domain]
 		if ctx.Err() != nil {
 			break
 		}
-
-		err = d.domains.acquire(ctx, domain)
-		if err != nil {
-			break
+		if heldDomain != domain {
+			if !d.domains.tryAcquire(domain) {
+				diagnostics = append(diagnostics, normalizeDiagnostic(fmt.Sprintf("%s: delivery concurrency unavailable", domain)))
+				break
+			}
+			heldDomain = domain
 		}
 
+		previousDetails := make([]string, len(indexes))
+		for i, index := range indexes {
+			previousDetails[i] = envelope.Recipients[index].Detail
+		}
 		err := d.domain(ctx, envelope, domain, indexes)
 		d.domains.release(domain)
+		heldDomain = ""
 
+		if ctx.Err() != nil {
+			for i, index := range indexes {
+				recipient := &envelope.Recipients[index]
+				if recipient.Status == queue.StatusPending {
+					recipient.Detail = previousDetails[i]
+				}
+			}
+			break
+		}
 		if err != nil {
-			envelope.LastError = normalizeDiagnostic(fmt.Sprintf("%s: %s", domain, err))
+			detail := normalizeDiagnostic(fmt.Sprintf("%s: %s", domain, err))
+			diagnostics = append(diagnostics, detail)
+			for _, index := range indexes {
+				recipient := &envelope.Recipients[index]
+				if recipient.Status == queue.StatusPending && recipient.Detail == "" {
+					recipient.Detail = detail
+				}
+			}
 		}
 	}
+
+	envelope.LastError = normalizeDiagnostic(strings.Join(diagnostics, "; "))
 
 	switch {
 	case envelope.Pending() == 0:
@@ -400,11 +474,12 @@ func (d *Deliverer) attempt(ctx context.Context, envelope *queue.Envelope) error
 				switch {
 				case recipient.Detail != "":
 					// keep capability-specific or prior MX detail
-				case envelope.LastError != "":
-					recipient.Detail = normalizeDiagnostic(envelope.LastError)
 				default:
-					recipient.Detail = "delivery attempts exhausted"
+					recipient.Detail = exhaustedDetail
 				}
+
+				recipient.Code = 554
+				recipient.EnhancedCode = terminalEnhancedCode
 			}
 		}
 
@@ -442,6 +517,8 @@ func (d *Deliverer) expirePending(envelope *queue.Envelope) error {
 		if recipient.Status == queue.StatusPending {
 			recipient.Status = queue.StatusFailed
 			recipient.Detail = lifetimeDetail
+			recipient.Code = 554
+			recipient.EnhancedCode = terminalEnhancedCode
 		}
 	}
 
@@ -672,6 +749,7 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 	}
 
 	accepted := make([]int, 0, len(indexes))
+	temporary := make([]string, 0, len(indexes))
 
 	for _, index := range indexes {
 		recipient := &envelope.Recipients[index]
@@ -691,10 +769,14 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 		}
 
 		recipient.Detail = describe(err)
+		temporary = append(temporary, fmt.Sprintf("%s: %s", recipient.Address, recipient.Detail))
 	}
 
 	if len(accepted) == 0 {
 		_ = client.Quit()
+		if len(temporary) > 0 {
+			return false, fmt.Errorf("temporary RCPT failures: %s", strings.Join(temporary, "; "))
+		}
 		return true, nil
 	}
 
@@ -720,11 +802,22 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 		return false, err
 	}
 
-	_, err = io.Copy(dw, reader)
+	written, err := io.Copy(dw, io.LimitReader(reader, envelope.Size+1))
 	if err != nil {
 		// Closing DotWriter emits the DATA terminator. Abort the transport instead.
 		_ = client.Close()
 		return false, err
+	}
+
+	if written != envelope.Size {
+		// Closing DotWriter emits the DATA terminator, so body integrity failures
+		// must abort the transport directly.
+		_ = client.Close()
+		if written < envelope.Size {
+			return false, fmt.Errorf("%w: got %d, want %d", errBodyTooShort, written, envelope.Size)
+		}
+
+		return false, fmt.Errorf("%w: got at least %d, want %d", errBodyTooLong, written, envelope.Size)
 	}
 
 	err = dw.Close()
@@ -746,6 +839,9 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 	}
 
 	_ = client.Quit()
+	if len(temporary) > 0 {
+		return false, fmt.Errorf("temporary RCPT failures: %s", strings.Join(temporary, "; "))
+	}
 	return true, nil
 }
 

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -45,6 +46,13 @@ func main() {
 		}
 
 		log.MustFail(dns(configPath))
+	case "provision":
+		if len(args) != 1 {
+			log.MustFail(errors.New("usage: outboxd provision"))
+			return
+		}
+
+		log.MustFail(provision(configPath))
 	case "check":
 		if len(args) != 1 {
 			log.MustFail(errors.New("usage: outboxd check"))
@@ -64,7 +72,7 @@ func main() {
 
 		log.MustFail(serve(configPath))
 	default:
-		log.MustFail(fmt.Errorf("unknown command %q, expected user, dns, check, dead, corrupt, or serve (default)", args[0]))
+		log.MustFail(fmt.Errorf("unknown command %q, expected user, provision, dns, check, dead, corrupt, or serve (default)", args[0]))
 	}
 }
 
@@ -84,28 +92,123 @@ func parseGlobalFlags(args []string) (configPath string, rest []string) {
 	return configPath, fs.Args()
 }
 
-func loadConfig(configPath string) (*config.Config, bool, error) {
+func ensureConfig(configPath string) (*config.Config, bool, error) {
 	return config.EnsurePath(config.ResolveConfigPath(configPath))
 }
 
-func serve(configPath string) error {
-	log.Println("Loading config...")
+func loadOperationalConfig(configPath string) (*config.Config, *disk.FileLock, error) {
+	path, err := filepath.Abs(config.ResolveConfigPath(configPath))
+	if err != nil {
+		return nil, nil, err
+	}
 
-	cfg, created, err := loadConfig(configPath)
+	lockPath := path + ".outboxd.lock"
+	info, err := os.Lstat(lockPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil, fmt.Errorf("configuration is not provisioned (missing %s); run 'outboxd -config %s provision' first", lockPath, path)
+		}
+
+		return nil, nil, err
+	}
+
+	if !info.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("configuration ownership lock is not a regular file: %s", lockPath)
+	}
+
+	ownership, err := disk.Lock(lockPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("configuration %s: %w: another outboxd operation owns its startup snapshot", path, err)
+	}
+
+	cfg, err := config.LoadFile(path)
+	if err != nil {
+		_ = ownership.Close()
+		return nil, nil, err
+	}
+
+	return cfg, ownership, nil
+}
+
+func lockSpool(cfg *config.Config) (*disk.FileLock, error) {
+	queuePath := cfg.ResolvePath("queue")
+	info, err := os.Stat(queuePath)
+	if err != nil {
+		return nil, fmt.Errorf("spool is not provisioned at %s: %w", queuePath, err)
+	}
+
+	if !info.IsDir() {
+		return nil, fmt.Errorf("spool path is not a directory: %s", queuePath)
+	}
+
+	lock, err := disk.Lock(filepath.Join(queuePath, ".lock"))
+	if err != nil {
+		return nil, fmt.Errorf("spool %s: %w: stop the running daemon before this operation", queuePath, err)
+	}
+
+	return lock, nil
+}
+
+func provision(configPath string) error {
+	cfg, created, err := ensureConfig(configPath)
 	if err != nil {
 		return err
 	}
 
 	if created {
-		log.Println("Created default config")
+		fmt.Fprintf(os.Stdout, "Created default config at %q. Edit it, then rerun provision. Configuration changes require an outboxd restart.\n", cfg.Path())
+		return nil
 	}
 
-	log.Println("Ensuring data directory...")
+	ownership, err := disk.Lock(cfg.Path() + ".outboxd.lock")
+	if err != nil {
+		return fmt.Errorf("configuration %s: %w", cfg.Path(), err)
+	}
+	defer ownership.Close()
 
 	err = disk.Mkdir(cfg.ResolvedDataDir())
 	if err != nil {
 		return err
 	}
+
+	err = disk.Mkdir(cfg.ResolvePath("queue"))
+	if err != nil {
+		return err
+	}
+
+	spoolOwnership, err := lockSpool(cfg)
+	if err != nil {
+		return err
+	}
+	defer spoolOwnership.Close()
+
+	_, generated, err := sign.Ensure(cfg)
+	if err != nil {
+		return fmt.Errorf("provision DKIM key: %w", err)
+	}
+
+	path, err := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
+	if err != nil {
+		return err
+	}
+
+	if generated {
+		fmt.Fprintf(os.Stdout, "Provisioned DKIM key at %q (create-once).\n", path)
+	} else {
+		fmt.Fprintf(os.Stdout, "DKIM key already provisioned at %q; left unchanged.\n", path)
+	}
+
+	return nil
+}
+
+func serve(configPath string) error {
+	log.Println("Loading config...")
+
+	cfg, ownership, err := loadOperationalConfig(configPath)
+	if err != nil {
+		return err
+	}
+	defer ownership.Close()
 
 	for _, warning := range cfg.Warnings() {
 		log.Warnln(warning)
@@ -121,7 +224,14 @@ func serve(configPath string) error {
 		return err
 	}
 
-	// Exclusive spool lock is daemon ownership: hold it before writing keys/certs.
+	log.Println("Loading DKIM key...")
+
+	signer, err := sign.Load(cfg)
+	if err != nil {
+		return fmt.Errorf("load DKIM key (run 'outboxd -config %s provision' first): %w", cfg.Path(), err)
+	}
+
+	// Exclusive spool lock is daemon ownership: hold it before writing certs.
 	spool, err := queue.Open(cfg.ResolvePath("queue"), queue.Limits{
 		MaxMessages:         cfg.Server.MaxQueueMessages,
 		MaxBytes:            cfg.Server.MaxQueueBytes,
@@ -135,7 +245,13 @@ func serve(configPath string) error {
 		return err
 	}
 
-	defer spool.Close()
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), queueShutdownTimeout)
+		defer cancel()
+		if closeErr := spool.CloseContext(closeCtx); closeErr != nil {
+			log.Warnln("queue shutdown incomplete:", escapeControl(closeErr.Error()))
+		}
+	}()
 	spool.FreeDisk = disk.FreeBytes
 
 	for _, cerr := range spool.Corrupt {
@@ -147,17 +263,6 @@ func serve(configPath string) error {
 	}
 
 	logSpoolStats(spool)
-
-	log.Println("Ensuring DKIM keys...")
-
-	signer, generated, err := sign.Ensure(cfg)
-	if err != nil {
-		return err
-	}
-
-	if generated {
-		log.Println("Generated DKIM key")
-	}
 
 	log.Println("Ensuring TLS certificates...")
 
@@ -228,16 +333,37 @@ func serve(configPath string) error {
 
 	log.Println("Server ready")
 
-	wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		timer := time.NewTimer(serviceShutdownTimeout)
+		defer timer.Stop()
+		select {
+		case <-done:
+		case <-timer.C:
+			return errors.New("service shutdown exceeded its deadline")
+		}
+	}
 
 	log.Warnln("Stopped")
 
 	return errors.Join(errs[0], errs[1])
 }
 
+var (
+	serviceShutdownTimeout = 45 * time.Second
+	queueShutdownTimeout   = 30 * time.Second
+)
+
 func logSpoolStats(spool *queue.Queue) {
 	stats := spool.SpoolStats()
-	message := fmt.Sprintf("Spool physical usage: %d bytes used, %d reserved, %d hard limit", stats.Used, stats.Reserved, stats.Limit)
+	message := fmt.Sprintf("Spool estimated usage: %d bytes used, %d reserved, %d admission limit", stats.Used, stats.Reserved, stats.Limit)
 
 	if stats.HighWater {
 		log.Warnln("HIGH WATER:", message)

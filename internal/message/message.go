@@ -12,22 +12,28 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/coalaura/outboxd/internal/mailbox"
 )
 
 const (
-	maxLineLength  = 998
-	maxTraceLength = 128
+	maxLineLength   = 998
+	maxTraceLength  = 128
+	maxHeaderBytes  = 1 << 20
+	maxHeaderFields = 1000
 )
 
 var (
-	errEmpty     = errors.New("message is empty")
-	errMalformed = errors.New("message header is malformed")
-	errNoFrom    = errors.New("message has no From header")
-	errManyFrom  = errors.New("message has more than one From header")
-	errBinary    = errors.New("message contains a NUL byte")
-	errLongLine  = fmt.Errorf("message contains a line longer than %d octets; use quoted-printable or base64", maxLineLength)
-	errOversized = errors.New("message exceeds size limit")
-	errBodyUTF8  = errors.New("8-bit message body contains invalid UTF-8")
+	errEmpty      = errors.New("message is empty")
+	errMalformed  = errors.New("message header is malformed")
+	errNoFrom     = errors.New("message has no From header")
+	errManyFrom   = errors.New("message has more than one From header")
+	errBinary     = errors.New("message contains a NUL byte")
+	errLongLine   = fmt.Errorf("message contains a line longer than %d octets; use quoted-printable or base64", maxLineLength)
+	errOversized  = errors.New("message exceeds size limit")
+	errHeaderSize = fmt.Errorf("message header exceeds %d octets", maxHeaderBytes)
+	errFieldCount = fmt.Errorf("message header exceeds %d fields", maxHeaderFields)
+	errResent     = errors.New("resent headers are not supported")
 
 	crlf = []byte("\r\n")
 
@@ -49,9 +55,10 @@ type Options struct {
 
 // Message is a submission that is ready to be signed and queued.
 type Message struct {
-	Data []byte
-	From string
-	ID   string
+	Data   []byte
+	From   string
+	Sender string
+	ID     string
 
 	// NeedsUTF8 is true when envelope-bound header material uses raw UTF-8
 	// (internationalized addresses or non-ASCII header bytes not in encoded-words
@@ -110,6 +117,9 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 	}
 
 	header, body := split(data)
+	if len(header) > maxHeaderBytes {
+		return nil, errHeaderSize
+	}
 
 	fields, err := scan(header)
 	if err != nil {
@@ -132,10 +142,15 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 
 	var (
 		from      string
+		sender    string
 		needsUTF8 bool
 	)
 
 	for _, field := range fields {
+		if strings.HasPrefix(field.name, "resent-") {
+			return nil, errResent
+		}
+
 		if fieldHasHighBit(field.value) {
 			if !utf8.Valid(field.value) {
 				return nil, errors.New("message header contains invalid UTF-8")
@@ -144,19 +159,33 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 			needsUTF8 = true
 		}
 
-		if field.name != "from" {
+		if field.name != "from" && field.name != "sender" {
 			continue
 		}
 
 		address, err := parser.Parse(field.text())
 		if err != nil {
-			return nil, fmt.Errorf("invalid From header: %w", err)
+			return nil, fmt.Errorf("invalid %s header: %w", canonicalHeader(field.name), err)
 		}
 
 		// Preserve local-part case; only the domain is case-insensitive.
-		from = preserveLocalPartCase(field.text(), address.Address)
-		if needsUTF8Addr(from) {
+		originator := preserveLocalPartCase(field.text(), address.Address)
+		if err := mailbox.ValidateAddress(originator); err != nil {
+			return nil, fmt.Errorf("invalid %s header: %w", canonicalHeader(field.name), err)
+		}
+
+		if needsUTF8Addr(originator) {
 			needsUTF8 = true
+		}
+
+		if field.name == "from" {
+			from = originator
+		} else {
+			if sender != "" {
+				return nil, errors.New("message has more than one Sender header")
+			}
+
+			sender = originator
 		}
 	}
 
@@ -208,11 +237,9 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 	}
 
 	eightBit := !ascii(body)
-	if eightBit && !utf8.Valid(body) {
-		return nil, errBodyUTF8
-	}
+	bodyUTF8 := eightBit && utf8.Valid(body)
 
-	if present["content-type"] == 0 && eightBit {
+	if present["content-type"] == 0 && bodyUTF8 {
 		out.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
 
 		present["content-type"]++
@@ -222,7 +249,7 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 		out.WriteString("Content-Transfer-Encoding: 8bit\r\n")
 	}
 
-	if present["mime-version"] == 0 && present["content-type"] > 0 {
+	if present["mime-version"] == 0 && (present["content-type"] > 0 || eightBit) {
 		out.WriteString("MIME-Version: 1.0\r\n")
 	}
 
@@ -263,6 +290,7 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 	return &Message{
 		Data:      out.Bytes(),
 		From:      from,
+		Sender:    sender,
 		ID:        msgID,
 		NeedsUTF8: needsUTF8,
 		EightBit:  eightBit,
@@ -468,6 +496,9 @@ func scan(header []byte) ([]field, error) {
 		}
 
 		start = offset
+		if len(fields) >= maxHeaderFields {
+			return nil, errFieldCount
+		}
 
 		fields = append(fields, field{
 			name:  strings.ToLower(string(name)),
@@ -478,6 +509,14 @@ func scan(header []byte) ([]field, error) {
 	}
 
 	return fields, nil
+}
+
+func canonicalHeader(name string) string {
+	if name == "sender" {
+		return "Sender"
+	}
+
+	return "From"
 }
 
 func validFieldName(name []byte) bool {

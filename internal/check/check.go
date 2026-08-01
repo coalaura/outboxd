@@ -600,7 +600,7 @@ func dkimP(record string) (string, bool) {
 func parseTags(record string) map[string]string {
 	out := make(map[string]string)
 
-	for _, part := range strings.Split(record, ";") {
+	for part := range strings.SplitSeq(record, ";") {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue

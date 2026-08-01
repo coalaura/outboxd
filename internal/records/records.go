@@ -304,7 +304,7 @@ func external(reportURI, orgDomain string) []string {
 	var domains []string
 	orgDomain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(orgDomain), "."))
 
-	for _, uri := range strings.Split(reportURI, ",") {
+	for uri := range strings.SplitSeq(reportURI, ",") {
 		uri = strings.TrimSpace(uri)
 		uri = trimDMARCSize(uri)
 		parsed, err := url.Parse(uri)

@@ -14,10 +14,10 @@ import (
 // quota admission cannot rely on optimistic apparent sizes.
 const allocationUnit int64 = 64 << 10
 
-// AllocationSize conservatively estimates filesystem allocation for one
-// object from its apparent size. Directory entries and empty files still cost
-// one allocation unit; sparse and compressed files are charged by apparent
-// size rather than trusting platform-specific allocation reporting.
+// AllocationSize returns a conservative application admission estimate for
+// one filesystem object. It is not a measurement of physical disk usage.
+// Directory entries and empty files still cost one allocation unit; sparse
+// and compressed files are charged by apparent size.
 func AllocationSize(size int64) int64 {
 	if size <= 0 {
 		return allocationUnit
@@ -30,8 +30,8 @@ func AllocationSize(size int64) int64 {
 	return ((size + allocationUnit - 1) / allocationUnit) * allocationUnit
 }
 
-// AllocatedBytes returns conservative physical usage below root. WalkDir uses
-// Lstat semantics and never follows symbolic links.
+// AllocatedBytes returns a conservative application admission estimate below
+// root. WalkDir uses Lstat semantics and never follows symbolic links.
 func AllocatedBytes(root string) (int64, error) {
 	var total int64
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
@@ -127,6 +127,39 @@ func SyncFile(file *os.File) error {
 // Mkdir creates a directory and its parents with owner-only permissions.
 func Mkdir(path string) error {
 	return os.MkdirAll(path, 0700)
+}
+
+// ValidatePath rejects any existing symbolic-link or reparse-point component
+// in path. Queue roots are private namespaces, so traversal through either is
+// never valid even when the final target is a directory.
+func ValidatePath(path string) error {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+
+	for current := filepath.Clean(abs); ; current = filepath.Dir(current) {
+		info, statErr := os.Lstat(current)
+		if statErr == nil {
+			linked, linkErr := isLinkOrReparse(current, info)
+			if linkErr != nil {
+				return linkErr
+			}
+
+			if linked {
+				return &os.PathError{Op: "validate spool namespace", Path: current, Err: errors.New("symbolic link or reparse point is not allowed")}
+			}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return statErr
+		}
+
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+	}
+
+	return nil
 }
 
 // MkdirDurable creates each missing directory component and syncs its parent.
@@ -249,19 +282,37 @@ func Commit(file *os.File, path string, mode os.FileMode) error {
 
 // Write atomically replaces the file at path.
 func Write(path string, body []byte, mode os.FileMode) error {
+	_, err := WriteWithTempState(path, body, mode)
+	return err
+}
+
+// WriteWithTempState atomically replaces path and reports whether its temporary
+// file may remain after an error. Callers can use the result for disk accounting.
+func WriteWithTempState(path string, body []byte, mode os.FileMode) (bool, error) {
 	file, err := Temp(path)
 	if err != nil {
-		return err
+		return false, err
 	}
+	temp := file.Name()
 
 	_, err = file.Write(body)
 	if err != nil {
 		file.Close()
-		os.Remove(file.Name())
-		return err
+		os.Remove(temp)
+		return pathMayExist(temp), err
 	}
 
-	return Commit(file, path, mode)
+	err = Commit(file, path, mode)
+	if err != nil {
+		return pathMayExist(temp), err
+	}
+
+	return false, nil
+}
+
+func pathMayExist(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil || !errors.Is(err, os.ErrNotExist)
 }
 
 // WriteExclusive writes path, failing with os.ErrExist if it already exists.

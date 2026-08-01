@@ -10,7 +10,7 @@ func TestSubmissionLimiterBurstNotFullHourly(t *testing.T) {
 	l := newSubmissionLimiter(1000, 10000, 5, 50)
 
 	// Only burst of 5 messages immediately, not 1000.
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if !l.take("u", 1) {
 			t.Fatalf("take %d failed", i)
 		}

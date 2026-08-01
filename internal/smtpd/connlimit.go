@@ -126,3 +126,88 @@ func connIP(addr net.Addr) string {
 
 	return host
 }
+
+type connectionTracker struct {
+	mu     sync.Mutex
+	conns  map[*trackedConn]struct{}
+	closed bool
+}
+
+func newConnectionTracker() *connectionTracker {
+	return &connectionTracker{conns: make(map[*trackedConn]struct{})}
+}
+
+func (t *connectionTracker) add(c *trackedConn) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return false
+	}
+
+	t.conns[c] = struct{}{}
+	return true
+}
+
+func (t *connectionTracker) remove(c *trackedConn) {
+	t.mu.Lock()
+	delete(t.conns, c)
+	t.mu.Unlock()
+}
+
+func (t *connectionTracker) closeAll() {
+	t.mu.Lock()
+	t.closed = true
+	conns := make([]*trackedConn, 0, len(t.conns))
+	for conn := range t.conns {
+		conns = append(conns, conn)
+	}
+	t.mu.Unlock()
+
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+}
+
+type trackListener struct {
+	net.Listener
+	tracker     *connectionTracker
+	beforeTrack func()
+}
+
+func newTrackListener(ln net.Listener, tracker *connectionTracker) net.Listener {
+	return &trackListener{Listener: ln, tracker: tracker}
+}
+
+func (l *trackListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	if l.beforeTrack != nil {
+		l.beforeTrack()
+	}
+
+	tracked := &trackedConn{Conn: conn, tracker: l.tracker}
+	if !l.tracker.add(tracked) {
+		_ = tracked.Close()
+		return nil, net.ErrClosed
+	}
+
+	return tracked, nil
+}
+
+type trackedConn struct {
+	net.Conn
+	tracker *connectionTracker
+	once    sync.Once
+	err     error
+}
+
+func (c *trackedConn) Close() error {
+	c.once.Do(func() {
+		c.tracker.remove(c)
+		c.err = c.Conn.Close()
+	})
+	return c.err
+}

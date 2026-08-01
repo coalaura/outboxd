@@ -83,7 +83,7 @@ func TestRoutingDomainRejects(t *testing.T) {
 	// Overlong domain after conversion (>253).
 	var b strings.Builder
 
-	for i := 0; i < 40; i++ {
+	for i := range 40 {
 		if i > 0 {
 			b.WriteByte('.')
 		}

@@ -1,12 +1,10 @@
 package deliver
 
 import (
-	"context"
 	"sync"
 )
 
 type slot struct {
-	tokens  chan struct{}
 	holders int
 }
 
@@ -28,47 +26,28 @@ func newDomainLimiter(limit int) *domainLimiter {
 	}
 }
 
-func (l *domainLimiter) acquire(ctx context.Context, domain string) error {
+// tryAcquire reserves domain capacity without creating a waiter.
+func (l *domainLimiter) tryAcquire(domain string) bool {
 	l.mu.Lock()
-	entry, ok := l.slots[domain]
-	if !ok {
-		entry = &slot{tokens: make(chan struct{}, l.limit)}
+	defer l.mu.Unlock()
+
+	if domain == "" {
+		return true
+	}
+	entry := l.slots[domain]
+	if entry != nil && entry.holders >= l.limit {
+		return false
+	}
+	if entry == nil {
+		entry = &slot{}
 		l.slots[domain] = entry
 	}
-
 	entry.holders++
-	tokens := entry.tokens
-	l.mu.Unlock()
 
-	select {
-	case tokens <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		l.drop(domain)
-		return ctx.Err()
-	}
+	return true
 }
 
 func (l *domainLimiter) release(domain string) {
-	l.mu.Lock()
-	entry, ok := l.slots[domain]
-	l.mu.Unlock()
-
-	if !ok {
-		return
-	}
-
-	select {
-	case <-entry.tokens:
-	default:
-		// no token held
-		return
-	}
-
-	l.drop(domain)
-}
-
-func (l *domainLimiter) drop(domain string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -78,7 +57,6 @@ func (l *domainLimiter) drop(domain string) {
 	}
 
 	entry.holders--
-
 	if entry.holders <= 0 {
 		delete(l.slots, domain)
 	}

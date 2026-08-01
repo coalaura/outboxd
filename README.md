@@ -18,10 +18,15 @@ Bounce and reply handling require a **separate** mailbox (and MX) for envelope-s
 
 ```bash
 # config path: -config path | OUTBOXD_CONFIG | ./config.yml
-outboxd -config /etc/outboxd/config.yml          # serve
+outboxd -config /etc/outboxd/config.yml provision # create config if needed; edit it before continuing
+# after editing the config, rerun provision to create the DKIM identity once
+outboxd -config /etc/outboxd/config.yml provision
+# provision TLS files, then:
 outboxd -config ... user add alice alice@example.com
+# stop a running daemon before regenerating DNS
 outboxd -config ... dns
 outboxd -config ... check
+outboxd -config ... serve
 outboxd -config ... dead list|show|retry|export|delete <id>
 outboxd -config ... corrupt list|delete <name>
 ```
@@ -43,6 +48,10 @@ outboxd -config ... corrupt list|delete <name>
 
 External DMARC report destinations need the usual `<org-domain>._report._dmarc.<rua-host>` authorization TXT. outboxd emits a reminder in `dns-records.txt` but does not collect reports.
 
+Run `outboxd provision` before `dns`, `check`, or `serve`. If the config is absent, the command creates only the default config so you can edit paths and settings safely; rerun it afterward to create the data/spool paths and configured DKIM private key. Once the key exists, later provisioning runs load and preserve the existing identity. Operational commands never generate or replace a missing DKIM identity and fail instead. Back up the private key before publishing its DNS record.
+
+`dns` takes exclusive ownership of both the config startup snapshot and spool before loading the DKIM key and writing `dns.output_file`. It therefore cannot run alongside the daemon. Stop the daemon, run `outboxd dns`, publish/verify the resulting records, then restart the daemon. Use the same stop/provision-or-DNS/restart workflow after changing `server.data_directory`, `dkim.private_key_file`, `dns.output_file`, or the config path; do not use a newly configured path to work around ownership of the old one.
+
 ## TLS
 
 | `tls.mode` | Meaning |
@@ -60,24 +69,31 @@ On Unix, the config and generated DKIM private key must be regular, non-symlink 
 
 - On-disk spool under the data directory: **at-least-once** delivery. A crash between a successful remote DATA response and local `Finish` can redeliver; receivers must tolerate duplicates.
 - Exhausted or permanently failed messages move to the **dead-letter** area (`outboxd dead …`).
-- `max_queue_bytes` is the logical ready-message body quota. `max_spool_bytes` is the required hard physical quota across ready, tmp, DSN, dead, corrupt, and trash; `spool_emergency_bytes` is unavailable to ordinary submissions but available to DSNs and necessary state transitions. No write may cross the hard quota or `min_free_disk_bytes` floor.
+- `max_queue_bytes` is the logical ready-message body quota. `max_spool_bytes` is a conservative admission estimate across ready, tmp, DSN, dead, corrupt, and trash; `spool_emergency_bytes` is unavailable to ordinary submissions but available to DSNs and necessary state transitions. Filesystem allocation, metadata, and external writes mean this is not a hard physical guarantee.
+- Put the data directory on a dedicated, local, quota-controlled volume sized with additional filesystem headroom. The OS/filesystem quota is the physical boundary; do not rely on `max_spool_bytes` to protect a shared root volume.
+- The spool must be a private namespace writable only by outboxd. Do not place symlinks, junctions, mount points, or other reparse/redirecting entries anywhere below it, and do not let other processes create files there.
 - Positive `dead_retention` and `corrupt_retention` bound retained failures. Startup and hourly pruning use crash-safe trash transitions; operators can also delete dead/corrupt entries explicitly.
 
 ## Configuration
 
-See the generated `config.yml` comments after first start. Important knobs:
+See the generated `config.yml` comments after `provision`. Important knobs:
 
 - `server.hostname` / `server.domain` — HELO name vs organizational domain
 - `server.max_message_bytes`, connection and auth worker limits
 - `dns.*` — public IPs and DNS generation only (not outbound bind addresses)
 - `delivery.bind_ipv4` / `bind_ipv6` — must exist on a local interface at startup
 
+Configuration and the DKIM key are loaded as one startup snapshot and remain fixed for the process lifetime. Config-file edits and `user add` mutations do not affect a running daemon; restart outboxd to apply them. The only runtime file reload is the documented TLS certificate/key content reload.
+
+`user add` intentionally retains create behavior: when the selected config does not exist, it creates the default config before adding the user. It does not provision the data directory, spool, or DKIM key; run `provision` afterward.
+
 ## Commands
 
 ```
 outboxd [-config path]              # run submission + delivery
+outboxd provision                   # create the DKIM key once; preserve it thereafter
 outboxd user add <user> [senders…]  # append user via config.AddUser
-outboxd dns                         # write and print DNS instructions
+outboxd dns                         # exclusively own spool, then write/print DNS instructions
 outboxd check                       # PASS/WARN/FAIL deployment checks
 outboxd dead list|show|retry|export|delete
 outboxd corrupt list|delete

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -92,6 +93,21 @@ func TestAllocatedBytesDoesNotFollowSymlinks(t *testing.T) {
 
 	if used >= 1<<20 {
 		t.Fatalf("usage %d followed external symlink", used)
+	}
+}
+
+func TestValidatePathRejectsSymlinkComponent(t *testing.T) {
+	root := t.TempDir()
+	external := t.TempDir()
+	link := filepath.Join(root, "link")
+	err := os.Symlink(external, link)
+	if err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	err = ValidatePath(filepath.Join(link, "spool"))
+	if err == nil || !strings.Contains(err.Error(), "symbolic link or reparse point") {
+		t.Fatalf("ValidatePath error=%v", err)
 	}
 }
 

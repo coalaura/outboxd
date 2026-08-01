@@ -36,11 +36,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"math"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -93,6 +95,7 @@ const (
 	maxEnvelopeDetailBytes = 64 << 10
 	maxEnvelopeAttempts    = 1 << 20
 	maxEnvelopeRevision    = math.MaxUint64 - 1
+	bodyDigestPrefix       = "sha256:"
 )
 
 // idPattern accepts the envelope IDs this process generates and previously
@@ -124,6 +127,7 @@ type Envelope struct {
 	LastError   string      `json:"last_error,omitempty"`
 	SMTPUTF8    bool        `json:"smtp_utf8,omitempty"`
 	EightBit    bool        `json:"eight_bit,omitempty"`
+	BodyDigest  string      `json:"body_digest"`
 
 	// DSNID links a source to the exact DSN durably created for this generation.
 	DSNID string `json:"dsn_id,omitempty"`
@@ -141,8 +145,9 @@ type Envelope struct {
 }
 
 // Limits caps the durable queue. MaxBytes is the logical size of message
-// bodies in ready/. MaxSpoolBytes is the hard physical limit across every
-// queue namespace. Zero means unlimited for that dimension.
+// bodies in ready/. MaxSpoolBytes is a conservative application admission
+// limit across every queue namespace, not a physical disk-usage measurement.
+// Zero means unlimited for that dimension.
 type Limits struct {
 	MaxMessages         int
 	MaxBytes            int64
@@ -153,9 +158,10 @@ type Limits struct {
 	CorruptRetention    time.Duration
 }
 
-// PhysicalStats describes conservative spool allocation, including active
-// reservations. HighWater is true once ordinary writes are in emergency
-// headroom or the hard limit is at least 90 percent consumed.
+// PhysicalStats describes the conservative spool admission estimate,
+// including active reservations. It is intentionally not physical disk usage.
+// HighWater is true once ordinary writes are in emergency headroom or the hard
+// limit is at least 90 percent consumed.
 type PhysicalStats struct {
 	Used      int64
 	Reserved  int64
@@ -198,8 +204,8 @@ type Queue struct {
 	requeues      map[string][]*Envelope
 	reserved      int   // in-flight Add reservations (count)
 	resBytes      int64 // in-flight Add reservations (bytes)
-	spoolBytes    int64 // conservative allocation across all namespaces
-	spoolReserved int64 // in-flight physical allocation reservations
+	spoolBytes    int64 // conservative admission estimate across all namespaces
+	spoolReserved int64 // in-flight spool admission reservations
 	lastSpoolScan time.Time
 	active        int
 	closing       bool
@@ -227,6 +233,14 @@ type Queue struct {
 	// afterBodyOpen is a test seam invoked after the exact body handle has
 	// passed its initial size check.
 	afterBodyOpen func()
+
+	// afterBodyVerify is a test seam invoked after openBody's validation pass
+	// but before ReadBody or ExportDead reads the bytes it will expose.
+	afterBodyVerify func()
+
+	// beforeAddRollback is a test seam for an acceptance error whose rollback
+	// cannot restore the pending marker.
+	beforeAddRollback func() error
 }
 
 // Pending reports how many recipients still need a delivery attempt.
@@ -289,8 +303,8 @@ func (q *Queue) Stats() (messages int, bytes int64) {
 	return messages, bytes
 }
 
-// SpoolStats returns conservative physical allocation across ready, tmp, dsn,
-// dead, corrupt, and trash, including concurrent reservations.
+// SpoolStats returns the conservative application admission estimate across
+// ready, tmp, dsn, dead, corrupt, and trash, including concurrent reservations.
 func (q *Queue) SpoolStats() PhysicalStats {
 	if q == nil || q.beginOperation() != nil {
 		return PhysicalStats{}
@@ -315,8 +329,9 @@ func (q *Queue) SpoolStats() PhysicalStats {
 	return stats
 }
 
-// reserveLocked checks logical and physical quotas. Emergency operations may
-// consume the configured reserve but never the hard spool or free-space floor.
+// reserveLocked checks logical and conservative spool admission quotas.
+// Emergency operations may consume the configured reserve but never the hard
+// admission limit or free-space floor.
 func (q *Queue) reserveLocked(size, physical int64, exempt, emergency bool) error {
 	if size < 0 {
 		return errors.New("negative reservation size")
@@ -396,12 +411,10 @@ func (q *Queue) releaseReserve(size, physical int64) {
 
 func estimateEntryAllocation(bodySize int64, metadataSize int) int64 {
 	parts := []int64{
+		estimatePersistentEntryAllocation(bodySize, metadataSize),
+		// The staging namespace may cross an allocation boundary while the
+		// entry is moved into ready/.
 		disk.AllocationSize(0),
-		disk.AllocationSize(bodySize),
-		disk.AllocationSize(int64(metadataSize)),
-		disk.AllocationSize(int64(len(addAccepted))),
-		// tmp/ and ready/ may each cross an allocation boundary.
-		2 * disk.AllocationSize(0),
 	}
 	var total int64
 
@@ -416,7 +429,29 @@ func estimateEntryAllocation(bodySize int64, metadataSize int) int64 {
 	return total
 }
 
-func (q *Queue) holdPhysical(bytes int64, terminal bool) (func(), error) {
+func estimatePersistentEntryAllocation(bodySize int64, metadataSize int) int64 {
+	parts := []int64{
+		disk.AllocationSize(0),
+		disk.AllocationSize(bodySize),
+		disk.AllocationSize(int64(metadataSize)),
+		disk.AllocationSize(int64(len(addAccepted))),
+		// The destination namespace may cross an allocation boundary.
+		disk.AllocationSize(0),
+	}
+	var total int64
+
+	for _, part := range parts {
+		var ok bool
+		total, ok = checkedAddInt64(total, part)
+		if !ok {
+			return math.MaxInt64
+		}
+	}
+
+	return total
+}
+
+func (q *Queue) holdPhysical(bytes int64, terminal bool) (func(bool), error) {
 	q.mu.Lock()
 	err := q.reservePhysicalLocked(bytes, true, terminal)
 	q.mu.Unlock()
@@ -425,9 +460,15 @@ func (q *Queue) holdPhysical(bytes int64, terminal bool) (func(), error) {
 		return nil, err
 	}
 
-	return func() {
+	return func(commit bool) {
 		q.mu.Lock()
-		q.commitPhysicalLocked(bytes)
+		if commit {
+			q.commitPhysicalLocked(bytes)
+		} else if bytes > q.spoolReserved {
+			q.spoolReserved = 0
+		} else {
+			q.spoolReserved -= bytes
+		}
 		q.mu.Unlock()
 	}, nil
 }
@@ -562,7 +603,7 @@ var (
 	// ErrInsufficientDisk is returned when free disk is below the threshold.
 	ErrInsufficientDisk = errors.New("insufficient free disk space")
 
-	// ErrSpoolFull is returned when the physical spool limit is exhausted.
+	// ErrSpoolFull is returned when the conservative spool admission limit is exhausted.
 	ErrSpoolFull = errors.New("physical spool full")
 
 	// ErrInvalidID is returned for unusable queue identifiers.
@@ -698,7 +739,7 @@ func ValidateID(id string) error {
 // DSNID returns the stable queue ID for one source-message incarnation and
 // notification generation.
 func DSNID(sourceID, incarnation string, generation uint64) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("outboxd-dsn-v1\x00%s\x00%s\x00%d", sourceID, incarnation, generation)))
+	sum := sha256.Sum256(fmt.Appendf(nil, "outboxd-dsn-v1\x00%s\x00%s\x00%d", sourceID, incarnation, generation))
 	return fmt.Sprintf("dsn.%x", sum)
 }
 
@@ -816,6 +857,7 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 	}
 
 	envelope.Size = int64(len(data))
+	envelope.BodyDigest = bodyDigest(data)
 	err = validateEnvelope(envelope)
 	if err != nil {
 		return err
@@ -910,7 +952,7 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 		return err
 	}
 
-	err = acceptAdd(filepath.Join(readyDir, addStateName))
+	err = q.acceptAdd(filepath.Join(readyDir, addStateName))
 	if err != nil {
 		abortErr := q.quarantineDir(readyDir, envelope.ID+"-uncommitted")
 		// Quarantine intentionally retains the failed entry. If quarantine itself
@@ -918,15 +960,9 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 		commitPhysical()
 		if abortErr == nil {
 			return err
-		} else {
-			// If quarantine itself fails while an accepted marker is visible,
-			// report success rather than invite a duplicate retry for an entry
-			// that recovery will deliver.
-			state, readErr := readBoundedRegular(filepath.Join(readyDir, addStateName), maxAddStateBytes)
-			if readErr != nil || string(state) != addAccepted {
-				return errors.Join(err, fmt.Errorf("quarantine failed add: %w", abortErr), readErr)
-			}
 		}
+
+		return errors.Join(err, fmt.Errorf("quarantine failed add: %w", abortErr))
 	}
 
 	success = true
@@ -997,6 +1033,7 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 
 	dsn.Revision = 1
 	dsn.Size = int64(len(data))
+	dsn.BodyDigest = bodyDigest(data)
 	err = validateEnvelope(dsn)
 	if err != nil {
 		return err
@@ -1103,10 +1140,14 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 		return err
 	}
 
-	physical, ok := checkedAddInt64(
-		estimateEntryAllocation(dsn.Size, len(meta)),
-		disk.AllocationSize(int64(len(linkedMeta))+disk.AllocationSize(0))+disk.AllocationSize(0),
-	)
+	persistentPhysical := estimatePersistentEntryAllocation(dsn.Size, len(meta))
+	stagingPhysical := disk.AllocationSize(0)
+	sourceTempPhysical := disk.AllocationSize(int64(len(linkedMeta)))
+	replacementPhysical := disk.AllocationSize(int64(len(linkedMeta))+disk.AllocationSize(0)) + disk.AllocationSize(0)
+	physical, ok := checkedAddInt64(persistentPhysical, stagingPhysical)
+	if ok {
+		physical, ok = checkedAddInt64(physical, replacementPhysical)
+	}
 	if !ok {
 		return ErrSpoolFull
 	}
@@ -1153,15 +1194,18 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 	q.mu.Unlock()
 	held := true
 	physicalHeld := physical
-	commitPhysical := func() {
-		if physicalHeld == 0 {
+	commitPhysical := func(bytes int64) {
+		if bytes <= 0 || physicalHeld == 0 {
 			return
+		}
+		if bytes > physicalHeld {
+			bytes = physicalHeld
 		}
 
 		q.mu.Lock()
-		q.commitPhysicalLocked(physicalHeld)
+		q.commitPhysicalLocked(bytes)
 		q.mu.Unlock()
-		physicalHeld = 0
+		physicalHeld -= bytes
 	}
 	defer func() {
 		if held {
@@ -1180,7 +1224,7 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 			removeErr := os.RemoveAll(stageDir)
 			syncErr := disk.Sync(q.dsn)
 			if removeErr != nil || syncErr != nil {
-				commitPhysical()
+				commitPhysical(persistentPhysical + stagingPhysical)
 			}
 		}
 	}()
@@ -1210,20 +1254,24 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 		return err
 	}
 
-	err = acceptAdd(filepath.Join(stageDir, addStateName))
+	err = q.acceptAdd(filepath.Join(stageDir, addStateName))
 	if err != nil {
 		return err
 	}
 
 	// The accepted stage remains recoverable across every later error. Move its
-	// conservative reservation into committed usage before linking the source.
-	commitPhysical()
+	// persistent allocation into committed usage before linking the source.
+	commitPhysical(persistentPhysical)
 
-	storeErr := q.storeReady(&linked)
+	retainedSourceTemp, storeErr := q.storeReady(&linked)
+	if retainedSourceTemp {
+		commitPhysical(sourceTempPhysical)
+	}
 	if storeErr != nil && linked.Revision == source.Revision {
 		// Preserve the complete stage. Startup decides whether the source update
 		// committed and either publishes or quarantines it.
 		cleanup = false
+		commitPhysical(stagingPhysical)
 		q.mu.Lock()
 		q.requeues[source.ID] = append(q.requeues[source.ID], cloneEnvelope(durableSource))
 		q.mu.Unlock()
@@ -1234,6 +1282,7 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 
 	moved, err := moveState(stageDir, filepath.Join(q.ready, dsn.ID))
 	if err != nil && !moved {
+		commitPhysical(stagingPhysical)
 		return err
 	}
 
@@ -1292,7 +1341,7 @@ func (q *Queue) publishStagedDSN(dsn *Envelope) (*Envelope, bool, error) {
 // acceptAdd performs the sole Add acceptance transition. The marker already
 // has a durable directory entry, so only its fixed-size contents need syncing.
 // No fallible operation is reported after the successful Sync commit point.
-func acceptAdd(path string) error {
+func (q *Queue) acceptAdd(path string) error {
 	if len(addPending) != len(addAccepted) {
 		panic("queue Add states must have equal length")
 	}
@@ -1306,21 +1355,28 @@ func acceptAdd(path string) error {
 
 	err = writeAddState(file, addAccepted)
 	if err != nil {
-		return rollbackAdd(file, err)
+		return q.rollbackAdd(file, err)
 	}
 
 	err = disk.SyncFile(file)
 	if err != nil {
-		return rollbackAdd(file, err)
+		return q.rollbackAdd(file, err)
 	}
 
 	_ = file.Close()
 	return nil
 }
 
-func rollbackAdd(file *os.File, cause error) error {
+func (q *Queue) rollbackAdd(file *os.File, cause error) error {
 	// A failed commit must not leave accepted bytes recoverable after Add
 	// reports failure. A successful rollback sync restores that invariant.
+	if q.beforeAddRollback != nil {
+		err := q.beforeAddRollback()
+		if err != nil {
+			return errors.Join(cause, fmt.Errorf("rollback add state: %w", err))
+		}
+	}
+
 	err := writeAddState(file, addPending)
 	if err != nil {
 		return errors.Join(cause, fmt.Errorf("rollback add state: %w", err))
@@ -1448,11 +1504,15 @@ func (q *Queue) RequeueAfter(envelope *Envelope, delay time.Duration) {
 	deferred.NextAttempt = time.Now().Add(delay)
 	q.mu.Lock()
 
-	for i, queued := range q.pending {
-		if queued.ID == envelope.ID {
-			heap.Remove(&q.pending, i)
-			delete(q.scheduled, envelope.ID)
-			break
+	// Checked-out envelopes are absent from scheduled, which is the common
+	// delivery-admission path. Only scan when replacing an existing schedule.
+	if _, scheduled := q.scheduled[envelope.ID]; scheduled {
+		for i, queued := range q.pending {
+			if queued.ID == envelope.ID {
+				heap.Remove(&q.pending, i)
+				delete(q.scheduled, envelope.ID)
+				break
+			}
 		}
 	}
 
@@ -1553,11 +1613,13 @@ func (q *Queue) Retry(envelope *Envelope) error {
 		return err
 	}
 
-	defer release()
+	commitHold := false
+	defer func() { release(commitHold) }()
 
-	err = q.storeReady(envelope)
+	commitHold, err = q.storeReady(envelope)
 	if err != nil {
-		// Leave bytes on disk; keep it schedulable.
+		// Keep the durable entry schedulable. Only a temp file that could not be
+		// removed consumes additional cached usage.
 		if !errors.Is(err, ErrIDConflict) {
 			publish()
 		}
@@ -1728,7 +1790,8 @@ func (q *Queue) Bury(envelope *Envelope) error {
 		return err
 	}
 
-	defer release()
+	commitHold := false
+	defer func() { release(commitHold) }()
 	src := filepath.Join(q.ready, envelope.ID)
 	dst := filepath.Join(q.dead, envelope.ID)
 	err = q.matchReady(envelope)
@@ -1767,7 +1830,7 @@ func (q *Queue) Bury(envelope *Envelope) error {
 	}
 
 	// Persist final status inside ready/ before the rename.
-	err = q.storeReady(envelope)
+	commitHold, err = q.storeReady(envelope)
 	if err != nil {
 		// Reschedule for recoverability; signal fatal to caller.
 		if !errors.Is(err, ErrIDConflict) {
@@ -1776,7 +1839,6 @@ func (q *Queue) Bury(envelope *Envelope) error {
 
 		return err
 	}
-
 	moved, err := moveState(src, dst)
 	if err != nil {
 		if moved {
@@ -1886,6 +1948,19 @@ func (q *Queue) ReviveDead(id string) (*Envelope, error) {
 	q.mu.Unlock()
 	held := true
 	physicalHeld := physical
+	commitPhysical := func(bytes int64) {
+		if bytes <= 0 || physicalHeld == 0 {
+			return
+		}
+		if bytes > physicalHeld {
+			bytes = physicalHeld
+		}
+
+		q.mu.Lock()
+		q.commitPhysicalLocked(bytes)
+		q.mu.Unlock()
+		physicalHeld -= bytes
+	}
 	defer func() {
 		if held {
 			q.releaseReserve(env.Size, physicalHeld)
@@ -1916,21 +1991,26 @@ func (q *Queue) ReviveDead(id string) (*Envelope, error) {
 	}
 
 	stagedMeta := filepath.Join(src, reviveMetaName)
-	err = q.writeMeta(stagedMeta, env)
+	_, retainedStageTemp, err := q.writeMetaReconciled(stagedMeta, env)
 	if err != nil {
-		return nil, errors.Join(err, removeAndSync(stagedMeta))
+		cleanupErr := removeAndSync(stagedMeta)
+		if retainedStageTemp {
+			commitPhysical(disk.AllocationSize(int64(len(meta))))
+		}
+		if cleanupErr != nil {
+			commitPhysical(disk.AllocationSize(int64(len(meta))) + disk.AllocationSize(0))
+		}
+		return nil, errors.Join(err, cleanupErr)
 	}
 
-	// The staged metadata can survive every later error. Charge it immediately;
-	// successful cleanup may leave a conservative overcount until reconciliation.
-	q.mu.Lock()
-	q.commitPhysicalLocked(physicalHeld)
-	q.mu.Unlock()
-	physicalHeld = 0
 	dst := filepath.Join(q.ready, id)
 	moved, moveErr := moveState(src, dst)
 	if moveErr != nil && !moved {
-		return nil, errors.Join(moveErr, removeAndSync(stagedMeta))
+		cleanupErr := removeAndSync(stagedMeta)
+		if cleanupErr != nil {
+			commitPhysical(disk.AllocationSize(int64(len(meta))) + disk.AllocationSize(0))
+		}
+		return nil, errors.Join(moveErr, cleanupErr)
 	}
 
 	activated, activateErr := moveState(filepath.Join(dst, reviveMetaName), filepath.Join(dst, metaName))
@@ -1938,15 +2018,24 @@ func (q *Queue) ReviveDead(id string) (*Envelope, error) {
 		rolledBack, rollbackErr := moveState(dst, src)
 		if rolledBack {
 			cleanupErr := removeAndSync(filepath.Join(src, reviveMetaName))
+			if cleanupErr != nil {
+				commitPhysical(disk.AllocationSize(int64(len(meta))) + disk.AllocationSize(0))
+			}
 			return nil, errors.Join(moveErr, activateErr, rollbackErr, cleanupErr)
 		}
 
-		committed, reconcileErr := q.writeMetaReconciled(filepath.Join(dst, metaName), env)
+		committed, retainedReplacementTemp, reconcileErr := q.writeMetaReconciled(filepath.Join(dst, metaName), env)
+		if retainedReplacementTemp {
+			commitPhysical(disk.AllocationSize(int64(len(meta))))
+		}
 		if !committed {
 			return nil, errors.Join(moveErr, activateErr, fmt.Errorf("rollback revive: %w", rollbackErr), reconcileErr)
 		}
 
 		cleanupErr := removeAndSync(filepath.Join(dst, reviveMetaName))
+		if cleanupErr != nil {
+			commitPhysical(disk.AllocationSize(int64(len(meta))) + disk.AllocationSize(0))
+		}
 		activateErr = errors.Join(activateErr, fmt.Errorf("rollback revive: %w", rollbackErr), reconcileErr, cleanupErr)
 	}
 
@@ -2227,7 +2316,16 @@ func (q *Queue) ExportDead(id string, w io.Writer) error {
 	}
 
 	defer f.Close()
-	return copyExactBody(w, f, env.Size)
+	if q.afterBodyVerify != nil {
+		q.afterBodyVerify()
+	}
+	body, err := readBodyFromFile(f, env.Size, env.BodyDigest)
+	if err != nil {
+		return err
+	}
+
+	_, err = io.Copy(w, bytes.NewReader(body))
+	return err
 }
 
 // Reader opens the stored message body for a ready entry.
@@ -2250,13 +2348,19 @@ func (q *Queue) Reader(id string) (io.ReadCloser, error) {
 	}
 
 	dir := filepath.Join(q.ready, id)
-	_, file, err := q.openAcceptedBody(dir, id)
+	env, file, err := q.openAcceptedBody(dir, id)
 	if err != nil {
 		return nil, err
 	}
 
 	owned = false
-	return &trackedReader{file: file, queue: q}, nil
+	return &trackedReader{
+		file:      file,
+		queue:     q,
+		remaining: env.Size,
+		digest:    env.BodyDigest,
+		hash:      sha256.New(),
+	}, nil
 }
 
 // ReadBody returns the full body bytes for ready or dead.
@@ -2277,7 +2381,10 @@ func (q *Queue) ReadBody(id string) ([]byte, error) {
 	env, file, err := q.openAcceptedBody(ready, id)
 	if err == nil {
 		defer file.Close()
-		return readBodyFromFile(file, env.Size)
+		if q.afterBodyVerify != nil {
+			q.afterBodyVerify()
+		}
+		return readBodyFromFile(file, env.Size, env.BodyDigest)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
@@ -2289,7 +2396,10 @@ func (q *Queue) ReadBody(id string) ([]byte, error) {
 	}
 
 	defer file.Close()
-	return readBodyFromFile(file, env.Size)
+	if q.afterBodyVerify != nil {
+		q.afterBodyVerify()
+	}
+	return readBodyFromFile(file, env.Size, env.BodyDigest)
 }
 
 // Path returns the spool root.
@@ -2382,11 +2492,8 @@ func (q *Queue) endTransitions(ids ...string) {
 	for _, id := range ids {
 		delete(q.transitioning, id)
 
-		for _, envelope := range q.requeues[id] {
-			if q.scheduleLocked(envelope) {
-				added = true
-				break
-			}
+		if slices.ContainsFunc(q.requeues[id], q.scheduleLocked) {
+			added = true
 		}
 
 		delete(q.requeues, id)
@@ -2413,16 +2520,17 @@ func (q *Queue) noteRemoved(id string) {
 	q.mu.Unlock()
 }
 
-func (q *Queue) storeReady(envelope *Envelope) error {
+// storeReady reports whether an additional metadata temp file may remain.
+func (q *Queue) storeReady(envelope *Envelope) (bool, error) {
 	nextRevision, err := incrementRevision(envelope.Revision)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	dir := filepath.Join(q.ready, envelope.ID)
 	err = q.matchReady(envelope)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	path := filepath.Join(dir, metaName)
@@ -2430,12 +2538,12 @@ func (q *Queue) storeReady(envelope *Envelope) error {
 	updated.Revision = nextRevision
 	err = validateEnvelope(&updated)
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	committed, err := q.writeMetaReconciled(path, &updated)
+	committed, retainedTemp, err := q.writeMetaReconciled(path, &updated)
 	if !committed {
-		return err
+		return retainedTemp, err
 	}
 
 	envelope.Revision = updated.Revision
@@ -2448,7 +2556,7 @@ func (q *Queue) storeReady(envelope *Envelope) error {
 	}
 
 	q.mu.Unlock()
-	return err
+	return retainedTemp, err
 }
 
 func (q *Queue) matchReady(envelope *Envelope) error {
@@ -2469,6 +2577,10 @@ func (q *Queue) matchReady(envelope *Envelope) error {
 
 	if current.Revision != envelope.Revision {
 		return fmt.Errorf("%w: queue metadata changed", ErrIDConflict)
+	}
+
+	if current.Size != envelope.Size || current.BodyDigest != envelope.BodyDigest {
+		return fmt.Errorf("%w: queue body identity changed", ErrIDConflict)
 	}
 
 	return nil
@@ -2522,23 +2634,23 @@ func (q *Queue) writeMeta(path string, envelope *Envelope) error {
 	return disk.Write(path, body, 0600)
 }
 
-func (q *Queue) writeMetaReconciled(path string, envelope *Envelope) (bool, error) {
+func (q *Queue) writeMetaReconciled(path string, envelope *Envelope) (bool, bool, error) {
 	body, err := marshalEnvelope(envelope)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 
-	err = disk.Write(path, body, 0600)
+	retainedTemp, err := disk.WriteWithTempState(path, body, 0600)
 	if err != nil {
 		visible, readErr := readBoundedRegular(path, maxEnvelopeMetadata)
 		if readErr == nil && bytes.Equal(visible, body) {
-			return true, err
+			return true, retainedTemp, err
 		}
 
-		return false, errors.Join(err, readErr)
+		return false, retainedTemp, errors.Join(err, readErr)
 	}
 
-	return true, nil
+	return true, false, nil
 }
 
 func (q *Queue) loadDir(dir, expectID string) (*Envelope, error) {
@@ -2551,11 +2663,15 @@ func (q *Queue) loadDir(dir, expectID string) (*Envelope, error) {
 	if err != nil {
 		return nil, fmt.Errorf("missing body: %w", err)
 	}
-
-	file.Close()
+	defer file.Close()
 
 	if info.Size() != env.Size {
 		return nil, fmt.Errorf("body size mismatch: metadata=%d actual=%d", env.Size, info.Size())
+	}
+
+	err = verifyBodyHandle(file, env.Size, env.BodyDigest)
+	if err != nil {
+		return nil, err
 	}
 
 	return env, nil
@@ -2671,14 +2787,56 @@ func openRegularFromInfo(path string, before os.FileInfo) (*os.File, os.FileInfo
 }
 
 type trackedReader struct {
-	file  *os.File
-	queue *Queue
-	once  sync.Once
-	err   error
+	file      *os.File
+	queue     *Queue
+	remaining int64
+	digest    string
+	hash      hash.Hash
+	verified  bool
+	once      sync.Once
+	err       error
 }
 
 func (r *trackedReader) Read(p []byte) (int, error) {
-	return r.file.Read(p)
+	if r.verified {
+		return 0, io.EOF
+	}
+
+	if r.remaining == 0 {
+		var extra [1]byte
+		n, err := r.file.Read(extra[:])
+		if n != 0 {
+			return 0, errors.New("body size mismatch while reading: body grew")
+		}
+
+		if err != nil && !errors.Is(err, io.EOF) {
+			return 0, err
+		}
+
+		actual := bodyDigestPrefix + hex.EncodeToString(r.hash.Sum(nil))
+		if actual != r.digest {
+			return 0, fmt.Errorf("body digest mismatch: metadata=%s actual=%s", r.digest, actual)
+		}
+
+		r.verified = true
+		return 0, io.EOF
+	}
+
+	if int64(len(p)) > r.remaining {
+		p = p[:r.remaining]
+	}
+
+	n, err := r.file.Read(p)
+	if n > 0 {
+		_, _ = r.hash.Write(p[:n])
+		r.remaining -= int64(n)
+	}
+
+	if errors.Is(err, io.EOF) && r.remaining != 0 {
+		return n, fmt.Errorf("body size mismatch while reading: %d bytes missing", r.remaining)
+	}
+
+	return n, err
 }
 
 func (r *trackedReader) Close() error {
@@ -2689,7 +2847,7 @@ func (r *trackedReader) Close() error {
 	return r.err
 }
 
-func (q *Queue) openBody(path string, expected int64) (*os.File, error) {
+func (q *Queue) openBody(path string, expected int64, digest string) (*os.File, error) {
 	file, info, err := openRegular(path)
 	if err != nil {
 		return nil, err
@@ -2715,16 +2873,26 @@ func (q *Queue) openBody(path string, expected int64) (*os.File, error) {
 		return nil, fmt.Errorf("body size mismatch: metadata=%d actual=%d", expected, info.Size())
 	}
 
+	err = verifyBodyHandle(file, expected, digest)
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+
 	return file, nil
 
 }
 
-func readBodyFromFile(file *os.File, expected int64) ([]byte, error) {
+func readBodyFromFile(file *os.File, expected int64, digest string) ([]byte, error) {
 	var body bytes.Buffer
-
-	err := copyExactBody(&body, file, expected)
+	hash := sha256.New()
+	err := copyExactBody(io.MultiWriter(&body, hash), file, expected)
 	if err != nil {
 		return nil, err
+	}
+	actual := bodyDigestPrefix + hex.EncodeToString(hash.Sum(nil))
+	if actual != digest {
+		return nil, fmt.Errorf("body digest mismatch: metadata=%s actual=%s", digest, actual)
 	}
 
 	return body.Bytes(), nil
@@ -2755,6 +2923,32 @@ func copyExactBody(dst io.Writer, file *os.File, expected int64) error {
 	}
 
 	return nil
+}
+
+func bodyDigest(body []byte) string {
+	sum := sha256.Sum256(body)
+	return bodyDigestPrefix + hex.EncodeToString(sum[:])
+}
+
+func verifyBodyHandle(file *os.File, expected int64, digest string) error {
+	_, err := file.Seek(0, io.SeekStart)
+	if err != nil {
+		return err
+	}
+
+	hash := sha256.New()
+	err = copyExactBody(hash, file, expected)
+	if err != nil {
+		return err
+	}
+
+	actual := bodyDigestPrefix + hex.EncodeToString(hash.Sum(nil))
+	if actual != digest {
+		return fmt.Errorf("body digest mismatch: metadata=%s actual=%s", digest, actual)
+	}
+
+	_, err = file.Seek(0, io.SeekStart)
+	return err
 }
 
 // Open loads an existing spool directory, creating it when needed.
@@ -2793,7 +2987,17 @@ func Open(directory string, limits Limits) (*Queue, error) {
 		q.FreeDisk = disk.FreeBytes
 	}
 
-	err := disk.MkdirDurable(q.root)
+	err := disk.ValidatePath(q.root)
+	if err != nil {
+		return nil, err
+	}
+
+	err = disk.MkdirDurable(q.root)
+	if err != nil {
+		return nil, err
+	}
+
+	err = disk.ValidatePath(q.root)
 	if err != nil {
 		return nil, err
 	}
@@ -2812,6 +3016,12 @@ func Open(directory string, limits Limits) (*Queue, error) {
 	for _, d := range []string{q.ready, q.dead, q.tmp, q.dsn, q.corr, q.trash} {
 
 		err = disk.MkdirDurable(d)
+		if err != nil {
+			_ = q.Close()
+			return nil, err
+		}
+
+		err = disk.ValidatePath(d)
 		if err != nil {
 			_ = q.Close()
 			return nil, err
@@ -2870,10 +3080,21 @@ func Open(directory string, limits Limits) (*Queue, error) {
 // Supported: DeadIDs, LoadDead, ExportDead, ReadBody, Path, DeadDir.
 // Mutating methods return ErrReadOnly.
 func OpenReadOnly(directory string) (*Queue, error) {
+	err := disk.ValidatePath(directory)
+	if err != nil {
+		return nil, err
+	}
+
+	dead := filepath.Join(directory, dirDead)
+	err = disk.ValidatePath(dead)
+	if err != nil {
+		return nil, err
+	}
+
 	q := &Queue{
 		root:          directory,
 		ready:         filepath.Join(directory, dirReady),
-		dead:          filepath.Join(directory, dirDead),
+		dead:          dead,
 		tmp:           filepath.Join(directory, dirTmp),
 		dsn:           filepath.Join(directory, dirDSN),
 		corr:          filepath.Join(directory, dirCorrupt),
@@ -2892,27 +3113,46 @@ func OpenReadOnly(directory string) (*Queue, error) {
 	return q, nil
 }
 
-// Close releases the exclusive spool lock.
+// Close releases the exclusive spool lock after all active operations finish.
 func (q *Queue) Close() error {
+	return q.CloseContext(context.Background())
+}
+
+// CloseContext starts closing the queue and waits up to ctx's deadline. Once
+// started, close is irreversible: new operations are rejected and blocked Next
+// calls are woken. A deadline only bounds this wait; it cannot cancel arbitrary
+// filesystem calls or open readers. The spool lock remains held until every
+// active operation finishes and the close completes in the background.
+func (q *Queue) CloseContext(ctx context.Context) error {
 	if q == nil {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	q.mu.Lock()
+	if !q.closing {
+		q.closing = true
+		close(q.closeSignal)
+		go q.finishClose()
+	}
+	done := q.closeDone
+	q.mu.Unlock()
 
-	if q.closing {
-		done := q.closeDone
-		q.mu.Unlock()
-		<-done
+	select {
+	case <-done:
 		q.mu.Lock()
 		err := q.closeErr
 		q.mu.Unlock()
 		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
+}
 
-	q.closing = true
-	close(q.closeSignal)
-
+func (q *Queue) finishClose() {
+	q.mu.Lock()
 	for q.active > 0 {
 		q.closeCond.Wait()
 	}
@@ -2931,7 +3171,6 @@ func (q *Queue) Close() error {
 	q.closeErr = err
 	close(q.closeDone)
 	q.mu.Unlock()
-	return err
 }
 
 // OpenDefault is Open with unlimited quotas.
@@ -3278,10 +3517,15 @@ func (q *Queue) loadAcceptedDir(dir, expectID string) (*Envelope, error) {
 		return nil, fmt.Errorf("missing body: %w", err)
 	}
 
-	file.Close()
+	defer file.Close()
 
 	if info.Size() != env.Size {
 		return nil, fmt.Errorf("body size mismatch: metadata=%d actual=%d", env.Size, info.Size())
+	}
+
+	err = verifyBodyHandle(file, env.Size, env.BodyDigest)
+	if err != nil {
+		return nil, err
 	}
 
 	return env, nil
@@ -3311,7 +3555,7 @@ func (q *Queue) openAcceptedBody(dir, expectID string) (*Envelope, *os.File, err
 		return nil, nil, err
 	}
 
-	file, err := q.openBody(filepath.Join(dir, bodyName), env.Size)
+	file, err := q.openBody(filepath.Join(dir, bodyName), env.Size, env.BodyDigest)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -3326,7 +3570,7 @@ func (q *Queue) removeTrash(path string) error {
 }
 
 func (q *Queue) quarantineDir(src, name string) error {
-	err := disk.Mkdir(q.corr)
+	err := ensureDurableDir(q.corr)
 	if err != nil {
 		return err
 	}
@@ -3338,22 +3582,17 @@ func (q *Queue) quarantineDir(src, name string) error {
 		return fmt.Errorf("quarantine %s: %w", src, err)
 	}
 
-	err = disk.Sync(filepath.Dir(src))
-	if err != nil {
-		return fmt.Errorf("sync quarantine source %s: %w", src, err)
-	}
-
 	return nil
 }
 
 func (q *Queue) quarantineFile(src, name string) error {
-	err := disk.Mkdir(q.corr)
+	err := ensureDurableDir(q.corr)
 	if err != nil {
 		return err
 	}
 
 	dstDir := filepath.Join(q.corr, name+"."+strconv.FormatInt(time.Now().UnixNano(), 10))
-	err = disk.Mkdir(dstDir)
+	err = disk.MkdirDurable(dstDir)
 	if err != nil {
 		return err
 	}
@@ -3361,11 +3600,29 @@ func (q *Queue) quarantineFile(src, name string) error {
 	dst := filepath.Join(dstDir, filepath.Base(src))
 	err = disk.Rename(src, dst)
 	if err != nil {
-		_ = os.Remove(dstDir)
-		return fmt.Errorf("quarantine file %s: %w", src, err)
+		removeErr := os.Remove(dstDir)
+		syncErr := disk.Sync(q.corr)
+		return errors.Join(fmt.Errorf("quarantine file %s: %w", src, err), removeErr, syncErr)
 	}
 
 	return nil
+}
+
+func ensureDurableDir(path string) error {
+	info, err := os.Stat(path)
+	if err == nil {
+		if !info.IsDir() {
+			return &os.PathError{Op: "mkdir", Path: path, Err: os.ErrExist}
+		}
+
+		return nil
+	}
+
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	return disk.MkdirDurable(path)
 }
 
 func sanitize(s string) string {
@@ -3478,6 +3735,19 @@ func validateEnvelope(e *Envelope) error {
 
 	if e.Size < 0 {
 		return errors.New("negative size")
+	}
+
+	if len(e.BodyDigest) != len(bodyDigestPrefix)+sha256.Size*2 || !strings.HasPrefix(e.BodyDigest, bodyDigestPrefix) {
+		return errors.New("missing or invalid body digest")
+	}
+
+	digestBytes, err := hex.DecodeString(strings.TrimPrefix(e.BodyDigest, bodyDigestPrefix))
+	if err != nil {
+		return errors.New("invalid body digest")
+	}
+
+	if bodyDigestPrefix+hex.EncodeToString(digestBytes) != e.BodyDigest {
+		return errors.New("non-canonical body digest")
 	}
 
 	needUTF8 := false
@@ -3595,7 +3865,7 @@ func envelopeMetadataWithinLimit(e *Envelope) bool {
 	// per envelope and recipient so validation rejects before marshaling.
 	remaining := int64(maxEnvelopeMetadata) - 2048 - int64(len(e.Recipients))*256
 	strings := []string{
-		e.ID, e.Incarnation, e.Username, e.Sender, e.LastError, e.DSNID,
+		e.ID, e.Incarnation, e.Username, e.Sender, e.LastError, e.BodyDigest, e.DSNID,
 		e.DSNSourceID, e.DSNSourceIncarnation,
 	}
 

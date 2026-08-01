@@ -51,6 +51,73 @@ func TestLoadIsReadOnly(t *testing.T) {
 	}
 }
 
+func TestEnsureCreatesKeyOnce(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.Server.DataDirectory = dir
+
+	first, created, err := Ensure(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !created {
+		t.Fatal("first provision did not create key")
+	}
+
+	path := filepath.Join(dir, cfg.DKIM.PrivateKeyFile)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second, created, err := Ensure(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if created {
+		t.Fatal("second provision replaced key")
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(after) != string(before) || second.PublicKey != first.PublicKey {
+		t.Fatal("second provision changed key identity")
+	}
+}
+
+func TestEnsureDoesNotReplaceMalformedExistingKey(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.Server.DataDirectory = dir
+	path := filepath.Join(dir, cfg.DKIM.PrivateKeyFile)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	before := []byte("not a private key\n")
+	if err := os.WriteFile(path, before, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := Ensure(cfg); err == nil {
+		t.Fatal("provision accepted malformed existing key")
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(after) != string(before) {
+		t.Fatal("provision replaced malformed existing key")
+	}
+}
+
 func TestParseKeyRejectsWeakAndInvalidRSA(t *testing.T) {
 	weak, err := rsa.GenerateKey(rand.Reader, 1024)
 	if err != nil {

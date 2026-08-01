@@ -76,6 +76,7 @@ func testEnv(id string) *Envelope {
 		},
 		Created:     now,
 		NextAttempt: now,
+		BodyDigest:  bodyDigest(nil),
 	}
 }
 
@@ -151,6 +152,7 @@ func writeQueueEntry(t *testing.T, root, namespace string, env *Envelope, body [
 		t.Fatal(err)
 	}
 
+	env.BodyDigest = bodyDigest(body)
 	raw, err := json.Marshal(env)
 	if err != nil {
 		t.Fatal(err)
@@ -220,6 +222,25 @@ func TestAddPersistsAndOpenRecovers(t *testing.T) {
 
 	if got.ID != "msg001" || got.Username != "alice" {
 		t.Fatalf("unexpected envelope %#v", got)
+	}
+}
+
+func TestOpenRejectsSymlinkNamespaceComponent(t *testing.T) {
+	clearHooks(t)
+	parent := t.TempDir()
+	external := t.TempDir()
+	link := filepath.Join(parent, "linked")
+	err := os.Symlink(external, link)
+	if err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	q, err := Open(filepath.Join(link, "spool"), Limits{})
+	if q != nil {
+		_ = q.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "symbolic link or reparse point") {
+		t.Fatalf("Open error=%v", err)
 	}
 }
 
@@ -407,6 +428,45 @@ func TestFailedAddQuarantineRemainsPhysicallyAccounted(t *testing.T) {
 
 	if len(ids) != 1 {
 		t.Fatalf("corrupt IDs=%v want one retained entry", ids)
+	}
+}
+
+func TestAddAcceptanceSyncErrorNeverReturnsSuccess(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	id := "ambiguous-acceptance"
+	readyDir := filepath.Join(root, dirReady, id)
+	statePath := filepath.Join(readyDir, addStateName)
+	wantSync := errors.New("acceptance sync failed")
+	wantRollback := errors.New("rollback unavailable")
+	wantQuarantine := errors.New("quarantine unavailable")
+	q.beforeAddRollback = func() error { return wantRollback }
+	disk.SetHooks(disk.Hooks{
+		AfterSyncFile: func(path string) error {
+			if filepath.Clean(path) == filepath.Clean(statePath) {
+				return wantSync
+			}
+
+			return nil
+		},
+		BeforeRename: func(oldpath, _ string) error {
+			if filepath.Clean(oldpath) == filepath.Clean(readyDir) {
+				return wantQuarantine
+			}
+
+			return nil
+		},
+	})
+
+	err := q.Add(testEnv(id), []byte("body"))
+	if !errors.Is(err, wantSync) || !errors.Is(err, wantRollback) || !errors.Is(err, wantQuarantine) {
+		t.Fatalf("Add error=%v", err)
+	}
+
+	state, readErr := os.ReadFile(statePath)
+	if readErr != nil || string(state) != addAccepted {
+		t.Fatalf("visible acceptance marker=%q err=%v", state, readErr)
 	}
 }
 
@@ -1353,6 +1413,51 @@ func TestReviveDeadReservesCapacityAndRollsBack(t *testing.T) {
 	}
 }
 
+func TestReviveDeadCyclesDoNotGrowCachedSpoolUsage(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	env := testEnv("revive-usage-cycles")
+	err := q.Add(env, []byte("body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Recipients[0].Status = StatusFailed
+	err = q.Bury(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := q.SpoolStats().Used
+
+	for i := range 5 {
+		_, err = q.ReviveDead(env.ID)
+		if err != nil {
+			t.Fatalf("revive %d: %v", i, err)
+		}
+		stats := q.SpoolStats()
+		if stats.Used != want || stats.Reserved != 0 {
+			t.Fatalf("revive %d spool estimate=%+v want Used=%d Reserved=0", i, stats, want)
+		}
+
+		got, err = q.Next(context.Background())
+		if err != nil {
+			t.Fatalf("next %d: %v", i, err)
+		}
+		got.Recipients[0].Status = StatusFailed
+		err = q.Bury(got)
+		if err != nil {
+			t.Fatalf("bury %d: %v", i, err)
+		}
+		if used := q.SpoolStats().Used; used != want {
+			t.Fatalf("bury %d cached usage=%d want %d", i, used, want)
+		}
+	}
+}
+
 func TestReviveDeadRollsBackActivationFailure(t *testing.T) {
 	clearHooks(t)
 	root := t.TempDir()
@@ -1669,7 +1774,7 @@ func TestConcurrentAddNext(t *testing.T) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, n*2)
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -1685,10 +1790,8 @@ func TestConcurrentAddNext(t *testing.T) {
 	defer cancel()
 	var got atomic.Int32
 
-	for i := 0; i < 4; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 4 {
+		wg.Go(func() {
 
 			for {
 				if int(got.Load()) >= n {
@@ -1703,7 +1806,7 @@ func TestConcurrentAddNext(t *testing.T) {
 				got.Add(1)
 				_ = q.Finish(e)
 			}
-		}()
+		})
 	}
 
 	wg.Wait()
@@ -1782,6 +1885,34 @@ func TestDSNExemptFromMessageQuota(t *testing.T) {
 	err = q.Add(testEnv("ord2"), []byte("b"))
 	if !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("ordinary Add want ErrQueueFull got %v", err)
+	}
+}
+
+func TestAddDSNCommitsOnlyPersistentEntryUsage(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+
+	for i := range 5 {
+		source := testEnv(fmt.Sprintf("dsn-usage-source-%d", i))
+		err := q.Add(source, []byte("source"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dsn := testDSN(source)
+		before := q.SpoolStats().Used
+		err = q.AddDSN(source, dsn, []byte("dsn"))
+		if err != nil {
+			t.Fatalf("AddDSN %d: %v", i, err)
+		}
+		meta, err := marshalEnvelope(dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantDelta := estimatePersistentEntryAllocation(dsn.Size, len(meta))
+		stats := q.SpoolStats()
+		if stats.Used-before != wantDelta || stats.Reserved != 0 {
+			t.Fatalf("AddDSN %d spool delta=%d Reserved=%d want delta=%d Reserved=0", i, stats.Used-before, stats.Reserved, wantDelta)
+		}
 	}
 }
 
@@ -2233,6 +2364,7 @@ func TestAddDoesNotQuarantineUnreadableReadyState(t *testing.T) {
 	q := mustOpen(t, root, Limits{})
 	env := testEnv("unreadable-ready-state")
 	env.Size = int64(len("original"))
+	env.BodyDigest = bodyDigest([]byte("original"))
 	readyDir := filepath.Join(root, dirReady, env.ID)
 	err := disk.Mkdir(readyDir)
 	if err != nil {
@@ -2732,6 +2864,31 @@ func TestOpenReadOnlyAlongsideLocked(t *testing.T) {
 		t.Fatalf("Add want ErrReadOnly got %v", err)
 	}
 
+}
+
+func TestOpenReadOnlyRejectsLinkedDeadNamespace(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	err := q.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = os.Remove(filepath.Join(root, dirDead))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = os.Symlink(t.TempDir(), filepath.Join(root, dirDead))
+	if err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	_, err = OpenReadOnly(root)
+	if err == nil || !strings.Contains(err.Error(), "symbolic link or reparse point") {
+		t.Fatalf("OpenReadOnly error=%v", err)
+	}
 }
 
 func TestCorruptNeverDeletedSilently(t *testing.T) {
@@ -3464,7 +3621,7 @@ func TestCloseBroadcastsToBlockedNextCalls(t *testing.T) {
 	const consumers = 4
 	nextResults := make(chan error, consumers)
 
-	for i := 0; i < consumers; i++ {
+	for range consumers {
 		go func() {
 			_, err := q.Next(context.Background())
 			nextResults <- err
@@ -3485,7 +3642,7 @@ func TestCloseBroadcastsToBlockedNextCalls(t *testing.T) {
 		t.Fatal("Close blocked with multiple Next calls")
 	}
 
-	for i := 0; i < consumers; i++ {
+	for i := range consumers {
 		err := <-nextResults
 		if !errors.Is(err, ErrQueueClosed) {
 			t.Fatalf("Next[%d] error=%v want ErrQueueClosed", i, err)
@@ -3500,7 +3657,7 @@ func TestConcurrentCloseAndBlockedNextStress(t *testing.T) {
 		closers    = 8
 	)
 
-	for iteration := 0; iteration < iterations; iteration++ {
+	for iteration := range iterations {
 		q, err := OpenReadOnly(t.TempDir())
 		if err != nil {
 			t.Fatal(err)
@@ -3508,7 +3665,7 @@ func TestConcurrentCloseAndBlockedNextStress(t *testing.T) {
 
 		nextResults := make(chan error, consumers)
 
-		for i := 0; i < consumers; i++ {
+		for range consumers {
 			go func() {
 				_, err := q.Next(context.Background())
 				nextResults <- err
@@ -3519,18 +3676,18 @@ func TestConcurrentCloseAndBlockedNextStress(t *testing.T) {
 
 		closeResults := make(chan error, closers)
 
-		for i := 0; i < closers; i++ {
+		for range closers {
 			go func() { closeResults <- q.Close() }()
 		}
 
-		for i := 0; i < closers; i++ {
+		for i := range closers {
 			err = <-closeResults
 			if err != nil {
 				t.Fatalf("iteration %d Close[%d]: %v", iteration, i, err)
 			}
 		}
 
-		for i := 0; i < consumers; i++ {
+		for i := range consumers {
 			err = <-nextResults
 			if !errors.Is(err, ErrQueueClosed) {
 				t.Fatalf("iteration %d Next[%d] error=%v want ErrQueueClosed", iteration, i, err)
@@ -3593,7 +3750,7 @@ func TestCloseWaitsForActiveDiskOperationAndIsConcurrentSafe(t *testing.T) {
 	const closers = 16
 	closeResults := make(chan error, closers)
 
-	for i := 0; i < closers; i++ {
+	for range closers {
 		go func() { closeResults <- q.Close() }()
 	}
 
@@ -3611,11 +3768,66 @@ func TestCloseWaitsForActiveDiskOperationAndIsConcurrentSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < closers; i++ {
+	for i := range closers {
 		err = <-closeResults
 		if err != nil {
 			t.Fatalf("Close[%d]: %v", i, err)
 		}
+	}
+
+	disk.SetHooks(disk.Hooks{})
+	reopened := mustOpen(t, root, Limits{})
+	if reopened.Len() != 1 {
+		t.Fatalf("reopened Len=%d want 1", reopened.Len())
+	}
+}
+
+func TestCloseContextKeepsLockUntilBlockedMutationFinishes(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	err := q.Add(testEnv("close-context-active"), []byte("body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	disk.SetHooks(disk.Hooks{BeforeRename: func(_, newpath string) error {
+		if filepath.Clean(newpath) == filepath.Join(root, dirReady, got.ID, metaName) {
+			close(entered)
+			<-release
+		}
+
+		return nil
+	}})
+	retryResult := make(chan error, 1)
+	go func() { retryResult <- q.Retry(got) }()
+	<-entered
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err = q.CloseContext(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CloseContext error=%v want deadline exceeded", err)
+	}
+
+	_, err = Open(root, Limits{})
+	if !errors.Is(err, disk.ErrLocked) {
+		t.Fatalf("Open after CloseContext timeout error=%v want ErrLocked", err)
+	}
+
+	close(release)
+	if err = <-retryResult; err != nil {
+		t.Fatal(err)
+	}
+	if err = q.Close(); err != nil {
+		t.Fatal(err)
 	}
 
 	disk.SetHooks(disk.Hooks{})
@@ -3718,6 +3930,262 @@ func TestReadBodyRejectsConcurrentGrowth(t *testing.T) {
 	_, err = q.ReadBody(env.ID)
 	if err == nil || !strings.Contains(err.Error(), "body size mismatch") {
 		t.Fatalf("ReadBody error=%v want body size mismatch", err)
+	}
+}
+
+func TestReadBodyHashesBytesReadAfterValidation(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("read-body-post-validation-mutation")
+	err := q.Add(env, []byte("original"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	q.afterBodyVerify = func() {
+		q.afterBodyVerify = nil
+		err := os.WriteFile(filepath.Join(root, dirReady, env.ID, bodyName), []byte("mutated!"), 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err = q.ReadBody(env.ID)
+	if err == nil || !strings.Contains(err.Error(), "body digest mismatch") {
+		t.Fatalf("ReadBody error=%v", err)
+	}
+}
+
+func TestExportDeadEmitsNoBytesChangedAfterValidation(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("export-dead-post-validation-mutation")
+	err := q.Add(env, []byte("original"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Recipients[0].Status = StatusFailed
+	err = q.Bury(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	q.afterBodyVerify = func() {
+		q.afterBodyVerify = nil
+		err := os.WriteFile(filepath.Join(root, dirDead, env.ID, bodyName), []byte("mutated!"), 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var exported bytes.Buffer
+	err = q.ExportDead(env.ID, &exported)
+	if err == nil || !strings.Contains(err.Error(), "body digest mismatch") {
+		t.Fatalf("ExportDead error=%v", err)
+	}
+	if exported.Len() != 0 {
+		t.Fatalf("ExportDead emitted %d unchecked bytes", exported.Len())
+	}
+}
+
+func TestBodyDigestRejectsSameLengthMutation(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("digest-mutation")
+	err := q.Add(env, []byte("original"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.HasPrefix(env.BodyDigest, bodyDigestPrefix) {
+		t.Fatalf("BodyDigest=%q", env.BodyDigest)
+	}
+
+	err = os.WriteFile(filepath.Join(root, dirReady, env.ID, bodyName), []byte("mutated!"), 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = q.ReadBody(env.ID)
+	if err == nil || !strings.Contains(err.Error(), "body digest mismatch") {
+		t.Fatalf("ReadBody error=%v", err)
+	}
+
+	q = mustReopen(t, q, root, Limits{})
+	if q.Len() != 0 || len(q.Corrupt) == 0 {
+		t.Fatalf("mutated body loaded: Len=%d Corrupt=%v", q.Len(), q.Corrupt)
+	}
+}
+
+func TestDeadDigestMismatchRejectsLoadExportAndRevive(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("dead-digest-mismatch")
+	env.Size = int64(len("original"))
+	dir := writeQueueEntry(t, root, dirDead, env, []byte("original"))
+	err := os.WriteFile(filepath.Join(dir, bodyName), []byte("mutated!"), 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = q.LoadDead(env.ID)
+	if err == nil || !strings.Contains(err.Error(), "body digest mismatch") {
+		t.Fatalf("LoadDead error=%v", err)
+	}
+
+	err = q.ExportDead(env.ID, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "body digest mismatch") {
+		t.Fatalf("ExportDead error=%v", err)
+	}
+
+	_, err = q.ReviveDead(env.ID)
+	if err == nil || !strings.Contains(err.Error(), "body digest mismatch") {
+		t.Fatalf("ReviveDead error=%v", err)
+	}
+}
+
+func TestOpenQuarantinesDigestMismatchInDSNStage(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	source := testEnv("dsn-stage-digest-source")
+	err := q.Add(source, []byte("source"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dsn := testDSN(source)
+	sourceMeta := filepath.Join(root, dirReady, source.ID, metaName)
+	disk.SetHooks(disk.Hooks{BeforeRename: func(_, newpath string) error {
+		if filepath.Clean(newpath) == sourceMeta {
+			return errors.New("leave DSN stage")
+		}
+		return nil
+	}})
+	err = q.AddDSN(source, dsn, []byte("original"))
+	if err == nil {
+		t.Fatal("AddDSN unexpectedly succeeded")
+	}
+	disk.SetHooks(disk.Hooks{})
+
+	err = os.WriteFile(filepath.Join(root, dirDSN, dsn.ID, bodyName), []byte("mutated!"), 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q = mustReopen(t, q, root, Limits{})
+	if len(q.Corrupt) == 0 || len(corruptEntries(t, root)) == 0 {
+		t.Fatal("digest-mismatched DSN stage was not reported and quarantined")
+	}
+	_, err = os.Stat(filepath.Join(root, dirReady, dsn.ID))
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("digest-mismatched DSN was published: %v", err)
+	}
+}
+
+func TestOpenQuarantinesDigestMismatchFromReviveMetadata(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("revive-metadata-digest")
+	err := q.Add(env, []byte("original"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Recipients[0].Status = StatusFailed
+	err = q.Bury(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got.BodyDigest = bodyDigest([]byte("mutated!"))
+	deadDir := filepath.Join(root, dirDead, got.ID)
+	err = q.writeMeta(filepath.Join(deadDir, reviveMetaName), got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = os.Rename(deadDir, filepath.Join(root, dirReady, got.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	q = mustReopen(t, q, root, Limits{})
+	if q.Len() != 0 || len(q.Corrupt) == 0 || len(corruptEntries(t, root)) == 0 {
+		t.Fatalf("revive digest mismatch loaded: Len=%d Corrupt=%v", q.Len(), q.Corrupt)
+	}
+}
+
+func TestReaderRejectsMutationAfterOpen(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("reader-exact-body")
+	err := q.Add(env, []byte("original"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := q.Reader(env.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	err = os.WriteFile(filepath.Join(root, dirReady, env.ID, bodyName), []byte("mutated!"), 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = io.ReadAll(reader)
+	if err == nil || !strings.Contains(err.Error(), "body digest mismatch") {
+		t.Fatalf("Reader error=%v", err)
+	}
+}
+
+func TestOpenRejectsMissingBodyDigest(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	_ = mustOpen(t, root, Limits{}).Close()
+	env := testEnv("missing-digest")
+	env.Size = 4
+	env.BodyDigest = ""
+	dir := filepath.Join(root, dirReady, env.ID)
+	err := os.MkdirAll(dir, 0700)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = os.WriteFile(filepath.Join(dir, metaName), raw, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = os.WriteFile(filepath.Join(dir, bodyName), []byte("body"), 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeAcceptedMarker(t, dir)
+
+	q := mustOpen(t, root, Limits{})
+	if q.Len() != 0 || len(q.Corrupt) == 0 {
+		t.Fatalf("digestless body loaded: Len=%d Corrupt=%v", q.Len(), q.Corrupt)
 	}
 }
 
@@ -3909,7 +4377,7 @@ func TestRevisionBoundaryMutationSafety(t *testing.T) {
 
 	q := mustOpen(t, root, Limits{})
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		env, err := q.Next(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -4043,6 +4511,127 @@ func TestPhysicalSpoolCountsEveryNamespace(t *testing.T) {
 	after := q.SpoolStats().Used
 	if after-before < 6*disk.AllocationSize(1) {
 		t.Fatalf("physical usage increase=%d want at least %d", after-before, 6*disk.AllocationSize(1))
+	}
+}
+
+func TestRetryMetadataReplacementReleasesAdmissionHold(t *testing.T) {
+	clearHooks(t)
+	q := mustOpen(t, t.TempDir(), Limits{})
+	env := testEnv("retry-admission-hold")
+	err := q.Add(env, []byte("body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := q.SpoolStats()
+	got.Attempts++
+	got.NextAttempt = time.Now().Add(time.Hour)
+	err = q.Retry(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	after := q.SpoolStats()
+	if after.Used != before.Used || after.Reserved != 0 {
+		t.Fatalf("spool estimate before=%+v after=%+v", before, after)
+	}
+}
+
+func TestRetryAndBuryMetadataFaultsDoNotGrowCachedUsage(t *testing.T) {
+	faults := []struct {
+		name  string
+		hooks func(string) disk.Hooks
+	}{
+		{
+			name: "after_temp_sync",
+			hooks: func(_ string) disk.Hooks {
+				return disk.Hooks{AfterSyncFile: func(path string) error {
+					if strings.HasPrefix(filepath.Base(path), "."+metaName+".tmp-") {
+						return errors.New("after temp sync")
+					}
+					return nil
+				}}
+			},
+		},
+		{
+			name: "before_rename",
+			hooks: func(metaPath string) disk.Hooks {
+				return disk.Hooks{BeforeRename: func(_, newpath string) error {
+					if filepath.Clean(newpath) == metaPath {
+						return errors.New("before metadata rename")
+					}
+					return nil
+				}}
+			},
+		},
+		{
+			name: "after_rename",
+			hooks: func(metaPath string) disk.Hooks {
+				return disk.Hooks{AfterRename: func(_, newpath string) error {
+					if filepath.Clean(newpath) == metaPath {
+						return errors.New("after metadata rename")
+					}
+					return nil
+				}}
+			},
+		},
+		{
+			name: "after_rename_before_directory_sync",
+			hooks: func(metaPath string) disk.Hooks {
+				return disk.Hooks{BeforeSyncDir: func(path string) error {
+					if filepath.Clean(path) == filepath.Dir(metaPath) {
+						return errors.New("before metadata directory sync")
+					}
+					return nil
+				}}
+			},
+		},
+	}
+
+	for _, operation := range []string{"retry", "bury"} {
+		for _, fault := range faults {
+			t.Run(operation+"/"+fault.name, func(t *testing.T) {
+				clearHooks(t)
+				root := t.TempDir()
+				q := mustOpen(t, root, Limits{})
+				env := testEnv(operation + "-" + fault.name)
+				err := q.Add(env, []byte("body"))
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				before := q.SpoolStats().Used
+				metaPath := filepath.Join(root, dirReady, env.ID, metaName)
+				disk.SetHooks(fault.hooks(metaPath))
+
+				for i := range 8 {
+					got, err := q.Next(context.Background())
+					if err != nil {
+						t.Fatal(err)
+					}
+					got.Attempts++
+					got.NextAttempt = time.Now()
+					if operation == "bury" {
+						got.Recipients[0].Status = StatusFailed
+						err = q.Bury(got)
+					} else {
+						err = q.Retry(got)
+					}
+					if err == nil {
+						t.Fatalf("iteration %d unexpectedly succeeded", i)
+					}
+
+					stats := q.SpoolStats()
+					if stats.Used != before || stats.Reserved != 0 {
+						t.Fatalf("iteration %d spool estimate before=%d after=%+v", i, before, stats)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -4377,6 +4966,45 @@ func TestFailedQuarantineBlocksBadEntryAndLoadsValidEntry(t *testing.T) {
 	_, err = os.Stat(bad)
 	if err != nil {
 		t.Fatalf("blocked evidence was removed: %v", err)
+	}
+}
+
+func TestQuarantineFileDurablySyncsDestinationAndSourceParents(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	src := filepath.Join(q.ready, "stray")
+	err := os.WriteFile(src, []byte("evidence"), 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var synced []string
+	disk.SetHooks(disk.Hooks{AfterSyncDir: func(path string) error {
+		synced = append(synced, filepath.Clean(path))
+		return nil
+	}})
+	err = q.quarantineFile(src, "stray")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seenCorrupt := false
+	seenDestination := false
+	seenSource := false
+	for _, path := range synced {
+		switch {
+		case path == filepath.Clean(q.corr):
+			seenCorrupt = true
+		case filepath.Dir(path) == filepath.Clean(q.corr):
+			seenDestination = true
+		case path == filepath.Clean(q.ready):
+			seenSource = true
+		}
+	}
+
+	if !seenCorrupt || !seenDestination || !seenSource {
+		t.Fatalf("durable quarantine syncs=%v", synced)
 	}
 }
 

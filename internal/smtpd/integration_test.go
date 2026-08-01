@@ -68,6 +68,7 @@ func testServerWithUser(t *testing.T, password string) (*Server, *config.Config,
 		"  private_key_file: dkim/mail.key",
 		"  headers:",
 		"    - From",
+		"    - Sender",
 		"    - To",
 		"    - Subject",
 		"    - Date",
@@ -242,6 +243,34 @@ func (c *smtpClient) cmd(t *testing.T, line string, want int) string {
 	return c.readCode(t, want)
 }
 
+func (c *smtpClient) cmdLines(t *testing.T, line string, want int) []string {
+	t.Helper()
+	c.writeLine(line)
+	var lines []string
+	for {
+		response, err := c.br.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		response = strings.TrimRight(response, "\r\n")
+		lines = append(lines, response)
+		if len(response) < 4 {
+			t.Fatalf("short reply %q", response)
+		}
+
+		var code int
+		fmt.Sscanf(response[:3], "%d", &code)
+		if code != want {
+			t.Fatalf("want %d got %q", want, response)
+		}
+
+		if response[3] == ' ' {
+			return lines
+		}
+	}
+}
+
 func (c *smtpClient) authPlain(t *testing.T, user, pass string) {
 	t.Helper()
 	payload := base64.StdEncoding.EncodeToString([]byte("\x00" + user + "\x00" + pass))
@@ -327,6 +356,38 @@ func TestSubmissionMessageSizeBoundary(t *testing.T) {
 			cl.authPlain(t, "alice", password)
 			beginMessage(t, cl, "")
 			_, _ = io.WriteString(cl.conn, messageOfSize(tt.size)+".\r\n")
+			cl.readCode(t, tt.code)
+		})
+	}
+}
+
+func TestSubmissionSizeProtocolBoundaries(t *testing.T) {
+	const password = "protocol-size-password"
+	srv, cfg, _, _, pool := testServerWithUser(t, password)
+	runTestSubmission(t, srv)
+	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
+	defer cl.close()
+
+	lines := cl.cmdLines(t, "EHLO size.test", 250)
+	wantCapability := fmt.Sprintf("SIZE %d", cfg.Server.MaxMessageBytes)
+	if !strings.Contains(strings.Join(lines, "\n"), wantCapability) {
+		t.Fatalf("EHLO capabilities %q do not contain %q", lines, wantCapability)
+	}
+
+	cl.authPlain(t, "alice", password)
+	cl.cmd(t, fmt.Sprintf("MAIL FROM:<Alice.Sender@test.example> SIZE=%d", cfg.Server.MaxMessageBytes), 250)
+	cl.cmd(t, "RSET", 250)
+	cl.cmd(t, fmt.Sprintf("MAIL FROM:<Alice.Sender@test.example> SIZE=%d", cfg.Server.MaxMessageBytes+1), 552)
+
+	for _, tt := range []submissionMessageSizeCase{
+		{"exact maximum", cfg.Server.MaxMessageBytes, 250},
+		{"one over maximum", cfg.Server.MaxMessageBytes + 1, 552},
+	} {
+		t.Run("BDAT "+tt.name, func(t *testing.T) {
+			cl.cmd(t, "MAIL FROM:<Alice.Sender@test.example>", 250)
+			cl.cmd(t, "RCPT TO:<dest@example.com>", 250)
+			cl.writeLine(fmt.Sprintf("BDAT %d LAST", tt.size))
+			_, _ = io.WriteString(cl.conn, messageOfSize(tt.size))
 			cl.readCode(t, tt.code)
 		})
 	}
@@ -487,7 +548,7 @@ func TestMalformedDataConsumesSubmissionBudget(t *testing.T) {
 	cl.authPlain(t, "alice", password)
 	cl.cmd(t, "MAIL FROM:<unauthorized@test.example>", 550)
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		beginMessage(t, cl, "")
 		_, _ = io.WriteString(cl.conn, "not-a-header\r\n\r\nbody\r\n.\r\n")
 		cl.readCode(t, 550)
@@ -548,6 +609,12 @@ func TestBody7BitAndReset(t *testing.T) {
 	beginMessage(t, cl, "8BITMIME")
 	writeMessage(cl, "caf\xc3\xa9")
 	cl.readCode(t, 250)
+	beginMessage(t, cl, "")
+	writeMessage(cl, "latin-1 caf\xe9")
+	cl.readCode(t, 550)
+	beginMessage(t, cl, "8BITMIME")
+	writeMessage(cl, "latin-1 caf\xe9")
+	cl.readCode(t, 250)
 
 	s := &session{body: smtp.Body7Bit, sender: "a@example.com", smtpUTF8: true}
 	s.Reset()
@@ -555,4 +622,32 @@ func TestBody7BitAndReset(t *testing.T) {
 	if s.body != "" || s.sender != "" || s.smtpUTF8 {
 		t.Fatalf("Reset retained transaction state: body=%q sender=%q utf8=%v", s.body, s.sender, s.smtpUTF8)
 	}
+}
+
+func TestOriginatorAuthorization(t *testing.T) {
+	const password = "originator-password"
+	srv, _, _, _, pool := testServerWithUser(t, password)
+	runTestSubmission(t, srv)
+	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
+	defer cl.close()
+	cl.authPlain(t, "alice", password)
+
+	for _, tt := range []struct {
+		name   string
+		header string
+	}{
+		{"unauthorized Sender", "Sender: attacker@test.example\r\n"},
+		{"unsupported Resent-From", "Resent-From: Alice.Sender@test.example\r\n"},
+		{"unsupported Resent-Sender", "Resent-Sender: Alice.Sender@test.example\r\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			beginMessage(t, cl, "")
+			_, _ = io.WriteString(cl.conn, "From: Alice.Sender@test.example\r\n"+tt.header+"To: dest@example.com\r\n\r\nbody\r\n.\r\n")
+			cl.readCode(t, 550)
+		})
+	}
+
+	beginMessage(t, cl, "")
+	_, _ = io.WriteString(cl.conn, "From: Alice.Sender@test.example\r\nSender: alice@test.example\r\nTo: dest@example.com\r\n\r\nbody\r\n.\r\n")
+	cl.readCode(t, 250)
 }

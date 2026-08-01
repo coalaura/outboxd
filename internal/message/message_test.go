@@ -6,12 +6,11 @@ import (
 	"testing"
 )
 
-func TestPrepareStripsBccResentBccReturnPath(t *testing.T) {
+func TestPrepareStripsBccAndReturnPath(t *testing.T) {
 	raw := "" +
 		"From: Alice <Alice@Example.COM>\r\n" +
 		"To: bob@example.com\r\n" +
 		"Bcc: secret@example.com\r\n" +
-		"Resent-Bcc: other@example.com\r\n" +
 		"Return-Path: <bounce@example.com>\r\n" +
 		"Subject: hi\r\n" +
 		"\r\n" +
@@ -23,7 +22,7 @@ func TestPrepareStripsBccResentBccReturnPath(t *testing.T) {
 
 	s := string(msg.Data)
 
-	for _, bad := range []string{"Bcc:", "Resent-Bcc:", "Return-Path:"} {
+	for _, bad := range []string{"Bcc:", "Return-Path:"} {
 
 		if strings.Contains(s, bad) {
 			t.Fatalf("outgoing still contains %s", bad)
@@ -59,7 +58,7 @@ func TestEightBitAndUTF8Flags(t *testing.T) {
 	}
 }
 
-func TestEightBitCharsetInferenceRequiresValidUTF8(t *testing.T) {
+func TestEightBitCharsetInferenceOnlyForUTF8(t *testing.T) {
 	valid := []byte("From: a@b.co\r\n\r\ncaf\xc3\xa9\r\n")
 	msg, err := Prepare(bytes.NewReader(valid), Options{Hostname: "h"})
 	if err != nil {
@@ -71,10 +70,77 @@ func TestEightBitCharsetInferenceRequiresValidUTF8(t *testing.T) {
 	}
 
 	invalid := []byte("From: a@b.co\r\n\r\nbad\xff\r\n")
-	_, err = Prepare(bytes.NewReader(invalid), Options{Hostname: "h"})
-	if err == nil {
-		t.Fatal("invalid UTF-8 8-bit body accepted with inferred semantics")
+	msg, err = Prepare(bytes.NewReader(invalid), Options{Hostname: "h"})
+	if err != nil {
+		t.Fatalf("non-UTF-8 8-bit body rejected: %v", err)
 	}
+
+	if bytes.Contains(msg.Data, []byte("charset=utf-8")) {
+		t.Fatal("non-UTF-8 body inferred as UTF-8")
+	}
+
+	if !bytes.Contains(msg.Data, []byte("Content-Transfer-Encoding: 8bit")) {
+		t.Fatal("non-UTF-8 body missing 8bit transfer encoding")
+	}
+}
+
+func TestSenderAndResentOriginators(t *testing.T) {
+	msg, err := Prepare(strings.NewReader("From: a@b.co\r\nSender: Sender@B.CO\r\n\r\nbody\r\n"), Options{Hostname: "h"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if msg.Sender != "Sender@b.co" || !bytes.Contains(msg.Data, []byte("Sender: Sender@B.CO")) {
+		t.Fatalf("Sender=%q data=%q", msg.Sender, msg.Data)
+	}
+
+	for _, name := range []string{"Resent-Date", "Resent-From", "Resent-Sender", "Resent-To", "Resent-Bcc"} {
+		raw := "From: a@b.co\r\n" + name + ": a@b.co\r\n\r\nbody\r\n"
+		if _, err := Prepare(strings.NewReader(raw), Options{Hostname: "h"}); err != errResent {
+			t.Fatalf("%s err=%v want %v", name, err, errResent)
+		}
+	}
+}
+
+func TestHeaderLimitsExactBoundaries(t *testing.T) {
+	fields := strings.Repeat("X:x\r\n", maxHeaderFields-1) + "From: a@b.co\r\n"
+	if _, err := Prepare(strings.NewReader(fields+"\r\nbody\r\n"), Options{Hostname: "h"}); err != nil {
+		t.Fatalf("exact field limit: %v", err)
+	}
+
+	if _, err := Prepare(strings.NewReader("X:x\r\n"+fields+"\r\nbody\r\n"), Options{Hostname: "h"}); err != errFieldCount {
+		t.Fatalf("field limit + 1 err=%v", err)
+	}
+
+	header := headerOfSize(t, maxHeaderBytes)
+	if _, err := Prepare(bytes.NewReader(append(append([]byte{}, header...), []byte("\r\nbody\r\n")...)), Options{Hostname: "h"}); err != nil {
+		t.Fatalf("exact header byte limit: %v", err)
+	}
+
+	header = append(header, 'x')
+	if _, err := Prepare(bytes.NewReader(append(append([]byte{}, header...), []byte("\r\nbody\r\n")...)), Options{Hostname: "h"}); err != errHeaderSize {
+		t.Fatalf("header byte limit + 1 err=%v", err)
+	}
+}
+
+func headerOfSize(t *testing.T, size int) []byte {
+	t.Helper()
+	header := []byte("From: a@b.co\r\nX: x\r\n")
+	for size-len(header) > 1000 {
+		header = append(header, ' ')
+		header = append(header, bytes.Repeat([]byte{'x'}, 997)...)
+		header = append(header, '\r', '\n')
+	}
+
+	remaining := size - len(header)
+	if remaining < 3 {
+		t.Fatalf("cannot construct header of %d bytes", size)
+	}
+
+	header = append(header, ' ')
+	header = append(header, bytes.Repeat([]byte{'x'}, remaining-3)...)
+	header = append(header, '\r', '\n')
+	return header
 }
 
 func TestRejectsInvalidUTF8Header(t *testing.T) {

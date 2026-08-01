@@ -20,6 +20,7 @@ import (
 	"unicode"
 
 	"github.com/coalaura/outboxd/internal/disk"
+	"github.com/coalaura/outboxd/internal/mailbox"
 	"github.com/coalaura/outboxd/internal/passwd"
 	"github.com/coalaura/outboxd/internal/queue"
 	"github.com/goccy/go-yaml"
@@ -132,12 +133,17 @@ type User struct {
 type durationEntry struct {
 	name  string
 	value string
+	max   time.Duration
 }
 
 const (
 	defaultConfigName    = "config.yml"
 	MaxMessageBytes      = int64(100 << 20)
 	MaxRecipients        = 1000
+	MaxMessagesPerHour   = 1_000_000
+	MaxRecipientsPerHour = 10_000_000
+	MaxMessageBurst      = MaxMessagesPerHour
+	MaxRecipientBurst    = MaxRecipientsPerHour
 	MaxDeliveryAttempts  = 1000
 	MaxDomainConcurrency = 1024
 	MaxGlobalConcurrency = 4096
@@ -145,6 +151,17 @@ const (
 	MaxConnectionsPerIP  = 10000
 	MaxAuthWorkers       = 16
 	SPFDNSLookupLimit    = 10
+
+	MaxSMTPReadTimeout           = 30 * time.Minute
+	MaxSMTPWriteTimeout          = 30 * time.Minute
+	MaxDeadRetention             = 365 * 24 * time.Hour
+	MaxCorruptRetention          = 365 * 24 * time.Hour
+	MaxDeliveryLifetime          = 30 * 24 * time.Hour
+	MaxInitialRetryDelay         = 24 * time.Hour
+	MaxRetryDelay                = 7 * 24 * time.Hour
+	MaxDeliveryConnectionTimeout = 2 * time.Minute
+	MaxDeliveryCommandTimeout    = 10 * time.Minute
+	MaxDeliverySubmissionTimeout = 30 * time.Minute
 
 	// EnvConfigPath overrides the config file path.
 	EnvConfigPath = "OUTBOXD_CONFIG"
@@ -189,6 +206,7 @@ func Default() *Config {
 			PrivateKeyFile: "dkim/mail.key",
 			Headers: []string{
 				"From",
+				"Sender",
 				"To",
 				"Cc",
 				"Subject",
@@ -294,7 +312,7 @@ func isYAMLEOF(err error) bool {
 func rejectMultiDoc(raw []byte) error {
 	count := 0
 
-	for _, line := range bytes.Split(raw, []byte("\n")) {
+	for line := range bytes.SplitSeq(raw, []byte("\n")) {
 		if bytes.Equal(bytes.TrimSpace(line), []byte("---")) {
 			count++
 
@@ -358,6 +376,12 @@ func EnsurePath(path string) (*Config, bool, error) {
 }
 
 func (cfg *Config) applyDefaults() {
+	if !slices.ContainsFunc(cfg.DKIM.Headers, func(header string) bool {
+		return strings.EqualFold(strings.TrimSpace(header), "Sender")
+	}) {
+		cfg.DKIM.Headers = append(cfg.DKIM.Headers, "Sender")
+	}
+
 	if cfg.Server.DisableSubmission {
 		cfg.Server.SubmissionAddr = ""
 	}
@@ -595,12 +619,20 @@ func (cfg *Config) Validate() error {
 		return fmt.Errorf("server.max_recipients must be between 1 and %d", MaxRecipients)
 	}
 
-	if cfg.Server.MaxMessagesPerHour <= 0 {
-		return errors.New("server.max_messages_per_hour must be positive")
+	if cfg.Server.MaxMessagesPerHour <= 0 || cfg.Server.MaxMessagesPerHour > MaxMessagesPerHour {
+		return fmt.Errorf("server.max_messages_per_hour must be between 1 and %d", MaxMessagesPerHour)
 	}
 
-	if cfg.Server.MaxRecipientsPerHour <= 0 {
-		return errors.New("server.max_recipients_per_hour must be positive")
+	if cfg.Server.MaxRecipientsPerHour <= 0 || cfg.Server.MaxRecipientsPerHour > MaxRecipientsPerHour {
+		return fmt.Errorf("server.max_recipients_per_hour must be between 1 and %d", MaxRecipientsPerHour)
+	}
+
+	if cfg.Server.MessageBurst < 0 || cfg.Server.MessageBurst > MaxMessageBurst || cfg.Server.MessageBurst > cfg.Server.MaxMessagesPerHour {
+		return fmt.Errorf("server.message_burst must be 0 (default) or between 1 and max_messages_per_hour, up to %d", MaxMessageBurst)
+	}
+
+	if cfg.Server.RecipientBurst < 0 || cfg.Server.RecipientBurst > MaxRecipientBurst || cfg.Server.RecipientBurst > cfg.Server.MaxRecipientsPerHour {
+		return fmt.Errorf("server.recipient_burst must be 0 (default) or between 1 and max_recipients_per_hour, up to %d", MaxRecipientBurst)
 	}
 
 	if cfg.Server.DataDirectory == "" {
@@ -632,24 +664,20 @@ func (cfg *Config) Validate() error {
 	}
 
 	durations := []durationEntry{
-		{"server.read_timeout", cfg.Server.ReadTimeout},
-		{"server.write_timeout", cfg.Server.WriteTimeout},
-		{"server.dead_retention", cfg.Server.DeadRetention},
-		{"server.corrupt_retention", cfg.Server.CorruptRetention},
-		{"delivery.maximum_lifetime", cfg.Delivery.MaximumLifetime},
-		{"delivery.initial_retry_delay", cfg.Delivery.InitialRetryDelay},
-		{"delivery.maximum_retry_delay", cfg.Delivery.MaximumRetryDelay},
-		{"delivery.connection_timeout", cfg.Delivery.ConnectionTimeout},
-		{"delivery.command_timeout", cfg.Delivery.CommandTimeout},
-		{"delivery.submission_timeout", cfg.Delivery.SubmissionTimeout},
-	}
-
-	if Duration(cfg.Server.DeadRetention) <= 0 || Duration(cfg.Server.CorruptRetention) <= 0 {
-		return errors.New("server.dead_retention and server.corrupt_retention must be positive")
+		{"server.read_timeout", cfg.Server.ReadTimeout, MaxSMTPReadTimeout},
+		{"server.write_timeout", cfg.Server.WriteTimeout, MaxSMTPWriteTimeout},
+		{"server.dead_retention", cfg.Server.DeadRetention, MaxDeadRetention},
+		{"server.corrupt_retention", cfg.Server.CorruptRetention, MaxCorruptRetention},
+		{"delivery.maximum_lifetime", cfg.Delivery.MaximumLifetime, MaxDeliveryLifetime},
+		{"delivery.initial_retry_delay", cfg.Delivery.InitialRetryDelay, MaxInitialRetryDelay},
+		{"delivery.maximum_retry_delay", cfg.Delivery.MaximumRetryDelay, MaxRetryDelay},
+		{"delivery.connection_timeout", cfg.Delivery.ConnectionTimeout, MaxDeliveryConnectionTimeout},
+		{"delivery.command_timeout", cfg.Delivery.CommandTimeout, MaxDeliveryCommandTimeout},
+		{"delivery.submission_timeout", cfg.Delivery.SubmissionTimeout, MaxDeliverySubmissionTimeout},
 	}
 
 	for _, duration := range durations {
-		err = validateDuration(duration.name, duration.value)
+		err = validateDuration(duration.name, duration.value, duration.max)
 		if err != nil {
 			return err
 		}
@@ -667,8 +695,20 @@ func (cfg *Config) Validate() error {
 		return errors.New("delivery.maximum_retry_delay must be <= maximum_lifetime")
 	}
 
-	if initial > 24*365*time.Hour {
-		return errors.New("delivery.initial_retry_delay is unreasonably large")
+	connection := Duration(cfg.Delivery.ConnectionTimeout)
+	command := Duration(cfg.Delivery.CommandTimeout)
+	submission := Duration(cfg.Delivery.SubmissionTimeout)
+
+	if connection > command {
+		return errors.New("delivery.connection_timeout must be <= command_timeout")
+	}
+
+	if submission < command {
+		return errors.New("delivery.submission_timeout must be >= command_timeout")
+	}
+
+	if connection > lifetime || command > lifetime || submission > lifetime {
+		return errors.New("delivery connection, command, and submission timeouts must be <= maximum_lifetime")
 	}
 
 	switch cfg.TLS.Mode {
@@ -702,6 +742,7 @@ func (cfg *Config) Validate() error {
 	}
 
 	hasFromHeader := false
+	hasSenderHeader := false
 	seenDKIMHeaders := make(map[string]struct{}, len(cfg.DKIM.Headers))
 
 	for _, header := range cfg.DKIM.Headers {
@@ -719,11 +760,17 @@ func (cfg *Config) Validate() error {
 		seenDKIMHeaders[canon] = struct{}{}
 		if canon == "from" {
 			hasFromHeader = true
+		} else if canon == "sender" {
+			hasSenderHeader = true
 		}
 	}
 
 	if !hasFromHeader {
 		return errors.New("dkim.headers must contain From")
+	}
+
+	if !hasSenderHeader {
+		return errors.New("dkim.headers must contain Sender")
 	}
 
 	switch cfg.Delivery.TLSMode {
@@ -910,16 +957,12 @@ func (u *User) Validate() error {
 			continue
 		}
 
-		address, err := mail.ParseAddress(sender)
-		if err != nil || address.Name != "" {
+		address, err := mailbox.Address(sender)
+		if err != nil {
 			return fmt.Errorf("user %q has invalid sender %q", u.Username, sender)
 		}
 
-		if address.Address != sender && sender != "<"+address.Address+">" {
-			return fmt.Errorf("user %q has invalid sender %q", u.Username, sender)
-		}
-
-		canonicalSender := strings.ToLower(address.Address)
+		canonicalSender := strings.ToLower(address)
 		_, exists := senders[canonicalSender]
 		if exists {
 			return fmt.Errorf("user %q has duplicate sender %q", u.Username, sender)
@@ -928,7 +971,7 @@ func (u *User) Validate() error {
 		senders[canonicalSender] = struct{}{}
 
 		// Preserve local-part case for policy storage / comparisons via Allows.
-		u.AllowedSenders[i] = address.Address
+		u.AllowedSenders[i] = address
 	}
 
 	return nil
@@ -1099,10 +1142,10 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.server.domain":                        {yaml.HeadComment(" sending domain used for DKIM, SPF, and DMARC; prefer a dedicated subdomain")},
 		"$.server.max_message_bytes":             {yaml.HeadComment(" maximum accepted message size in bytes")},
 		"$.server.max_recipients":                {yaml.HeadComment(" maximum recipients accepted for one message")},
-		"$.server.max_messages_per_hour":         {yaml.HeadComment(" per-user hourly message rate")},
-		"$.server.max_recipients_per_hour":       {yaml.HeadComment(" per-user hourly recipient rate")},
-		"$.server.message_burst":                 {yaml.HeadComment(" token-bucket burst for messages (default hourly/60)")},
-		"$.server.recipient_burst":               {yaml.HeadComment(" token-bucket burst for recipients (default hourly/60)")},
+		"$.server.max_messages_per_hour":         {yaml.HeadComment(" per-user hourly message rate (maximum 1000000)")},
+		"$.server.max_recipients_per_hour":       {yaml.HeadComment(" per-user hourly recipient rate (maximum 10000000)")},
+		"$.server.message_burst":                 {yaml.HeadComment(" token-bucket burst for messages (0 = hourly/60; otherwise no greater than hourly rate)")},
+		"$.server.recipient_burst":               {yaml.HeadComment(" token-bucket burst for recipients (0 = hourly/60; otherwise no greater than hourly rate)")},
 		"$.server.submission_addr":               {yaml.HeadComment(` STARTTLS submission listen address; default ":587"; empty disables`)},
 		"$.server.implicit_tls_addr":             {yaml.HeadComment(` implicit TLS submission listen address; default ":465"; empty disables`)},
 		"$.server.max_connections":               {yaml.HeadComment(" global concurrent submission connections")},
@@ -1110,14 +1153,14 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.server.auth_workers":                  {yaml.HeadComment(" concurrent Argon2id authentications (19 MiB each; maximum 16)")},
 		"$.server.max_queue_messages":            {yaml.HeadComment(" maximum ready queue message count (0 = unlimited)")},
 		"$.server.max_queue_bytes":               {yaml.HeadComment(" logical quota for ready message bodies only (0 = unlimited)")},
-		"$.server.max_spool_bytes":               {yaml.HeadComment(" hard physical quota across ready, tmp, dsn, dead, corrupt, and trash")},
-		"$.server.spool_emergency_bytes":         {yaml.HeadComment(" physical headroom reserved from submissions for DSNs and state transitions")},
+		"$.server.max_spool_bytes":               {yaml.HeadComment(" conservative admission estimate across ready, tmp, dsn, dead, corrupt, and trash; use a dedicated quota-controlled volume for a hard limit")},
+		"$.server.spool_emergency_bytes":         {yaml.HeadComment(" estimated spool headroom reserved from submissions for DSNs and state transitions")},
 		"$.server.min_free_disk_bytes":           {yaml.HeadComment(" refuse submissions when free disk is below this threshold")},
-		"$.server.dead_retention":                {yaml.HeadComment(" positive retention for dead letters before automatic pruning")},
-		"$.server.corrupt_retention":             {yaml.HeadComment(" positive retention for quarantined entries before automatic pruning")},
+		"$.server.dead_retention":                {yaml.HeadComment(" positive retention for dead letters before automatic pruning (maximum 365d)")},
+		"$.server.corrupt_retention":             {yaml.HeadComment(" positive retention for quarantined entries before automatic pruning (maximum 365d)")},
 		"$.server.include_client_ip_in_received": {yaml.HeadComment(" include the submitting client's IP address in Received headers")},
-		"$.server.read_timeout":                  {yaml.HeadComment(" maximum time spent waiting for an SMTP command")},
-		"$.server.write_timeout":                 {yaml.HeadComment(" maximum time spent writing an SMTP response")},
+		"$.server.read_timeout":                  {yaml.HeadComment(" SMTP command-idle, TLS-read, and DATA-read timeout (maximum 30m)")},
+		"$.server.write_timeout":                 {yaml.HeadComment(" SMTP response and TLS-write timeout (maximum 30m)")},
 		"$.server.data_directory":                {yaml.HeadComment(" generated keys, certificates, DNS instructions and queue data; relative to the config file directory")},
 
 		"$.tls":                           {yaml.HeadComment("\n# TLS used by the submission listeners")},
@@ -1129,7 +1172,7 @@ func (cfg *Config) marshal() ([]byte, error) {
 
 		"$.dkim":                  {yaml.HeadComment("\n# DKIM signing configuration")},
 		"$.dkim.selector":         {yaml.HeadComment(" DNS selector placed before _domainkey")},
-		"$.dkim.private_key_file": {yaml.HeadComment(" automatically generated when absent")},
+		"$.dkim.private_key_file": {yaml.HeadComment(" create-once signing key provisioned explicitly with 'outboxd provision'")},
 		"$.dkim.headers":          {yaml.HeadComment(" message headers included in the DKIM signature; From is mandatory")},
 
 		"$.delivery":                                  {yaml.HeadComment("\n# outbound SMTP delivery and retry policy")},
@@ -1138,14 +1181,14 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.delivery.bind_ipv4":                        {yaml.HeadComment(" optional local IPv4 bind for outbound MX connections (independent of dns.public_ipv4)")},
 		"$.delivery.bind_ipv6":                        {yaml.HeadComment(" optional local IPv6 bind for outbound MX connections")},
 		"$.delivery.max_attempts":                     {yaml.HeadComment(" maximum delivery attempts before moving a message to dead-letter state")},
-		"$.delivery.maximum_lifetime":                 {yaml.HeadComment(" absolute time a message may remain queued before dead-lettering")},
-		"$.delivery.initial_retry_delay":              {yaml.HeadComment(" delay after the first temporary delivery failure")},
-		"$.delivery.maximum_retry_delay":              {yaml.HeadComment(" upper bound for exponential retry delays")},
+		"$.delivery.maximum_lifetime":                 {yaml.HeadComment(" absolute time a message may remain queued before dead-lettering (maximum 30d)")},
+		"$.delivery.initial_retry_delay":              {yaml.HeadComment(" delay after the first temporary delivery failure (maximum 24h)")},
+		"$.delivery.maximum_retry_delay":              {yaml.HeadComment(" upper bound for exponential retry delays (maximum 7d and no greater than lifetime)")},
 		"$.delivery.domain_concurrency":               {yaml.HeadComment(" maximum simultaneous deliveries to one recipient domain")},
 		"$.delivery.global_concurrency":               {yaml.HeadComment(" maximum simultaneous outbound deliveries")},
-		"$.delivery.connection_timeout":               {yaml.HeadComment(" timeout while connecting to a destination MX")},
-		"$.delivery.command_timeout":                  {yaml.HeadComment(" timeout while waiting for normal SMTP responses")},
-		"$.delivery.submission_timeout":               {yaml.HeadComment(" timeout while waiting for the response after message data")},
+		"$.delivery.connection_timeout":               {yaml.HeadComment(" timeout while dialing a destination MX (maximum 2m; no greater than command_timeout)")},
+		"$.delivery.command_timeout":                  {yaml.HeadComment(" timeout while waiting for normal SMTP responses (maximum 10m)")},
+		"$.delivery.submission_timeout":               {yaml.HeadComment(" timeout while waiting for the response after message data (maximum 30m; at least command_timeout)")},
 		"$.delivery.require_valid_mx_tls_certificate": {yaml.HeadComment(" legacy: when false with tls_mode=opportunistic, STARTTLS uses insecure verification on the first (only) attempt; prefer tls_mode=opportunistic_insecure. Never enables verified-then-insecure reconnect")},
 		"$.delivery.allow_private_destinations":       {yaml.HeadComment(" permit delivery to private/loopback MX addresses (default false)")},
 
@@ -1178,14 +1221,18 @@ func canonicalUsername(username string) string {
 	return strings.ToLower(strings.TrimSpace(username))
 }
 
-func validateDuration(name, value string) error {
+func validateDuration(name, value string, maximum time.Duration) error {
 	duration, err := time.ParseDuration(value)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s: %w", name, err)
 	}
 
 	if duration <= 0 {
 		return fmt.Errorf("%s must be positive", name)
+	}
+
+	if duration > maximum {
+		return fmt.Errorf("%s must not exceed %s", name, maximum)
 	}
 
 	return nil

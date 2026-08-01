@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -146,7 +147,7 @@ func TestEnsureDSNFlagsASCII(t *testing.T) {
 	}
 }
 
-func TestEnsureDSNFlagsUTF8Recipient(t *testing.T) {
+func TestEnsureDSNInheritsSMTPUTF8ForASCIIReport(t *testing.T) {
 	dir := t.TempDir()
 	q, err := queue.Open(dir, queue.Limits{})
 	if err != nil {
@@ -157,7 +158,7 @@ func TestEnsureDSNFlagsUTF8Recipient(t *testing.T) {
 	d := New(&config.Config{Server: config.Server{Hostname: "mail.test"}}, q, nopLog{})
 	now := time.Now()
 	orig := &queue.Envelope{
-		ID: "orig2", Username: "user", Sender: "björn@ex.com",
+		ID: "orig2", Username: "user", Sender: "alice@ex.com",
 		Recipients: []queue.Recipient{{
 			Address: "bob@ex.com", Domain: "ex.com",
 			Status: queue.StatusFailed, Detail: "gone",
@@ -177,7 +178,51 @@ func TestEnsureDSNFlagsUTF8Recipient(t *testing.T) {
 
 	env := loadReadyEnvelope(t, q.Path(), queue.DSNID(orig.ID, orig.Incarnation, orig.DSNGeneration))
 	if !env.SMTPUTF8 {
-		t.Fatal("UTF-8 DSN recipient must set SMTPUTF8")
+		t.Fatal("DSN envelope must inherit source SMTPUTF8")
+	}
+
+	r, err := q.Reader(env.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(msg, []byte("report-type=global-delivery-status")) {
+		t.Fatal("SMTPUTF8 DSN envelope contains non-global report")
+	}
+}
+
+func TestEnsureDSNFlagsFailedUTF8Recipient(t *testing.T) {
+	dir := t.TempDir()
+	q, err := queue.Open(dir, queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	d := New(&config.Config{Server: config.Server{Hostname: "mail.test"}}, q, nopLog{})
+	now := time.Now()
+	orig := &queue.Envelope{
+		ID: "orig-utf8-failed", Username: "user", Sender: "alice@ex.com",
+		Recipients: []queue.Recipient{{
+			Address: "björn@ex.com", Domain: "ex.com", Status: queue.StatusFailed, Detail: "gone",
+		}},
+		Created: now, NextAttempt: now, SMTPUTF8: true,
+	}
+	if err := q.Add(orig, []byte("From: x\r\nTo: y\r\n\r\nHi\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ensureDSN(orig); err != nil {
+		t.Fatal(err)
+	}
+
+	env := loadReadyEnvelope(t, q.Path(), queue.DSNID(orig.ID, orig.Incarnation, orig.DSNGeneration))
+	if !env.SMTPUTF8 {
+		t.Fatal("failed UTF-8 recipient in report must set SMTPUTF8")
 	}
 }
 
@@ -254,8 +299,10 @@ func TestReadDSNOriginalCapsMissingHeaderTerminator(t *testing.T) {
 }
 
 func TestBuildDSNUsesEnhancedStatusAndFallback(t *testing.T) {
+	created := time.Date(2025, 2, 3, 4, 5, 6, 0, time.FixedZone("test", -7*60*60))
 	env := &queue.Envelope{
 		ID: "status-dsn", Sender: "alice@example.com",
+		Created: created,
 		Recipients: []queue.Recipient{
 			{Address: "enhanced@example.com", Status: queue.StatusFailed, Code: 550, EnhancedCode: "5.1.1", Detail: "550 5.1.1 missing"},
 			{Address: "basic@example.com", Status: queue.StatusFailed, Code: 554, Detail: "554 rejected"},
@@ -271,6 +318,43 @@ func TestBuildDSNUsesEnhancedStatusAndFallback(t *testing.T) {
 
 		if !bytes.Contains(msg, []byte(status)) {
 			t.Fatalf("missing %q in DSN", status)
+		}
+	}
+
+	if !bytes.Contains(msg, []byte("Arrival-Date: "+created.UTC().Format(time.RFC1123Z)+"\r\n")) {
+		t.Fatal("DSN Arrival-Date does not use envelope creation time")
+	}
+	for _, form := range []string{
+		"report-type=delivery-status", "Content-Type: message/delivery-status", "Final-Recipient: rfc822;", "Content-Type: message/rfc822",
+	} {
+		if !bytes.Contains(msg, []byte(form)) {
+			t.Fatalf("ASCII DSN missing RFC 3464 form %q", form)
+		}
+	}
+}
+
+func TestBuildDSNUsesRFC6533GlobalForms(t *testing.T) {
+	env := &queue.Envelope{
+		ID: "global-dsn", Sender: "alice@example.com", Created: time.Now(), SMTPUTF8: true,
+		Recipients: []queue.Recipient{{
+			Address: "bob@example.com", Status: queue.StatusFailed, Detail: "5.1.1 unknown recipient",
+		}},
+	}
+	msg, err := buildDSN("mail.test", env, []byte("From: alice@example.com\r\n\r\nbody\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, form := range []string{
+		"report-type=global-delivery-status", "Content-Type: message/global-delivery-status", "Final-Recipient: utf-8; bob@example.com", "Content-Type: message/global",
+	} {
+		if !bytes.Contains(msg, []byte(form)) {
+			t.Fatalf("SMTPUTF8 DSN missing RFC 6533 form %q", form)
+		}
+	}
+	for _, asciiForm := range []string{"message/delivery-status", "Final-Recipient: rfc822;", "Content-Type: message/rfc822"} {
+		if bytes.Contains(msg, []byte(asciiForm)) {
+			t.Fatalf("SMTPUTF8 DSN retained RFC 3464 form %q", asciiForm)
 		}
 	}
 }

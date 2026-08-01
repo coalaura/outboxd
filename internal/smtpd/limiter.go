@@ -417,10 +417,7 @@ func (l *authLimiter) convertFail(m map[string]*attemptState, key string, now ti
 		return
 	}
 
-	shift := st.failures - freeAttempts
-	if shift > 10 {
-		shift = 10
-	}
+	shift := min(st.failures-freeAttempts, 10)
 
 	lockout := lockoutBase << shift
 	st.until = now.Add(min(lockout, lockoutMax))
