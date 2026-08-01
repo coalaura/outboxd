@@ -191,8 +191,6 @@ func TestServeDoesNotGenerateMissingDKIMKeyOrReplaceDNS(t *testing.T) {
 	if err = disk.Write(dnsPath, []byte("published identity\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	provisionOwnershipFiles(t, cfg)
-
 	keyPath, err := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
 	if err != nil {
 		t.Fatal(err)
@@ -205,6 +203,9 @@ func TestServeDoesNotGenerateMissingDKIMKeyOrReplaceDNS(t *testing.T) {
 
 	if _, err = os.Stat(keyPath); !os.IsNotExist(err) {
 		t.Fatalf("serve generated missing DKIM key: %v", err)
+	}
+	if info, statErr := os.Stat(path + ".outboxd.lock"); statErr != nil || !info.Mode().IsRegular() {
+		t.Fatalf("serve did not create regular ownership lock: info=%v err=%v", info, statErr)
 	}
 
 	body, err := os.ReadFile(dnsPath)

@@ -32,47 +32,47 @@ func main() {
 	configPath, args := parseGlobalFlags(os.Args[1:])
 
 	if len(args) == 0 {
-		log.MustFail(serve(configPath))
+		log.MustExit(serve(configPath))
 		return
 	}
 
 	switch args[0] {
 	case "user":
-		log.MustFail(user(configPath, args[1:]))
+		log.MustExit(user(configPath, args[1:]))
 	case "dns":
 		if len(args) != 1 {
-			log.MustFail(errors.New("usage: outboxd dns"))
+			log.MustExit(errors.New("usage: outboxd dns"))
 			return
 		}
 
-		log.MustFail(dns(configPath))
+		log.MustExit(dns(configPath))
 	case "provision":
 		if len(args) != 1 {
-			log.MustFail(errors.New("usage: outboxd provision"))
+			log.MustExit(errors.New("usage: outboxd provision"))
 			return
 		}
 
-		log.MustFail(provision(configPath))
+		log.MustExit(provision(configPath))
 	case "check":
 		if len(args) != 1 {
-			log.MustFail(errors.New("usage: outboxd check"))
+			log.MustExit(errors.New("usage: outboxd check"))
 			return
 		}
 
-		log.MustFail(runCheck(configPath))
+		log.MustExit(runCheck(configPath))
 	case "dead":
-		log.MustFail(dead(configPath, args[1:]))
+		log.MustExit(dead(configPath, args[1:]))
 	case "corrupt":
-		log.MustFail(corrupt(configPath, args[1:]))
+		log.MustExit(corrupt(configPath, args[1:]))
 	case "serve":
 		if len(args) != 1 {
-			log.MustFail(errors.New("usage: outboxd serve"))
+			log.MustExit(errors.New("usage: outboxd serve"))
 			return
 		}
 
-		log.MustFail(serve(configPath))
+		log.MustExit(serve(configPath))
 	default:
-		log.MustFail(fmt.Errorf("unknown command %q, expected user, provision, dns, check, dead, corrupt, or serve (default)", args[0]))
+		log.MustExit(fmt.Errorf("unknown command %q, expected user, provision, dns, check, dead, corrupt, or serve (default)", args[0]))
 	}
 }
 
@@ -102,17 +102,20 @@ func loadOperationalConfig(configPath string) (*config.Config, *disk.FileLock, e
 		return nil, nil, err
 	}
 
-	lockPath := path + ".outboxd.lock"
-	info, err := os.Lstat(lockPath)
+	// Confirm the configuration exists before creating its synchronization file.
+	// Reload after acquiring the lock so the caller receives one owned snapshot.
+	_, err = config.LoadFile(path)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil, fmt.Errorf("configuration is not provisioned (missing %s); run 'outboxd -config %s provision' first", lockPath, path)
-		}
-
 		return nil, nil, err
 	}
 
-	if !info.Mode().IsRegular() {
+	lockPath := path + ".outboxd.lock"
+	info, err := os.Lstat(lockPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, nil, err
+		}
+	} else if !info.Mode().IsRegular() {
 		return nil, nil, fmt.Errorf("configuration ownership lock is not a regular file: %s", lockPath)
 	}
 
