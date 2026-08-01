@@ -58,9 +58,11 @@ func NewClient(conn net.Conn, command, submission time.Duration) *Client {
 	if command <= 0 {
 		command = 5 * time.Minute
 	}
+
 	if submission <= 0 {
 		submission = 12 * time.Minute
 	}
+
 	bounded := &boundedResponseConn{Conn: conn}
 	return &Client{
 		conn:       conn,
@@ -104,6 +106,7 @@ func (c *Client) EHLO(hostname string) error {
 	if err != nil {
 		return err
 	}
+
 	c.text.StartResponse(id)
 	defer c.text.EndResponse(id)
 
@@ -112,6 +115,7 @@ func (c *Client) EHLO(hostname string) error {
 	if err != nil {
 		return err
 	}
+
 	c.ext = parseExtensions(lines)
 	return nil
 }
@@ -121,9 +125,11 @@ func (c *Client) HELO(hostname string) error {
 	c.conn.SetDeadline(time.Now().Add(c.command))
 	defer c.conn.SetDeadline(time.Time{})
 
-	if err := c.cmd(250, "HELO %s", hostname); err != nil {
+	err := c.cmd(250, "HELO %s", hostname)
+	if err != nil {
 		return err
 	}
+
 	c.ext = make(map[string]string)
 	return nil
 }
@@ -139,14 +145,17 @@ func (c *Client) StartTLS(cfg *tls.Config) error {
 	c.conn.SetDeadline(time.Now().Add(c.command))
 	defer c.conn.SetDeadline(time.Time{})
 
-	if err := c.cmd(220, "STARTTLS"); err != nil {
+	err := c.cmd(220, "STARTTLS")
+	if err != nil {
 		return err
 	}
 
 	tlsConn := tls.Client(c.conn, cfg)
-	if err := tlsConn.Handshake(); err != nil {
+	err = tlsConn.Handshake()
+	if err != nil {
 		return err
 	}
+
 	c.conn = tlsConn
 	c.bounded = &boundedResponseConn{Conn: tlsConn}
 	c.text = textproto.NewConn(c.bounded)
@@ -167,23 +176,32 @@ func (c *Client) Mail(from string, opts MailOpts) error {
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "MAIL FROM:<%s>", from)
+
 	if opts.EightBit {
-		if _, ok := c.ext["8BITMIME"]; !ok {
+		_, ok := c.ext["8BITMIME"]
+		if !ok {
 			return err8BITMIMEUnsupported
 		}
+
 		b.WriteString(" BODY=8BITMIME")
 	}
+
 	if opts.Size > 0 {
-		if _, ok := c.ext["SIZE"]; ok {
+		_, ok := c.ext["SIZE"]
+		if ok {
 			fmt.Fprintf(&b, " SIZE=%d", opts.Size)
 		}
 	}
+
 	if opts.UTF8 {
-		if _, ok := c.ext["SMTPUTF8"]; !ok {
+		_, ok := c.ext["SMTPUTF8"]
+		if !ok {
 			return errSMTPUTF8Unsupported
 		}
+
 		b.WriteString(" SMTPUTF8")
 	}
+
 	return c.cmd(250, "%s", b.String())
 }
 
@@ -200,10 +218,12 @@ func (c *Client) Rcpt(to string) error {
 func (c *Client) Data() (*dataWriter, error) {
 	c.conn.SetDeadline(time.Now().Add(c.command))
 
-	if err := c.cmd(354, "DATA"); err != nil {
+	err := c.cmd(354, "DATA")
+	if err != nil {
 		c.conn.SetDeadline(time.Time{})
 		return nil, err
 	}
+
 	c.conn.SetDeadline(time.Now().Add(c.submission))
 	return &dataWriter{client: c, w: c.text.DotWriter()}, nil
 }
@@ -223,12 +243,15 @@ func (c *Client) Close() error {
 		c.stopWatch()
 		c.stopWatch = nil
 	}
+
 	if c.text != nil {
 		return c.text.Close()
 	}
+
 	if c.conn != nil {
 		return c.conn.Close()
 	}
+
 	return nil
 }
 
@@ -247,17 +270,21 @@ func (d *dataWriter) Close() error {
 	if d.closed {
 		return nil
 	}
+
 	d.closed = true
 	err := d.w.Close()
 	defer d.client.conn.SetDeadline(time.Time{})
+
 	if err != nil {
 		return err
 	}
+
 	d.client.bounded.reset()
 	code, msg, rerr := d.client.readResponse(250)
 	if rerr != nil {
 		return rerr
 	}
+
 	d.reply = fmt.Sprintf("%d %s", code, msg)
 	return nil
 }
@@ -272,6 +299,7 @@ func (c *Client) cmd(expect int, format string, args ...any) error {
 	if err != nil {
 		return err
 	}
+
 	c.text.StartResponse(id)
 	defer c.text.EndResponse(id)
 	c.bounded.reset()
@@ -284,6 +312,7 @@ func (c *Client) readResponse(expect int) (int, string, error) {
 	if err != nil {
 		return code, "", err
 	}
+
 	return code, strings.Join(lines, "\n"), nil
 }
 
@@ -292,51 +321,64 @@ func (c *Client) readResponseLines(expect int) (int, []string, error) {
 	if c.bounded.exceededLimit() {
 		return code, nil, errSMTPResponseTooLarge
 	}
+
 	if err != nil {
-		if tpErr, ok := err.(*textproto.Error); ok {
+		tpErr, ok := err.(*textproto.Error)
+		if ok {
 			msg := normalizeDiagnostic(tpErr.Msg)
 			return tpErr.Code, nil, &SMTPError{Code: tpErr.Code, EnhancedCode: parseEnhancedCode(tpErr.Code, msg), Message: msg}
 		}
+
 		if code != 0 {
 			msg = normalizeDiagnostic(msg)
 			return code, nil, &SMTPError{Code: code, EnhancedCode: parseEnhancedCode(code, msg), Message: msg}
 		}
+
 		return code, nil, err
 	}
+
 	lines := strings.Split(msg, "\n")
 	return code, lines, nil
 }
 
 func parseExtensions(lines []string) map[string]string {
 	ext := make(map[string]string)
+
 	// First line is the greeting line of the 250 response (hostname); extensions follow.
 	for i, line := range lines {
 		if i == 0 {
 			continue
 		}
+
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
+
 		name, param, _ := strings.Cut(line, " ")
 		ext[strings.ToUpper(name)] = param
 	}
+
 	return ext
 }
 
 func smtpCode(err error) int {
 	var se *SMTPError
+
 	if errors.As(err, &se) {
 		return se.Code
 	}
+
 	return 0
 }
 
 func smtpEnhancedCode(err error) string {
 	var se *SMTPError
+
 	if errors.As(err, &se) {
 		return se.EnhancedCode
 	}
+
 	return ""
 }
 
@@ -346,19 +388,23 @@ func parseEnhancedCode(code int, message string) string {
 	if len(parts) != 3 || len(parts[0]) != 1 || parts[0][0] < '2' || parts[0][0] > '5' || int(parts[0][0]-'0') != code/100 {
 		return ""
 	}
+
 	if parts[0] != "2" && parts[0] != "4" && parts[0] != "5" {
 		return ""
 	}
+
 	for _, part := range parts[1:] {
 		if len(part) < 1 || len(part) > 3 {
 			return ""
 		}
+
 		for i := range len(part) {
 			if part[i] < '0' || part[i] > '9' {
 				return ""
 			}
 		}
 	}
+
 	return field
 }
 
@@ -369,9 +415,11 @@ func permanent(err error) bool {
 
 func describe(err error) string {
 	var se *SMTPError
+
 	if errors.As(err, &se) {
 		return normalizeDiagnostic(fmt.Sprintf("%d %s", se.Code, se.Message))
 	}
+
 	return normalizeDiagnostic(err.Error())
 }
 
@@ -385,6 +433,7 @@ type boundedResponseConn struct {
 
 func (c *boundedResponseConn) reset() {
 	c.mu.Lock()
+
 	// Keep one probe byte so a reply of exactly maxSMTPResponseBytes is valid.
 	c.remaining = maxSMTPResponseBytes + 1
 	c.exceeded = false
@@ -399,10 +448,12 @@ func (c *boundedResponseConn) exceededLimit() bool {
 
 func (c *boundedResponseConn) Read(p []byte) (int, error) {
 	c.mu.Lock()
+
 	if c.remaining <= 0 {
 		c.mu.Unlock()
 		return 0, errSMTPResponseTooLarge
 	}
+
 	limit := min(len(p), c.remaining, maxResponseRead)
 	c.mu.Unlock()
 
@@ -413,10 +464,13 @@ func (c *boundedResponseConn) Read(p []byte) (int, error) {
 	if exhausted {
 		c.exceeded = true
 	}
+
 	c.mu.Unlock()
+
 	if err == nil && exhausted {
 		return n, errSMTPResponseTooLarge
 	}
+
 	return n, err
 }
 
@@ -425,19 +479,24 @@ func normalizeDiagnostic(s string) string {
 	var b strings.Builder
 	b.Grow(min(len(s), maxDiagnosticBytes))
 	space := false
+
 	for _, r := range s {
 		if unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
 			space = true
 			continue
 		}
+
 		if space && b.Len() > 0 && b.Len() < maxDiagnosticBytes {
 			b.WriteByte(' ')
 		}
+
 		space = false
 		if b.Len()+utf8.RuneLen(r) > maxDiagnosticBytes {
 			break
 		}
+
 		b.WriteRune(r)
 	}
+
 	return strings.TrimSpace(b.String())
 }

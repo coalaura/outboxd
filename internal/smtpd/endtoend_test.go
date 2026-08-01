@@ -70,6 +70,7 @@ func TestEndToEndLocalPath(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("outbound DATA timeout")
 	}
+
 	select {
 	case <-mx.sessionDone:
 	case <-time.After(5 * time.Second):
@@ -77,6 +78,7 @@ func TestEndToEndLocalPath(t *testing.T) {
 	}
 
 	dcancel()
+
 	select {
 	case <-delivDone:
 	case <-time.After(5 * time.Second):
@@ -86,23 +88,32 @@ func TestEndToEndLocalPath(t *testing.T) {
 	if spool.Len() != 0 {
 		t.Fatalf("queue nonempty after successful delivery: %d", spool.Len())
 	}
+
 	if mx.conns.Load() != 1 {
 		t.Fatalf("outbound conns=%d want 1", mx.conns.Load())
 	}
+
 	snap := mx.snapshot()
 	if !snap.tls || snap.sni != "mx.ex.com" {
 		t.Fatalf("tls=%v sni=%q", snap.tls, snap.sni)
 	}
+
 	if !snap.data {
 		t.Fatal("missing DATA")
 	}
-	var ehlos int
-	var sawStartTLS, sawMail, sawRcpt bool
+
+	var (
+		ehlos                         int
+		sawStartTLS, sawMail, sawRcpt bool
+	)
+
 	for _, c := range snap.commands {
 		u := strings.ToUpper(c)
+
 		switch {
 		case strings.HasPrefix(u, "EHLO "):
 			ehlos++
+
 			if !strings.Contains(c, cfg.Server.Hostname) {
 				t.Fatalf("EHLO hostname: %s", c)
 			}
@@ -120,31 +131,38 @@ func TestEndToEndLocalPath(t *testing.T) {
 			}
 		}
 	}
+
 	if ehlos < 2 || !sawStartTLS || !sawMail || !sawRcpt {
 		t.Fatalf("protocol incomplete ehlos=%d starttls=%v mail=%v rcpt=%v cmds=%v", ehlos, sawStartTLS, sawMail, sawRcpt, snap.commands)
 	}
+
 	if !strings.Contains(snap.dataBody, "DKIM-Signature:") {
 		t.Fatal("DATA missing DKIM-Signature header")
 	}
+
 	if !strings.Contains(snap.dataBody, "Body of the ordinary path.") {
 		t.Fatal("body not preserved")
 	}
+
 	verifs, err := dkim.VerifyWithOptions(bytes.NewReader([]byte(snap.dataBody)), &dkim.VerifyOptions{
 		LookupTXT: func(domain string) ([]string, error) {
 			if strings.Contains(domain, cfg.DKIM.Selector) && strings.Contains(domain, cfg.Server.Domain) {
 				return []string{signer.Record()}, nil
 			}
+
 			return nil, nil
 		},
 	})
 	if err != nil {
 		t.Fatalf("dkim verify: %v", err)
 	}
+
 	if len(verifs) == 0 || verifs[0].Err != nil {
 		t.Fatalf("dkim verifs=%+v", verifs)
 	}
 
 	cancel()
+
 	select {
 	case <-serveDone:
 	case <-time.After(5 * time.Second):
@@ -206,6 +224,7 @@ func startE2EMX(t *testing.T, mx *e2eMX) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	mx.ln = ln
 	mx.dataDone = make(chan struct{})
 	mx.sessionDone = make(chan struct{}, 4)
@@ -220,6 +239,7 @@ func (mx *e2eMX) serve() {
 		if err != nil {
 			return
 		}
+
 		mx.conns.Add(1)
 		live := &e2eLive{}
 		go func() {
@@ -245,32 +265,40 @@ func (mx *e2eMX) handle(c net.Conn, live *e2eLive) {
 	write := func(s string) { _, _ = io.WriteString(rw, s) }
 	write("220 mx.ex.com ESMTP\r\n")
 	secured := false
+
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
 			return
 		}
+
 		raw := strings.TrimRight(line, "\r\n")
 		live.mu.Lock()
 		live.commands = append(live.commands, raw)
 		live.mu.Unlock()
 		upper := strings.ToUpper(raw)
+
 		switch {
 		case strings.HasPrefix(upper, "EHLO"):
 			write("250-mx.ex.com\r\n")
+
 			if mx.startTLS && !secured {
 				write("250-STARTTLS\r\n")
 			}
+
 			if mx.ext8bit {
 				write("250-8BITMIME\r\n")
 			}
+
 			write("250 OK\r\n")
 		case strings.HasPrefix(upper, "STARTTLS"):
 			write("220 ready\r\n")
 			tc := tls.Server(rw, &tls.Config{Certificates: []tls.Certificate{mx.cert}})
-			if err := tc.Handshake(); err != nil {
+			err = tc.Handshake()
+			if err != nil {
 				return
 			}
+
 			cs := tc.ConnectionState()
 			live.mu.Lock()
 			live.tls = true
@@ -294,18 +322,22 @@ func (mx *e2eMX) handle(c net.Conn, live *e2eLive) {
 			live.data = true
 			live.mu.Unlock()
 			write("354 go\r\n")
+
 			for {
 				l, err := br.ReadString('\n')
 				if err != nil {
 					return
 				}
+
 				if strings.TrimRight(l, "\r\n") == "." {
 					break
 				}
+
 				live.mu.Lock()
 				live.body.WriteString(l)
 				live.mu.Unlock()
 			}
+
 			write("250 queued\r\n")
 			mx.dataOnce.Do(func() { close(mx.dataDone) })
 		case strings.HasPrefix(upper, "QUIT"):
@@ -323,11 +355,13 @@ type e2eResolver struct {
 }
 
 func (f *e2eResolver) LookupMX(ctx context.Context, name string) ([]*net.MX, error) {
-	if mx, ok := f.mx[name]; ok {
+	mx, ok := f.mx[name]
+	if ok {
 		out := make([]*net.MX, len(mx))
 		copy(out, mx)
 		return out, nil
 	}
+
 	return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
 }
 
@@ -336,6 +370,7 @@ func (f *e2eResolver) LookupNetIP(ctx context.Context, network, host string) ([]
 	if !ok {
 		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
 	}
+
 	out := make([]net.IP, len(ips))
 	copy(out, ips)
 	return out, nil
@@ -353,6 +388,7 @@ func mintOutboundCert(t *testing.T, cn string) (tls.Certificate, *x509.CertPool)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: cn},
@@ -366,20 +402,24 @@ func mintOutboundCert(t *testing.T, cn string) (tls.Certificate, *x509.CertPool)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	parsed, err := x509.ParseCertificate(der)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	pool := x509.NewCertPool()
 	pool.AddCert(parsed)
 	return tlsCert, pool

@@ -8,11 +8,14 @@ import (
 
 // Sync flushes a directory entry so renames survive a crash.
 func Sync(path string) error {
-	if h := currentHooks(); h.BeforeSyncDir != nil {
-		if err := h.BeforeSyncDir(path); err != nil {
+	h := currentHooks()
+	if h.BeforeSyncDir != nil {
+		err := h.BeforeSyncDir(path)
+		if err != nil {
 			return err
 		}
 	}
+
 	directory, err := os.Open(path)
 	if err != nil {
 		return err
@@ -25,8 +28,11 @@ func Sync(path string) error {
 	if err != nil {
 		return err
 	}
-	if h := currentHooks(); h.AfterSyncDir != nil {
+
+	h := currentHooks()
+	if h.AfterSyncDir != nil {
 		return h.AfterSyncDir(path)
 	}
+
 	return nil
 }

@@ -36,7 +36,8 @@ func Build(cfg *config.Config, dkim string) []Record {
 	records := make([]Record, 0, 8)
 
 	if cfg.DNS.PublicIPv4 != "" {
-		if ip, err := netip.ParseAddr(cfg.DNS.PublicIPv4); err == nil && ip.Is4() {
+		ip, err := netip.ParseAddr(cfg.DNS.PublicIPv4)
+		if err == nil && ip.Is4() {
 			records = append(records, Record{
 				Name:    hostname,
 				Type:    "A",
@@ -58,6 +59,7 @@ func Build(cfg *config.Config, dkim string) []Record {
 	// One SPF TXT per distinct owner name.
 	spfOwners := spfOwnerNames(cfg)
 	spfValue := spf(cfg)
+
 	for _, owner := range spfOwners {
 		purpose := "SPF; authorizes this server to send for this domain and rejects everything else"
 		if owner == hostname && owner != domain {
@@ -65,6 +67,7 @@ func Build(cfg *config.Config, dkim string) []Record {
 		} else if owner != domain && owner != hostname {
 			purpose = "SPF for an allowed envelope-sender domain"
 		}
+
 		records = append(records, Record{
 			Name:    owner,
 			Type:    "TXT",
@@ -100,7 +103,8 @@ func Build(cfg *config.Config, dkim string) []Record {
 	}
 
 	// TLS-RPT is separate from DMARC reporting.
-	if tlsURI := strings.TrimSpace(cfg.DNS.TLSRPTURI); tlsURI != "" {
+	tlsURI := strings.TrimSpace(cfg.DNS.TLSRPTURI)
+	if tlsURI != "" {
 		records = append(records, Record{
 			Name:    "_smtp._tls." + domain,
 			Type:    "TXT",
@@ -114,12 +118,16 @@ func Build(cfg *config.Config, dkim string) []Record {
 
 // Write renders the DNS instructions next to the other generated files.
 func Write(cfg *config.Config, dkim string) (string, []byte, error) {
-	if err := config.ValidateDMARCReportURIList(cfg.DNS.ReportURI); err != nil {
+	err := config.ValidateDMARCReportURIList(cfg.DNS.ReportURI)
+	if err != nil {
 		return "", nil, fmt.Errorf("dns.dmarc_report_uri: %w", err)
 	}
-	if err := config.ValidateTLSReportURIList(cfg.DNS.TLSRPTURI); err != nil {
+
+	err = config.ValidateTLSReportURIList(cfg.DNS.TLSRPTURI)
+	if err != nil {
 		return "", nil, fmt.Errorf("dns.tlsrpt_uri: %w", err)
 	}
+
 	var buffer bytes.Buffer
 
 	buffer.Grow(4096)
@@ -128,12 +136,17 @@ func Write(cfg *config.Config, dkim string) (string, []byte, error) {
 
 	buffer.WriteString("- Outboxd is outbound submission + delivery only: it does not provide inbound MX\n")
 	buffer.WriteString("- Outbound TCP port 25 (sending mail) must be open from this host\n")
-	if addr := cfg.Server.ImplicitTLSListenAddr(); addr != "" {
+
+	addr := cfg.Server.ImplicitTLSListenAddr()
+	if addr != "" {
 		fmt.Fprintf(&buffer, "- Inbound TCP port %s (implicit TLS submission) must be open for clients\n", listenPort(addr))
 	}
-	if addr := cfg.Server.SubmissionListenAddr(); addr != "" {
+
+	addr = cfg.Server.SubmissionListenAddr()
+	if addr != "" {
 		fmt.Fprintf(&buffer, "- Inbound TCP port %s (STARTTLS submission) must be open for clients\n", listenPort(addr))
 	}
+
 	buffer.WriteString("- Do not publish an MX for this host unless a separate mailbox accepts mail elsewhere\n")
 
 	if cfg.DNS.PublicIPv4 != "" {
@@ -176,18 +189,23 @@ func Write(cfg *config.Config, dkim string) (string, []byte, error) {
 	if err != nil {
 		return "", nil, err
 	}
-	if err := cfg.CheckGeneratedParents(path); err != nil {
+
+	err = cfg.CheckGeneratedParents(path)
+	if err != nil {
 		return "", nil, err
 	}
+
 	body := buffer.Bytes()
 
 	return path, body, disk.Write(path, body, 0644)
 }
 
 func listenPort(addr string) string {
-	if _, port, err := net.SplitHostPort(addr); err == nil {
+	_, port, err := net.SplitHostPort(addr)
+	if err == nil {
 		return port
 	}
+
 	return strings.TrimPrefix(addr, ":")
 }
 
@@ -222,6 +240,7 @@ func spfOwnerNames(cfg *config.Config) []string {
 		if name == "." {
 			return
 		}
+
 		if !slices.Contains(owners, name) {
 			owners = append(owners, name)
 		}
@@ -235,14 +254,17 @@ func spfOwnerNames(cfg *config.Config) []string {
 			if sender == "" {
 				continue
 			}
+
 			if strings.HasPrefix(sender, "*@") {
 				add(sender[2:])
 				continue
 			}
+
 			at := strings.LastIndexByte(sender, '@')
 			if at < 0 || at == len(sender)-1 {
 				continue
 			}
+
 			add(sender[at+1:])
 		}
 	}
@@ -291,6 +313,7 @@ func external(reportURI, orgDomain string) []string {
 		}
 
 		var host string
+
 		switch strings.ToLower(parsed.Scheme) {
 		case "mailto":
 			at := strings.LastIndexByte(parsed.Opaque, '@')
@@ -300,6 +323,7 @@ func external(reportURI, orgDomain string) []string {
 		case "https":
 			host = parsed.Hostname()
 		}
+
 		host = strings.ToLower(strings.TrimSuffix(host, "."))
 
 		if host == "" || host == orgDomain || strings.HasSuffix(host, "."+orgDomain) {
@@ -319,17 +343,22 @@ func trimDMARCSize(value string) string {
 	if bang < 0 || bang == len(value)-1 {
 		return value
 	}
+
 	suffix := value[bang+1:]
-	if unit := suffix[len(suffix)-1]; unit == 'k' || unit == 'K' || unit == 'm' || unit == 'M' || unit == 'g' || unit == 'G' || unit == 't' || unit == 'T' {
+	unit := suffix[len(suffix)-1]
+	if unit == 'k' || unit == 'K' || unit == 'm' || unit == 'M' || unit == 'g' || unit == 'G' || unit == 't' || unit == 'T' {
 		suffix = suffix[:len(suffix)-1]
 	}
+
 	if suffix == "" {
 		return value
 	}
+
 	for _, char := range suffix {
 		if char < '0' || char > '9' {
 			return value
 		}
 	}
+
 	return value[:bang]
 }

@@ -6,13 +6,18 @@ package disk
 // and queue renames use MoveFileEx with MOVEFILE_WRITE_THROUGH instead because
 // Windows does not permit FlushFileBuffers on a directory handle.
 func Sync(path string) error {
-	if h := currentHooks(); h.BeforeSyncDir != nil {
-		if err := h.BeforeSyncDir(path); err != nil {
+	h := currentHooks()
+	if h.BeforeSyncDir != nil {
+		err := h.BeforeSyncDir(path)
+		if err != nil {
 			return err
 		}
 	}
-	if h := currentHooks(); h.AfterSyncDir != nil {
+
+	h = currentHooks()
+	if h.AfterSyncDir != nil {
 		return h.AfterSyncDir(path)
 	}
+
 	return nil
 }

@@ -145,13 +145,15 @@ const (
 	MaxConnectionsPerIP  = 10000
 	MaxAuthWorkers       = 16
 	SPFDNSLookupLimit    = 10
+
 	// EnvConfigPath overrides the config file path.
 	EnvConfigPath = "OUTBOXD_CONFIG"
 )
 
 // Default returns the default config without an example password hash.
 func Default() *Config {
-	allowPlain := false
+	var allowPlain bool
+
 	return &Config{
 		Server: Server{
 			Hostname:             "mail.example.invalid",
@@ -225,9 +227,12 @@ func ResolveConfigPath(flagPath string) string {
 	if flagPath != "" {
 		return flagPath
 	}
-	if v := os.Getenv(EnvConfigPath); v != "" {
+
+	v := os.Getenv(EnvConfigPath)
+	if v != "" {
 		return v
 	}
+
 	return defaultConfigName
 }
 
@@ -240,32 +245,45 @@ func LoadFile(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	cfg.path = abs
 	cfg.baseDir = filepath.Dir(abs)
+
 	raw, err := ReadCheckedFile(abs, true, false, maxConfigFileBytes)
 	if err != nil {
 		return nil, fmt.Errorf("config file: %w", err)
 	}
-	if err := rejectMultiDoc(raw); err != nil {
+
+	err = rejectMultiDoc(raw)
+	if err != nil {
 		return nil, err
 	}
 
 	cfg.Users = nil
+
 	dec := yaml.NewDecoder(bytes.NewReader(raw), yaml.DisallowUnknownField())
-	if err := dec.Decode(cfg); err != nil {
+
+	err = dec.Decode(cfg)
+	if err != nil {
 		return nil, err
 	}
+
 	var extra any
-	if err := dec.Decode(&extra); err == nil {
+
+	err = dec.Decode(&extra)
+	if err == nil {
 		return nil, errors.New("config contains trailing YAML content")
 	} else if err != io.EOF && !isYAMLEOF(err) {
 		return nil, fmt.Errorf("trailing YAML content: %w", err)
 	}
 
 	cfg.applyDefaults()
-	if err := cfg.Init(); err != nil {
+
+	err = cfg.Init()
+	if err != nil {
 		return nil, err
 	}
+
 	return cfg, nil
 }
 
@@ -275,14 +293,17 @@ func isYAMLEOF(err error) bool {
 
 func rejectMultiDoc(raw []byte) error {
 	count := 0
+
 	for _, line := range bytes.Split(raw, []byte("\n")) {
 		if bytes.Equal(bytes.TrimSpace(line), []byte("---")) {
 			count++
+
 			if count > 1 {
 				return errors.New("config contains multiple YAML documents")
 			}
 		}
 	}
+
 	return nil
 }
 
@@ -302,6 +323,7 @@ func EnsurePath(path string) (*Config, bool, error) {
 	if err == nil {
 		return cfg, false, nil
 	}
+
 	if !errors.Is(err, os.ErrNotExist) {
 		return nil, false, err
 	}
@@ -312,19 +334,26 @@ func EnsurePath(path string) (*Config, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
+
 	cfg.path = abs
 	cfg.baseDir = filepath.Dir(abs)
 	cfg.applyDefaults()
-	if err := cfg.Init(); err != nil {
+
+	err = cfg.Init()
+	if err != nil {
 		return nil, false, err
 	}
-	if err := cfg.storeExclusive(); err != nil {
+
+	err = cfg.storeExclusive()
+	if err != nil {
 		if errors.Is(err, os.ErrExist) {
 			cfg, err = LoadFile(path)
 			return cfg, false, err
 		}
+
 		return nil, false, err
 	}
+
 	return cfg, true, nil
 }
 
@@ -332,15 +361,19 @@ func (cfg *Config) applyDefaults() {
 	if cfg.Server.DisableSubmission {
 		cfg.Server.SubmissionAddr = ""
 	}
+
 	if cfg.Server.DisableImplicitTLS {
 		cfg.Server.ImplicitTLSAddr = ""
 	}
+
 	if cfg.Delivery.TLSMode == "" {
 		cfg.Delivery.TLSMode = "required"
 	}
+
 	if cfg.DNS.DMARC == "" {
 		cfg.DNS.DMARC = "none"
 	}
+
 	if cfg.DNS.OutputFile == "" {
 		cfg.DNS.OutputFile = "dns-records.txt"
 	}
@@ -351,6 +384,7 @@ func (s Server) SubmissionListenAddr() string {
 	if s.DisableSubmission {
 		return ""
 	}
+
 	return s.SubmissionAddr
 }
 
@@ -359,6 +393,7 @@ func (s Server) ImplicitTLSListenAddr() string {
 	if s.DisableImplicitTLS {
 		return ""
 	}
+
 	return s.ImplicitTLSAddr
 }
 
@@ -367,9 +402,11 @@ func (d Delivery) PlaintextAllowed() bool {
 	if d.TLSMode == "required" {
 		return false
 	}
+
 	if d.AllowPlaintext != nil {
 		return *d.AllowPlaintext
 	}
+
 	return false
 }
 
@@ -378,6 +415,7 @@ func (d Delivery) InsecureTLSAllowed() bool {
 	if d.TLSMode == "opportunistic_insecure" {
 		return true
 	}
+
 	return d.TLSMode == "opportunistic" && !d.RequireValidMXTLSCert
 }
 
@@ -411,6 +449,7 @@ func (cfg *Config) canonicalize() {
 	cfg.Server.Hostname = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(cfg.Server.Hostname), "."))
 	cfg.Server.Domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(cfg.Server.Domain), "."))
 	cfg.DKIM.Selector = strings.ToLower(strings.TrimSpace(cfg.DKIM.Selector))
+
 	for i, inc := range cfg.DNS.SPFIncludes {
 		cfg.DNS.SPFIncludes[i] = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(inc), "."))
 	}
@@ -424,10 +463,13 @@ func (cfg *Config) BaseDir() string { return cfg.baseDir }
 
 // AddUser appends a user and atomically rewrites the config after Validate.
 func (cfg *Config) AddUser(user User) error {
-	if err := user.Validate(); err != nil {
+	err := user.Validate()
+	if err != nil {
 		return err
 	}
-	if err := passwd.ValidatePHC(user.PasswordHash); err != nil {
+
+	err = passwd.ValidatePHC(user.PasswordHash)
+	if err != nil {
 		return err
 	}
 
@@ -435,42 +477,53 @@ func (cfg *Config) AddUser(user User) error {
 	if path == "" {
 		path = defaultConfigName
 	}
+
 	lock, err := lockConfig(path + ".lock")
 	if err != nil {
 		return err
 	}
+
 	defer lock.Close()
 
 	latest, err := LoadFile(path)
 	if err != nil {
 		return fmt.Errorf("reload config under mutation lock: %w", err)
 	}
+
 	for i := range latest.Users {
 		if canonicalUsername(latest.Users[i].Username) == canonicalUsername(user.Username) {
 			return fmt.Errorf("duplicate username %q", user.Username)
 		}
 	}
+
 	latest.Users = append(latest.Users, user)
-	if err := latest.Init(); err != nil {
+	err = latest.Init()
+	if err != nil {
 		return err
 	}
-	if err := latest.Save(); err != nil {
+
+	err = latest.Save()
+	if err != nil {
 		return err
 	}
+
 	cfg.adopt(latest)
 	return nil
 }
 
 func lockConfig(path string) (*disk.FileLock, error) {
 	deadline := time.Now().Add(10 * time.Second)
+
 	for {
 		lock, err := disk.Lock(path)
 		if err == nil {
 			return lock, nil
 		}
+
 		if !errors.Is(err, disk.ErrLocked) || time.Now().After(deadline) {
 			return nil, fmt.Errorf("lock config for mutation: %w", err)
 		}
+
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -481,6 +534,7 @@ func (cfg *Config) adopt(other *Config) {
 	cfg.Server, cfg.TLS, cfg.DKIM, cfg.Delivery, cfg.DNS = other.Server, other.TLS, other.DKIM, other.Delivery, other.DNS
 	cfg.Users = slices.Clone(other.Users)
 	cfg.userLookup = make(map[string]*User, len(cfg.Users))
+
 	for i := range cfg.Users {
 		cfg.userLookup[canonicalUsername(cfg.Users[i].Username)] = &cfg.Users[i]
 	}
@@ -492,10 +546,12 @@ func (cfg *Config) Save() error {
 	if err != nil {
 		return err
 	}
+
 	path := cfg.path
 	if path == "" {
 		path = defaultConfigName
 	}
+
 	cfg.fileMu.Lock()
 	defer cfg.fileMu.Unlock()
 	return disk.Write(path, body, 0600)
@@ -550,21 +606,27 @@ func (cfg *Config) Validate() error {
 	if cfg.Server.DataDirectory == "" {
 		return errors.New("server.data_directory must not be empty")
 	}
+
 	if cfg.Server.SubmissionListenAddr() == "" && cfg.Server.ImplicitTLSListenAddr() == "" {
 		return errors.New("at least one submission listener must be enabled")
 	}
+
 	if cfg.Server.MaxConnections <= 0 || cfg.Server.MaxConnections > MaxConnections || cfg.Server.MaxConnectionsPerIP <= 0 || cfg.Server.MaxConnectionsPerIP > MaxConnectionsPerIP || cfg.Server.MaxConnectionsPerIP > cfg.Server.MaxConnections {
 		return errors.New("connection limits are invalid or exceed supported bounds")
 	}
+
 	if cfg.Server.AuthWorkers <= 0 || cfg.Server.AuthWorkers > MaxAuthWorkers {
 		return errors.New("auth worker limit is invalid or exceeds supported bounds")
 	}
+
 	if cfg.Server.MaxQueueMessages < 0 || cfg.Server.MaxQueueBytes < 0 || cfg.Server.MinFreeDiskBytes < 0 {
 		return errors.New("queue caps and minimum free disk must not be negative")
 	}
+
 	if cfg.Server.MaxSpoolBytes <= 0 {
 		return errors.New("server.max_spool_bytes must be positive")
 	}
+
 	if cfg.Server.SpoolEmergencyBytes < queue.MinimumSpoolEmergencyBytes || cfg.Server.SpoolEmergencyBytes >= cfg.Server.MaxSpoolBytes {
 		return fmt.Errorf("server.spool_emergency_bytes must be at least %d bytes and smaller than max_spool_bytes", queue.MinimumSpoolEmergencyBytes)
 	}
@@ -581,6 +643,7 @@ func (cfg *Config) Validate() error {
 		{"delivery.command_timeout", cfg.Delivery.CommandTimeout},
 		{"delivery.submission_timeout", cfg.Delivery.SubmissionTimeout},
 	}
+
 	if Duration(cfg.Server.DeadRetention) <= 0 || Duration(cfg.Server.CorruptRetention) <= 0 {
 		return errors.New("server.dead_retention and server.corrupt_retention must be positive")
 	}
@@ -595,12 +658,15 @@ func (cfg *Config) Validate() error {
 	initial := Duration(cfg.Delivery.InitialRetryDelay)
 	maximum := Duration(cfg.Delivery.MaximumRetryDelay)
 	lifetime := Duration(cfg.Delivery.MaximumLifetime)
+
 	if initial > maximum {
 		return errors.New("delivery.initial_retry_delay must be <= maximum_retry_delay")
 	}
+
 	if maximum > lifetime {
 		return errors.New("delivery.maximum_retry_delay must be <= maximum_lifetime")
 	}
+
 	if initial > 24*365*time.Hour {
 		return errors.New("delivery.initial_retry_delay is unreasonably large")
 	}
@@ -629,20 +695,27 @@ func (cfg *Config) Validate() error {
 	if cfg.DKIM.PrivateKeyFile == "" {
 		return errors.New("dkim.private_key_file must not be empty")
 	}
-	if _, err := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile); err != nil {
+
+	_, err = cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
+	if err != nil {
 		return fmt.Errorf("dkim.private_key_file: %w", err)
 	}
 
 	hasFromHeader := false
 	seenDKIMHeaders := make(map[string]struct{}, len(cfg.DKIM.Headers))
+
 	for _, header := range cfg.DKIM.Headers {
-		if err := validateHeaderName(header); err != nil {
+		err = validateHeaderName(header)
+		if err != nil {
 			return fmt.Errorf("dkim.headers: %w", err)
 		}
+
 		canon := strings.ToLower(header)
-		if _, ok := seenDKIMHeaders[canon]; ok {
+		_, ok := seenDKIMHeaders[canon]
+		if ok {
 			return fmt.Errorf("dkim.headers: duplicate %q", header)
 		}
+
 		seenDKIMHeaders[canon] = struct{}{}
 		if canon == "from" {
 			hasFromHeader = true
@@ -658,9 +731,11 @@ func (cfg *Config) Validate() error {
 	default:
 		return fmt.Errorf("delivery.tls_mode must be opportunistic, required, or opportunistic_insecure, got %q", cfg.Delivery.TLSMode)
 	}
+
 	if cfg.Delivery.TLSMode == "required" && cfg.Delivery.AllowPlaintext != nil && *cfg.Delivery.AllowPlaintext {
 		return errors.New("delivery.tls_mode=required cannot be combined with allow_plaintext=true")
 	}
+
 	if cfg.Delivery.TLSMode == "opportunistic_insecure" && cfg.Delivery.RequireValidMXTLSCert {
 		return errors.New("delivery.tls_mode=opportunistic_insecure contradicts require_valid_mx_tls_certificate=true")
 	}
@@ -678,14 +753,17 @@ func (cfg *Config) Validate() error {
 		if err != nil || !ip.Is4() {
 			return fmt.Errorf("invalid delivery.bind_ipv4 %q", cfg.Delivery.BindIPv4)
 		}
+
 		cfg.Delivery.BindIPv4 = ip.String()
 	}
+
 	if cfg.Delivery.BindIPv6 != "" {
 		ip := net.ParseIP(cfg.Delivery.BindIPv6)
 		if ip == nil || ip.To4() != nil {
 			return fmt.Errorf("invalid delivery.bind_ipv6 %q", cfg.Delivery.BindIPv6)
 		}
 	}
+
 	for i, a := range cfg.Delivery.DestinationAllowlist {
 		if net.ParseIP(a) == nil {
 			return fmt.Errorf("delivery.destination_allowlist[%d] invalid", i)
@@ -701,7 +779,9 @@ func (cfg *Config) Validate() error {
 	if cfg.DNS.OutputFile == "" {
 		return errors.New("dns.output_file must not be empty")
 	}
-	if _, err := cfg.ResolveGeneratedPath(cfg.DNS.OutputFile); err != nil {
+
+	_, err = cfg.ResolveGeneratedPath(cfg.DNS.OutputFile)
+	if err != nil {
 		return fmt.Errorf("dns.output_file: %w", err)
 	}
 
@@ -710,6 +790,7 @@ func (cfg *Config) Validate() error {
 		if err != nil || !ip.Is4() {
 			return fmt.Errorf("invalid public IPv4 address %q", cfg.DNS.PublicIPv4)
 		}
+
 		cfg.DNS.PublicIPv4 = ip.String()
 	}
 
@@ -721,20 +802,26 @@ func (cfg *Config) Validate() error {
 	}
 
 	if cfg.DNS.ReportURI != "" {
-		if err := ValidateDMARCReportURIList(cfg.DNS.ReportURI); err != nil {
+		err = ValidateDMARCReportURIList(cfg.DNS.ReportURI)
+		if err != nil {
 			return fmt.Errorf("dns.dmarc_report_uri: %w", err)
 		}
 	}
+
 	if cfg.DNS.TLSRPTURI != "" {
-		if err := ValidateTLSReportURIList(cfg.DNS.TLSRPTURI); err != nil {
+		err = ValidateTLSReportURIList(cfg.DNS.TLSRPTURI)
+		if err != nil {
 			return fmt.Errorf("dns.tlsrpt_uri: %w", err)
 		}
 	}
+
 	for i, inc := range cfg.DNS.SPFIncludes {
-		if err := validateDomain(fmt.Sprintf("dns.spf_includes[%d]", i), inc); err != nil {
+		err = validateDomain(fmt.Sprintf("dns.spf_includes[%d]", i), inc)
+		if err != nil {
 			return err
 		}
 	}
+
 	if len(cfg.DNS.SPFIncludes) > SPFDNSLookupLimit {
 		return fmt.Errorf("dns.spf_includes exceeds SPF DNS lookup limit of %d", SPFDNSLookupLimit)
 	}
@@ -748,7 +835,9 @@ func (cfg *Config) Validate() error {
 		if err != nil {
 			return fmt.Errorf("users[%d]: %w", i, err)
 		}
-		if err := passwd.ValidatePHC(user.PasswordHash); err != nil {
+
+		err = passwd.ValidatePHC(user.PasswordHash)
+		if err != nil {
 			return fmt.Errorf("users[%d]: %w", i, err)
 		}
 
@@ -762,7 +851,8 @@ func (cfg *Config) Validate() error {
 		}
 
 		username := canonicalUsername(user.Username)
-		if _, exists := usernames[username]; exists {
+		_, exists := usernames[username]
+		if exists {
 			return fmt.Errorf("duplicate username %q", user.Username)
 		}
 
@@ -803,13 +893,18 @@ func (u *User) Validate() error {
 			if domain == "" || strings.Contains(domain, "@") {
 				return fmt.Errorf("user %q has invalid sender %q", u.Username, sender)
 			}
-			if err := validateDomain("allowed_senders", strings.ToLower(domain)); err != nil {
+
+			err := validateDomain("allowed_senders", strings.ToLower(domain))
+			if err != nil {
 				return fmt.Errorf("user %q has invalid sender %q", u.Username, sender)
 			}
+
 			canonicalSender := "*@" + strings.ToLower(domain)
-			if _, exists := senders[canonicalSender]; exists {
+			_, exists := senders[canonicalSender]
+			if exists {
 				return fmt.Errorf("user %q has duplicate sender %q", u.Username, sender)
 			}
+
 			senders[canonicalSender] = struct{}{}
 			u.AllowedSenders[i] = canonicalSender
 			continue
@@ -819,16 +914,19 @@ func (u *User) Validate() error {
 		if err != nil || address.Name != "" {
 			return fmt.Errorf("user %q has invalid sender %q", u.Username, sender)
 		}
+
 		if address.Address != sender && sender != "<"+address.Address+">" {
 			return fmt.Errorf("user %q has invalid sender %q", u.Username, sender)
 		}
 
 		canonicalSender := strings.ToLower(address.Address)
-		if _, exists := senders[canonicalSender]; exists {
+		_, exists := senders[canonicalSender]
+		if exists {
 			return fmt.Errorf("user %q has duplicate sender %q", u.Username, sender)
 		}
 
 		senders[canonicalSender] = struct{}{}
+
 		// Preserve local-part case for policy storage / comparisons via Allows.
 		u.AllowedSenders[i] = address.Address
 	}
@@ -857,14 +955,17 @@ func (cfg *Config) IsReady() error {
 	}
 
 	enabled := 0
+
 	for i := range cfg.Users {
 		if cfg.Users[i].Enabled {
 			enabled++
 		}
 	}
+
 	if enabled == 0 {
 		problems = append(problems, errors.New("configure at least one enabled SMTP user"))
 	}
+
 	if cfg.TLS.Mode == "self_signed" && !cfg.TLS.AllowSelfSignedServing {
 		problems = append(problems, errors.New("tls.mode=self_signed requires tls.allow_self_signed_serving=true before serving"))
 	}
@@ -924,18 +1025,22 @@ func (cfg Config) ResolveGeneratedPath(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
 	target := path
 	if !filepath.IsAbs(target) {
 		target = filepath.Join(data, target)
 	}
+
 	target, err = filepath.Abs(filepath.Clean(target))
 	if err != nil {
 		return "", err
 	}
+
 	rel, err := filepath.Rel(data, target)
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
 		return "", errors.New("path must resolve to a file beneath server.data_directory")
 	}
+
 	return target, nil
 }
 
@@ -945,13 +1050,16 @@ func (cfg Config) ResolvedDataDir() string {
 	if filepath.IsAbs(data) {
 		return data
 	}
+
 	if cfg.baseDir != "" {
 		return filepath.Join(cfg.baseDir, data)
 	}
+
 	abs, err := filepath.Abs(data)
 	if err != nil {
 		return data
 	}
+
 	return abs
 }
 
@@ -1116,14 +1224,17 @@ func validateHeaderName(name string) error {
 	if name == "" {
 		return errors.New("empty header name")
 	}
+
 	for _, r := range name {
 		if r <= 32 || r >= 127 || r == ':' {
 			return fmt.Errorf("invalid header name %q", name)
 		}
+
 		if unicode.IsControl(r) {
 			return fmt.Errorf("invalid header name %q", name)
 		}
 	}
+
 	return nil
 }
 
@@ -1143,53 +1254,67 @@ func validateReportURIList(value string, dmarc bool) error {
 	if strings.TrimSpace(value) == "" {
 		return nil
 	}
+
 	for uri := range strings.SplitSeq(value, ",") {
 		uri = strings.TrimSpace(uri)
 		if uri == "" {
 			return errors.New("empty report URI entry")
 		}
-		if err := validateReportURI(uri, dmarc); err != nil {
+
+		err := validateReportURI(uri, dmarc)
+		if err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
 func validateReportURI(uri string, dmarc bool) error {
 	base := strings.TrimSpace(uri)
 	if dmarc {
-		if suffix := reportSizeRE.FindStringIndex(base); suffix != nil {
+		suffix := reportSizeRE.FindStringIndex(base)
+		if suffix != nil {
 			base = base[:suffix[0]]
 		}
 	}
+
 	u, err := url.Parse(base)
 	if err != nil {
 		return fmt.Errorf("invalid report URI %q: %w", uri, err)
 	}
+
 	switch strings.ToLower(u.Scheme) {
 	case "mailto":
 		if u.Host != "" || u.RawQuery != "" || u.Fragment != "" {
 			return fmt.Errorf("invalid mailto URI %q", uri)
 		}
+
 		addr, err := mail.ParseAddress(u.Opaque)
 		if err != nil || addr.Name != "" || addr.Address != u.Opaque || strings.Count(addr.Address, "@") != 1 {
 			return fmt.Errorf("invalid mailto URI %q", uri)
 		}
+
 		domain := addr.Address[strings.LastIndexByte(addr.Address, '@')+1:]
-		if err := validateDomain("report mailbox domain", strings.ToLower(domain)); err != nil {
+		err = validateDomain("report mailbox domain", strings.ToLower(domain))
+		if err != nil {
 			return fmt.Errorf("invalid mailto URI %q", uri)
 		}
 	case "https":
 		if u.Host == "" || u.Hostname() == "" || u.User != nil || u.Fragment != "" || u.Opaque != "" {
 			return fmt.Errorf("invalid HTTPS report URI %q", uri)
 		}
+
 		host := strings.ToLower(u.Hostname())
 		if net.ParseIP(host) == nil {
-			if err := validateDomain("HTTPS report host", host); err != nil {
+			err = validateDomain("HTTPS report host", host)
+			if err != nil {
 				return fmt.Errorf("invalid HTTPS report URI %q", uri)
 			}
 		}
-		if port := u.Port(); port != "" {
+
+		port := u.Port()
+		if port != "" {
 			n, err := strconv.Atoi(port)
 			if err != nil || n < 1 || n > 65535 {
 				return fmt.Errorf("invalid HTTPS report URI port in %q", uri)
@@ -1198,6 +1323,7 @@ func validateReportURI(uri string, dmarc bool) error {
 	default:
 		return fmt.Errorf("unsupported report URI scheme in %q (use mailto: or https:)", uri)
 	}
+
 	return nil
 }
 
@@ -1207,17 +1333,22 @@ var reportSizeRE = regexp.MustCompile(`(?i)![0-9]+[kmgt]?$`)
 func (cfg *Config) ExpectedSPF() string {
 	var b strings.Builder
 	b.WriteString("v=spf1")
+
 	if cfg.DNS.PublicIPv4 != "" {
-		if ip, err := netip.ParseAddr(cfg.DNS.PublicIPv4); err == nil && ip.Is4() {
+		ip, err := netip.ParseAddr(cfg.DNS.PublicIPv4)
+		if err == nil && ip.Is4() {
 			fmt.Fprintf(&b, " ip4:%s", ip.String())
 		}
 	}
+
 	if cfg.DNS.PublicIPv6 != "" {
 		fmt.Fprintf(&b, " ip6:%s", cfg.DNS.PublicIPv6)
 	}
+
 	for _, include := range cfg.DNS.SPFIncludes {
 		fmt.Fprintf(&b, " include:%s", strings.ToLower(strings.TrimSuffix(strings.TrimSpace(include), ".")))
 	}
+
 	b.WriteString(" -all")
 	return b.String()
 }

@@ -9,10 +9,12 @@ func rename(oldpath, newpath string) error {
 	if err != nil {
 		return err
 	}
+
 	newptr, err := windows.UTF16PtrFromString(newpath)
 	if err != nil {
 		return err
 	}
+
 	return windows.MoveFileEx(
 		oldptr,
 		newptr,

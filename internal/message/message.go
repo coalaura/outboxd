@@ -30,10 +30,10 @@ var (
 	errBodyUTF8  = errors.New("8-bit message body contains invalid UTF-8")
 
 	crlf = []byte("\r\n")
-)
 
-// ErrOversized is returned when the submission exceeds Options.MaxBytes.
-var ErrOversized = errOversized
+	// ErrOversized is returned when the submission exceeds Options.MaxBytes.
+	ErrOversized = errOversized
+)
 
 // Options carries the trace information added to the message.
 type Options struct {
@@ -41,6 +41,7 @@ type Options struct {
 	Helo     string
 	Remote   string
 	TLS      string
+
 	// MaxBytes limits the raw submission size. Zero means no limit here
 	// (the SMTP layer may still enforce MaxMessageBytes).
 	MaxBytes int64
@@ -51,10 +52,12 @@ type Message struct {
 	Data []byte
 	From string
 	ID   string
+
 	// NeedsUTF8 is true when envelope-bound header material uses raw UTF-8
 	// (internationalized addresses or non-ASCII header bytes not in encoded-words
 	// alone). Delivery must advertise SMTPUTF8 when this is set.
 	NeedsUTF8 bool
+
 	// EightBit is true when the body contains octets with the high bit set.
 	EightBit bool
 }
@@ -80,11 +83,13 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 		raw []byte
 		err error
 	)
+
 	if opts.MaxBytes > 0 {
 		raw, err = io.ReadAll(io.LimitReader(r, opts.MaxBytes+1))
 		if err != nil {
 			return nil, err
 		}
+
 		if int64(len(raw)) > opts.MaxBytes {
 			return nil, errOversized
 		}
@@ -135,8 +140,10 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 			if !utf8.Valid(field.value) {
 				return nil, errors.New("message header contains invalid UTF-8")
 			}
+
 			needsUTF8 = true
 		}
+
 		if field.name != "from" {
 			continue
 		}
@@ -155,7 +162,8 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 
 	identifierDomain := opts.Hostname
 
-	if at := strings.LastIndexByte(from, '@'); at >= 0 && at < len(from)-1 {
+	at := strings.LastIndexByte(from, '@')
+	if at >= 0 && at < len(from)-1 {
 		identifierDomain = from[at+1:]
 	}
 
@@ -179,14 +187,16 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 	)
 
 	// Date: inject when missing or unusable.
-	if dateField, ok := firstField(fields, "date"); !ok || !validDate(dateField.text()) {
+	dateField, ok := firstField(fields, "date")
+	if !ok || !validDate(dateField.text()) {
 		fmt.Fprintf(&out, "Date: %s\r\n", time.Now().Format(time.RFC1123Z))
 		present["date"] = 1
 	}
 
 	// Message-ID: inject when missing or unusable.
 	msgID := identifier
-	if idField, ok := firstField(fields, "message-id"); ok && validMessageID(idField.text()) {
+	idField, ok := firstField(fields, "message-id")
+	if ok && validMessageID(idField.text()) {
 		msgID = strings.TrimSpace(idField.text())
 	} else {
 		fmt.Fprintf(&out, "Message-ID: %s\r\n", identifier)
@@ -218,10 +228,13 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 
 	rewriteDate := false
 	rewriteMsgID := false
-	if df, ok := firstField(fields, "date"); ok && !validDate(df.text()) {
+	df, ok := firstField(fields, "date")
+	if ok && !validDate(df.text()) {
 		rewriteDate = true
 	}
-	if mf, ok := firstField(fields, "message-id"); ok && !validMessageID(mf.text()) {
+
+	mf, ok := firstField(fields, "message-id")
+	if ok && !validMessageID(mf.text()) {
 		rewriteMsgID = true
 	}
 
@@ -262,6 +275,7 @@ func firstField(fields []field, name string) (field, bool) {
 			return f, true
 		}
 	}
+
 	return field{}, false
 }
 
@@ -270,9 +284,12 @@ func validDate(value string) bool {
 	if value == "" {
 		return false
 	}
-	if _, err := mail.ParseDate(value); err != nil {
+
+	_, err := mail.ParseDate(value)
+	if err != nil {
 		return false
 	}
+
 	return true
 }
 
@@ -281,17 +298,20 @@ func validMessageID(value string) bool {
 	if len(value) < 5 || value[0] != '<' || value[len(value)-1] != '>' {
 		return false
 	}
+
 	inner := value[1 : len(value)-1]
 	at := strings.LastIndexByte(inner, '@')
 	if at <= 0 || at == len(inner)-1 {
 		return false
 	}
+
 	for i := 0; i < len(inner); i++ {
 		c := inner[i]
 		if c <= 32 || c >= 127 {
 			return false
 		}
 	}
+
 	return true
 }
 
@@ -303,21 +323,27 @@ func preserveLocalPartCase(headerText, parsed string) string {
 	if at < 0 {
 		return parsed
 	}
+
 	// Pull the raw addr-spec from the header if present.
 	raw := headerText
-	if i := strings.LastIndex(headerText, "<"); i >= 0 {
-		if j := strings.LastIndex(headerText, ">"); j > i {
+	i := strings.LastIndex(headerText, "<")
+	if i >= 0 {
+		j := strings.LastIndex(headerText, ">")
+		if j > i {
 			raw = headerText[i+1 : j]
 		}
 	}
+
 	raw = strings.TrimSpace(raw)
 	rat := strings.LastIndexByte(raw, '@')
 	if rat < 0 {
 		return parsed
 	}
+
 	if !strings.EqualFold(raw, parsed) && !strings.EqualFold(raw[rat+1:], parsed[at+1:]) {
 		return parsed
 	}
+
 	// Domain lowercased, local-part as written.
 	return raw[:rat] + "@" + strings.ToLower(raw[rat+1:])
 }
@@ -328,6 +354,7 @@ func needsUTF8Addr(addr string) bool {
 			return true
 		}
 	}
+
 	return !utf8.ValidString(addr)
 }
 
@@ -337,6 +364,7 @@ func fieldHasHighBit(value []byte) bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -365,6 +393,7 @@ func normalize(raw []byte) ([]byte, error) {
 			out = append(out, raw[i])
 
 			length++
+
 			if length > maxLineLength {
 				return nil, errLongLine
 			}
@@ -407,10 +436,12 @@ func scan(header []byte) ([]field, error) {
 			if len(fields) == 0 {
 				return nil, errMalformed
 			}
+
 			// Bare folding whitespace line (CRLF SP CRLF) is malformed.
 			if len(bytes.TrimSpace(line[:len(line)-2])) == 0 {
 				return nil, errMalformed
 			}
+
 			// Prohibit NUL already handled; reject other C0 controls in folds.
 			if containsHeaderControls(line[:len(line)-2]) {
 				return nil, errMalformed
@@ -428,6 +459,7 @@ func scan(header []byte) ([]field, error) {
 		}
 
 		name := line[:colon]
+
 		// Field-name is 1*ftext (RFC 5322): %d33-57 / %d59-126 (no colon, no space).
 		if !validFieldName(name) {
 			return nil, errMalformed
@@ -456,12 +488,14 @@ func validFieldName(name []byte) bool {
 	if len(name) == 0 {
 		return false
 	}
+
 	for _, c := range name {
 		// ftext = %d33-57 / %d59-126
 		if c < 33 || c > 126 || c == ':' {
 			return false
 		}
 	}
+
 	return true
 }
 
@@ -472,6 +506,7 @@ func containsHeaderControls(b []byte) bool {
 			return true
 		}
 	}
+
 	return false
 }
 

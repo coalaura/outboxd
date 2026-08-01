@@ -111,6 +111,7 @@ func (s *session) Rcpt(to string, opts *smtp.RcptOptions) error {
 	address, err := address(to)
 
 	var routing string
+
 	if err == nil {
 		if strings.HasPrefix(address[strings.LastIndexByte(address, '@')+1:], "[") {
 			err = errors.New("literal address")
@@ -163,6 +164,7 @@ func (s *session) Data(r io.Reader) error {
 	if !s.server.acquireDataSlot() {
 		return s.abortData(errDataBusy)
 	}
+
 	defer s.server.releaseDataSlot()
 
 	// Rate is work admission: once admitted, all DATA processing outcomes consume it.
@@ -200,6 +202,7 @@ func (s *session) Data(r io.Reader) error {
 				Message:      "Message too large",
 			}
 		}
+
 		return &smtp.SMTPError{
 			Code:         550,
 			EnhancedCode: smtp.EnhancedCode{5, 6, 0},
@@ -246,6 +249,7 @@ func (s *session) Data(r io.Reader) error {
 
 	// Stored requirement is based on actual envelope/header needs, not client opt-in alone.
 	needUTF8 := prepared.NeedsUTF8 || needsUTF8(s.sender)
+
 	for _, rcpt := range s.recipients {
 		if needsUTF8(rcpt) {
 			needUTF8 = true
@@ -273,6 +277,7 @@ func (s *session) Data(r io.Reader) error {
 				Message:      "Invalid recipient address",
 			}
 		}
+
 		envelope.Recipients = append(envelope.Recipients, queue.Recipient{
 			Address: recipient,
 			Domain:  domain,
@@ -283,6 +288,7 @@ func (s *session) Data(r io.Reader) error {
 	err = s.server.queue.Add(envelope, data)
 	if err != nil {
 		s.server.log.Printf("failed to queue message: %v\n", err)
+
 		if errors.Is(err, queue.ErrQueueFull) || errors.Is(err, queue.ErrInsufficientDisk) {
 			return errQueueFull
 		}
@@ -321,6 +327,7 @@ func (s *session) authenticate(username, password string) error {
 		s.server.log.Printf("authentication busy from %s\n", ip)
 		return errAuthBusy
 	}
+
 	defer s.server.releaseHashSlot()
 
 	if !s.server.authLimit.reserve(ip, username) {

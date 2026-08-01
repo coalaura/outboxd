@@ -11,18 +11,19 @@ import (
 	"golang.org/x/net/idna"
 )
 
-// Strict lookup-oriented IDNA profile for SMTP recipient-domain DNS routing.
-// Options match the pinned golang.org/x/net/idna API for lookup validation plus
-// DNS length and Bidi checks required for safe A-label conversion.
-var idnaProfile = idna.New(
-	idna.MapForLookup(),
-	idna.StrictDomainName(true),
-	idna.ValidateLabels(true),
-	idna.VerifyDNSLength(true),
-	idna.BidiRule(),
-)
-
 var (
+
+	// Strict lookup-oriented IDNA profile for SMTP recipient-domain DNS routing.
+	// Options match the pinned golang.org/x/net/idna API for lookup validation plus
+	// DNS length and Bidi checks required for safe A-label conversion.
+	idnaProfile = idna.New(
+		idna.MapForLookup(),
+		idna.StrictDomainName(true),
+		idna.ValidateLabels(true),
+		idna.VerifyDNSLength(true),
+		idna.BidiRule(),
+	)
+
 	ErrEmptyDomain   = errors.New("empty domain")
 	ErrInvalidUTF8   = errors.New("invalid utf-8 domain")
 	ErrInvalidDomain = errors.New("invalid domain")
@@ -44,16 +45,21 @@ func Address(value string) (string, error) {
 	if value == "" {
 		return "", errors.New("empty address")
 	}
+
 	parsed, err := mail.ParseAddress(value)
 	if err != nil {
 		return "", err
 	}
+
 	if parsed.Name != "" || (parsed.Address != value && value != "<"+parsed.Address+">") {
 		return "", errors.New("address contains a display name")
 	}
-	if err := ValidateAddress(parsed.Address); err != nil {
+
+	err = ValidateAddress(parsed.Address)
+	if err != nil {
 		return "", err
 	}
+
 	return parsed.Address, nil
 }
 
@@ -64,23 +70,29 @@ func ValidateAddress(addr string) error {
 	if !utf8.ValidString(addr) {
 		return ErrInvalidUTF8
 	}
+
 	if len(addr) > maxMailboxOctets {
 		return ErrMailboxLength
 	}
+
 	at := strings.LastIndexByte(addr, '@')
 	if at <= 0 || at == len(addr)-1 {
 		return ErrEmptyDomain
 	}
+
 	if at > maxLocalOctets {
 		return ErrLocalLength
 	}
+
 	domain := addr[at+1:]
 	if strings.HasPrefix(domain, "[") && strings.HasSuffix(domain, "]") {
 		if len(domain) > 255 {
 			return ErrDomainLength
 		}
+
 		return nil
 	}
+
 	_, err := asciiDomain(domain, false)
 	return err
 }
@@ -92,6 +104,7 @@ func DomainOf(addr string) (string, error) {
 	if at <= 0 || at == len(addr)-1 {
 		return "", ErrEmptyDomain
 	}
+
 	return RoutingDomain(addr[at+1:])
 }
 
@@ -106,13 +119,16 @@ func asciiDomain(domain string, requireFQDN bool) (string, error) {
 	if domain == "" {
 		return "", ErrEmptyDomain
 	}
+
 	if !utf8.ValidString(domain) {
 		return "", ErrInvalidUTF8
 	}
+
 	// Whitespace is never accepted or stripped for routing.
 	if strings.TrimSpace(domain) != domain {
 		return "", ErrInvalidDomain
 	}
+
 	// Reject empty labels before IDNA (including trailing dots).
 	if strings.HasPrefix(domain, ".") || strings.HasSuffix(domain, ".") || strings.Contains(domain, "..") {
 		return "", ErrDomainLabel
@@ -122,23 +138,28 @@ func asciiDomain(domain string, requireFQDN bool) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrInvalidDomain, err)
 	}
+
 	// Profile already lowercases; enforce lowercase ASCII A-labels explicitly.
 	ascii = strings.ToLower(ascii)
 	if ascii == "" {
 		return "", ErrEmptyDomain
 	}
+
 	if len(ascii) > 253 {
 		return "", ErrDomainLength
 	}
+
 	labels := strings.Split(ascii, ".")
 	if requireFQDN && len(labels) < 2 {
 		// Delivery still requires a multi-label FQDN for ordinary recipients.
 		return "", ErrDomainLabel
 	}
+
 	for _, label := range labels {
 		if label == "" || len(label) > 63 {
 			return "", ErrDomainLabel
 		}
 	}
+
 	return ascii, nil
 }

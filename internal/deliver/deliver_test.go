@@ -61,11 +61,13 @@ type fakeResolver struct {
 }
 
 func (f *fakeResolver) LookupMX(ctx context.Context, name string) ([]*net.MX, error) {
-	if mx, ok := f.mx[name]; ok {
+	mx, ok := f.mx[name]
+	if ok {
 		out := make([]*net.MX, len(mx))
 		copy(out, mx)
 		return out, nil
 	}
+
 	return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
 }
 
@@ -74,16 +76,21 @@ func (f *fakeResolver) LookupNetIP(ctx context.Context, network, host string) ([
 	if !ok {
 		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
 	}
+
 	out := make([]net.IP, 0, len(ips))
+
 	for _, ip := range ips {
 		if network == "ip4" && ip.To4() == nil {
 			continue
 		}
+
 		if network == "ip6" && ip.To4() != nil {
 			continue
 		}
+
 		out = append(out, append(net.IP(nil), ip...))
 	}
+
 	return out, nil
 }
 
@@ -124,6 +131,7 @@ func openQueue(t *testing.T) *queue.Queue {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	t.Cleanup(func() { _ = q.Close() })
 	return q
 }
@@ -144,7 +152,8 @@ func addMsg(t *testing.T, q *queue.Queue, id, domain, rcpt string) {
 		NextAttempt: now,
 	}
 	body := []byte("From: sender@example.com\r\nTo: " + rcpt + "\r\nSubject: t\r\n\r\nHi\r\n")
-	if err := q.Add(env, body); err != nil {
+	err := q.Add(env, body)
+	if err != nil {
 		t.Fatal(err)
 	}
 }
@@ -155,6 +164,7 @@ func TestStoragePressureIsNonfatalAndBackedOff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	t.Cleanup(func() { _ = q.Close() })
 	addMsg(t, q, "storage-pressure", "missing.invalid", "user@missing.invalid")
 	q.FreeDisk = func(string) (int64, error) { return 0, nil }
@@ -164,12 +174,16 @@ func TestStoragePressureIsNonfatalAndBackedOff(t *testing.T) {
 	d.SetResolver(&fakeResolver{mx: map[string][]*net.MX{}, ips: map[string][]net.IP{}})
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	if err := d.Run(ctx); err != nil {
+
+	err = d.Run(ctx)
+	if err != nil {
 		t.Fatalf("Run returned storage pressure as fatal: %v", err)
 	}
+
 	if !logger.contains("storage pressure") {
 		t.Fatalf("storage pressure was not logged")
 	}
+
 	if q.Len() != 1 {
 		t.Fatalf("queued messages=%d want 1 recoverable message", q.Len())
 	}
@@ -181,6 +195,7 @@ func selfSigned(t *testing.T, cn string) tls.Certificate {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: cn},
@@ -194,16 +209,19 @@ func selfSigned(t *testing.T, cn string) tls.Certificate {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	return cert
 }
 
@@ -220,6 +238,7 @@ func smtpListener(t *testing.T, startTLS bool, cert tls.Certificate) *legacyList
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	l := &legacyListener{
 		addr:     ln.Addr().String(),
 		accepted: make(chan struct{}),
@@ -230,6 +249,7 @@ func smtpListener(t *testing.T, startTLS bool, cert tls.Certificate) *legacyList
 			if err != nil {
 				return
 			}
+
 			go serveSMTP(c, startTLS, cert, l)
 		}
 	}()
@@ -244,34 +264,43 @@ func serveSMTP(c net.Conn, startTLS bool, cert tls.Certificate, l *legacyListene
 	buf := make([]byte, 1)
 	readLine := func() string {
 		var b strings.Builder
+
 		for {
 			n, err := rw.Read(buf)
 			if n > 0 {
 				b.WriteByte(buf[0])
+
 				if buf[0] == '\n' {
 					break
 				}
 			}
+
 			if err != nil {
 				return b.String()
 			}
 		}
+
 		return b.String()
 	}
 	write("220 test ESMTP\r\n")
 	secured := false
+
 	for {
 		line := readLine()
 		if line == "" {
 			return
 		}
+
 		upper := strings.ToUpper(strings.TrimSpace(line))
+
 		switch {
 		case strings.HasPrefix(upper, "EHLO"):
 			write("250-localhost\r\n")
+
 			if startTLS && !secured {
 				write("250-STARTTLS\r\n")
 			}
+
 			write("250-8BITMIME\r\n")
 			write("250 OK\r\n")
 		case strings.HasPrefix(upper, "STARTTLS"):
@@ -279,11 +308,14 @@ func serveSMTP(c net.Conn, startTLS bool, cert tls.Certificate, l *legacyListene
 				write("503 bad\r\n")
 				continue
 			}
+
 			write("220 ready\r\n")
 			tlsConn := tls.Server(rw, &tls.Config{Certificates: []tls.Certificate{cert}})
-			if err := tlsConn.Handshake(); err != nil {
+			err := tlsConn.Handshake()
+			if err != nil {
 				return
 			}
+
 			rw = tlsConn
 			secured = true
 		case strings.HasPrefix(upper, "MAIL FROM:"):
@@ -292,12 +324,14 @@ func serveSMTP(c net.Conn, startTLS bool, cert tls.Certificate, l *legacyListene
 			write("250 OK\r\n")
 		case strings.HasPrefix(upper, "DATA"):
 			write("354 go\r\n")
+
 			for {
 				l2 := readLine()
 				if strings.TrimRight(l2, "\r\n") == "." {
 					break
 				}
 			}
+
 			write("250 queued\r\n")
 			l.once.Do(func() { close(l.accepted) })
 		case strings.HasPrefix(upper, "QUIT"):
@@ -311,6 +345,7 @@ func serveSMTP(c net.Conn, startTLS bool, cert tls.Certificate, l *legacyListene
 
 func awaitAccepted(t *testing.T, l *legacyListener, timeout time.Duration) {
 	t.Helper()
+
 	select {
 	case <-l.accepted:
 	case <-time.After(timeout):
@@ -378,10 +413,12 @@ func TestDeliveryRequiredRejectsPlain(t *testing.T) {
 		t.Fatal("required TLS must not deliver over plaintext")
 	default:
 	}
+
 	ids, err := q.DeadIDs()
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if len(ids) == 0 {
 		t.Fatal("expected message buried after required-TLS failure")
 	}
@@ -431,6 +468,7 @@ func TestPrivateIPRejection(t *testing.T) {
 		case dialed <- struct{}{}:
 		default:
 		}
+
 		return nil, net.ErrClosed
 	}))
 
@@ -509,6 +547,7 @@ func TestFairnessBlockedDomain(t *testing.T) {
 			case blockedDialing <- struct{}{}:
 			default:
 			}
+
 			select {
 			case <-releaseBlocked:
 				return nil, context.Canceled
@@ -516,6 +555,7 @@ func TestFairnessBlockedDomain(t *testing.T) {
 				return nil, ctx.Err()
 			}
 		}
+
 		var nd net.Dialer
 		return nd.DialContext(ctx, "tcp", fast.addr)
 	}))
@@ -575,6 +615,7 @@ func TestRunCancelUnblocksBlockedDial(t *testing.T) {
 		<-done
 		t.Fatal("dial never started")
 	}
+
 	cancel()
 
 	select {
@@ -594,6 +635,7 @@ func TestRunDSNAtFullQueueNotFatal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	t.Cleanup(func() { _ = q.Close() })
 
 	cfg := testConfig()
@@ -602,6 +644,7 @@ func TestRunDSNAtFullQueueNotFatal(t *testing.T) {
 	cfg.Delivery.InitialRetryDelay = "1ms"
 	cfg.Delivery.MaximumRetryDelay = "1ms"
 	d := deliver.New(cfg, q, memLog{})
+
 	// Hang the DSN recipient domain so Run cannot Finish the DSN before we assert.
 	dsnHold := make(chan struct{})
 	t.Cleanup(func() { close(dsnHold) })
@@ -626,7 +669,8 @@ func TestRunDSNAtFullQueueNotFatal(t *testing.T) {
 		Created: now, NextAttempt: now,
 	}
 	body := []byte("From: sender@example.com\r\nTo: r@ex.com\r\nSubject: t\r\n\r\nHi\r\n")
-	if err := q.Add(env, body); err != nil {
+	err = q.Add(env, body)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -635,15 +679,19 @@ func TestRunDSNAtFullQueueNotFatal(t *testing.T) {
 	go func() { done <- d.Run(ctx) }()
 
 	deadline := time.After(3 * time.Second)
+
 	for {
 		select {
 		case err := <-done:
 			t.Fatalf("Run returned early: %v", err)
 		case <-deadline:
 			cancel()
-			if err := <-done; err != nil {
+
+			err = <-done
+			if err != nil {
 				t.Fatalf("Run fatal after deadline: %v", err)
 			}
+
 			t.Fatal("message never buried")
 		default:
 			_, deadErr := os.Stat(filepath.Join(root, "dead", "full1"))
@@ -651,11 +699,14 @@ func TestRunDSNAtFullQueueNotFatal(t *testing.T) {
 			if deadErr == nil && dsnErr == nil {
 				goto buried
 			}
+
 			runtime.Gosched()
 		}
 	}
+
 buried:
 	cancel()
+
 	select {
 	case err := <-done:
 		if err != nil {
@@ -681,5 +732,6 @@ func (h *hangResolver) LookupMX(ctx context.Context, name string) ([]*net.MX, er
 			return nil, ctx.Err()
 		}
 	}
+
 	return h.fakeResolver.LookupMX(ctx, name)
 }

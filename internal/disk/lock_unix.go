@@ -16,13 +16,17 @@ func Lock(path string) (*FileLock, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+
+	err = unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+	if err != nil {
 		_ = f.Close()
 		if err == unix.EWOULDBLOCK || err == unix.EAGAIN {
 			return nil, ErrLocked
 		}
+
 		return nil, fmt.Errorf("flock %s: %w", path, err)
 	}
+
 	return &FileLock{impl: &unixFileLock{f: f}}, nil
 }
 
@@ -34,6 +38,7 @@ func (l *unixFileLock) close() error {
 	if l.f == nil {
 		return nil
 	}
+
 	_ = unix.Flock(int(l.f.Fd()), unix.LOCK_UN)
 	err := l.f.Close()
 	l.f = nil

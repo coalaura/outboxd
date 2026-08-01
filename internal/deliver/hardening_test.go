@@ -15,15 +15,23 @@ import (
 	"github.com/coalaura/outboxd/internal/queue"
 )
 
+type enhancedCodeCase struct {
+	code    int
+	message string
+	want    string
+}
+
 func servePlainSMTP(conn net.Conn, accepted chan<- struct{}, dataBytes chan<- string) {
 	defer conn.Close()
 	_, _ = io.WriteString(conn, "220 mx\r\n")
 	r := bufio.NewReader(conn)
+
 	for {
 		line, err := r.ReadString('\n')
 		if err != nil {
 			return
 		}
+
 		switch {
 		case strings.HasPrefix(line, "EHLO"):
 			_, _ = io.WriteString(conn, "250 mx\r\n")
@@ -34,20 +42,26 @@ func servePlainSMTP(conn net.Conn, accepted chan<- struct{}, dataBytes chan<- st
 			if accepted != nil {
 				accepted <- struct{}{}
 			}
+
 			var body strings.Builder
+
 			for {
 				line, err = r.ReadString('\n')
 				body.WriteString(line)
+
 				if err != nil {
 					if dataBytes != nil {
 						dataBytes <- body.String()
 					}
+
 					return
 				}
+
 				if strings.TrimRight(line, "\r\n") == "." {
 					break
 				}
 			}
+
 			_, _ = io.WriteString(conn, "250 queued\r\n")
 		case strings.HasPrefix(line, "QUIT"):
 			_, _ = io.WriteString(conn, "221 bye\r\n")
@@ -68,6 +82,7 @@ func TestAttemptCancellationDoesNotConsumeFinalAttempt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	t.Cleanup(func() { _ = q.Close() })
 	cfg := testDeliverCfg()
 	cfg.Delivery.MaxAttempts = 1
@@ -91,27 +106,35 @@ func TestAttemptCancellationDoesNotConsumeFinalAttempt(t *testing.T) {
 	env := hardeningEnvelope("cancel-final", time.Now(), queue.Recipient{
 		Address: "r@ex.com", Domain: "ex.com", Status: queue.StatusPending,
 	})
-	if err := q.Add(env, []byte("body\r\n")); err != nil {
+	err = q.Add(env, []byte("body\r\n"))
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	got, err := q.Next(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- d.attempt(ctx, got) }()
 	<-started
 	cancel()
-	if err := <-done; err != nil {
+
+	err = <-done
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got.Attempts != 0 || got.Recipients[0].Status != queue.StatusPending {
 		t.Fatalf("attempts=%d recipient=%+v", got.Attempts, got.Recipients[0])
 	}
+
 	if got.NextAttempt.After(time.Now()) {
 		t.Fatalf("retry is not immediate: %s", got.NextAttempt)
 	}
+
 	dead, _ := q.DeadIDs()
 	if len(dead) != 0 {
 		t.Fatalf("cancellation buried message: %v", dead)
@@ -123,6 +146,7 @@ func TestAttemptCancellationPreservesPartialMultiDomainProgress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	t.Cleanup(func() { _ = q.Close() })
 	cfg := testDeliverCfg()
 	cfg.Delivery.MaxAttempts = 1
@@ -148,6 +172,7 @@ func TestAttemptCancellationPreservesPartialMultiDomainProgress(t *testing.T) {
 				_, _ = server.Read(make([]byte, 1))
 			}()
 		}
+
 		return client, nil
 	}))
 	now := time.Now()
@@ -155,18 +180,23 @@ func TestAttemptCancellationPreservesPartialMultiDomainProgress(t *testing.T) {
 		queue.Recipient{Address: "a@a.test", Domain: "a.test", Status: queue.StatusPending},
 		queue.Recipient{Address: "b@b.test", Domain: "b.test", Status: queue.StatusPending},
 	)
-	if err := q.Add(env, []byte("hello\r\n")); err != nil {
+	err = q.Add(env, []byte("hello\r\n"))
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	got, _ := q.Next(context.Background())
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- d.attempt(ctx, got) }()
 	<-stalled
 	cancel()
-	if err := <-done; err != nil {
+
+	err = <-done
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got.Attempts != 0 || got.Recipients[0].Status != queue.StatusSent || got.Recipients[1].Status != queue.StatusPending {
 		t.Fatalf("attempts=%d recipients=%+v", got.Attempts, got.Recipients)
 	}
@@ -181,6 +211,7 @@ func (r *failingBody) Read(p []byte) (int, error) {
 		r.sent = true
 		return copy(p, "partial body\r\n"), nil
 	}
+
 	return 0, errors.New("spool read failed")
 }
 
@@ -189,6 +220,7 @@ func TestDataCopyErrorAbortsWithoutTerminator(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	t.Cleanup(func() { _ = q.Close() })
 	d := New(testDeliverCfg(), q, nopLogger{})
 	ip := net.ParseIP("127.0.0.1")
@@ -205,9 +237,11 @@ func TestDataCopyErrorAbortsWithoutTerminator(t *testing.T) {
 	env := hardeningEnvelope("copy-error", time.Now(), queue.Recipient{
 		Address: "r@ex.com", Domain: "ex.com", Status: queue.StatusPending,
 	})
-	if _, err := d.send(context.Background(), env, "mx.ex.com", []int{0}); err == nil {
+	_, err = d.send(context.Background(), env, "mx.ex.com", []int{0})
+	if err == nil {
 		t.Fatal("expected body read error")
 	}
+
 	got := <-data
 	if strings.Contains(got, "\r\n.\r\n") || strings.HasSuffix(got, ".\r\n") {
 		t.Fatalf("DATA terminator was sent: %q", got)
@@ -219,6 +253,7 @@ func TestEstablishedSessionClosesPromptlyOnCancel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	t.Cleanup(func() { _ = q.Close() })
 	d := New(testDeliverCfg(), q, nopLogger{})
 	connected := make(chan struct{})
@@ -236,6 +271,7 @@ func TestEstablishedSessionClosesPromptlyOnCancel(t *testing.T) {
 	go func() { _, err := d.dialAndSession(ctx, "mx.ex.com", net.ParseIP("127.0.0.1"), true); done <- err }()
 	<-connected
 	cancel()
+
 	select {
 	case err := <-done:
 		if err == nil {
@@ -251,6 +287,7 @@ func TestAttemptSessionCappedAtQueueLifetime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	t.Cleanup(func() { _ = q.Close() })
 	cfg := testDeliverCfg()
 	cfg.Delivery.MaximumLifetime = "100ms"
@@ -271,17 +308,22 @@ func TestAttemptSessionCappedAtQueueLifetime(t *testing.T) {
 	env := hardeningEnvelope("lifetime", time.Now(), queue.Recipient{
 		Address: "r@ex.com", Domain: "ex.com", Status: queue.StatusPending,
 	})
-	if err := q.Add(env, []byte("body\r\n")); err != nil {
+	err = q.Add(env, []byte("body\r\n"))
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	got, _ := q.Next(context.Background())
 	start := time.Now()
-	if err := d.attempt(context.Background(), got); err != nil {
+	err = d.attempt(context.Background(), got)
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	if time.Since(start) > time.Second {
 		t.Fatal("queue lifetime did not cap session")
 	}
+
 	if got.Recipients[0].Status != queue.StatusFailed || got.Recipients[0].Detail != lifetimeDetail {
 		t.Fatalf("recipient=%+v", got.Recipients[0])
 	}
@@ -296,7 +338,9 @@ func TestSMTPResponseBounds(t *testing.T) {
 		}()
 		c := NewClient(client, time.Second, time.Second)
 		defer c.Close()
-		if err := c.Greet(); err != nil {
+
+		err := c.Greet()
+		if err != nil {
 			t.Fatalf("exact-boundary Greet error=%v", err)
 		}
 	})
@@ -308,7 +352,9 @@ func TestSMTPResponseBounds(t *testing.T) {
 		}()
 		c := NewClient(client, time.Second, time.Second)
 		defer c.Close()
-		if err := c.Greet(); !errors.Is(err, errSMTPResponseTooLarge) {
+
+		err := c.Greet()
+		if !errors.Is(err, errSMTPResponseTooLarge) {
 			t.Fatalf("Greet error=%v", err)
 		}
 	})
@@ -319,19 +365,26 @@ func TestSMTPResponseBounds(t *testing.T) {
 			_, _ = io.WriteString(server, "220 mx\r\n")
 			r := bufio.NewReader(server)
 			_, _ = r.ReadString('\n')
+
 			for i := 0; i < maxSMTPResponseBytes/8+1; i++ {
-				if _, err := io.WriteString(server, "250-xxx\r\n"); err != nil {
+				_, err := io.WriteString(server, "250-xxx\r\n")
+				if err != nil {
 					return
 				}
 			}
+
 			_, _ = io.WriteString(server, "250 ok\r\n")
 		}()
 		c := NewClient(client, time.Second, time.Second)
 		defer c.Close()
-		if err := c.Greet(); err != nil {
+
+		err := c.Greet()
+		if err != nil {
 			t.Fatal(err)
 		}
-		if err := c.EHLO("host"); !errors.Is(err, errSMTPResponseTooLarge) {
+
+		err = c.EHLO("host")
+		if !errors.Is(err, errSMTPResponseTooLarge) {
 			t.Fatalf("EHLO error=%v", err)
 		}
 	})
@@ -342,19 +395,24 @@ func TestSubmissionDeadlineIncludesFinalDataResponse(t *testing.T) {
 	go func() {
 		defer server.Close()
 		r := bufio.NewReader(server)
-		if line, err := r.ReadString('\n'); err != nil || line != "DATA\r\n" {
+		line, err := r.ReadString('\n')
+		if err != nil || line != "DATA\r\n" {
 			return
 		}
+
 		_, _ = io.WriteString(server, "354 go\r\n")
+
 		for {
 			line, err := r.ReadString('\n')
 			if err != nil {
 				return
 			}
+
 			if line == ".\r\n" {
 				break
 			}
 		}
+
 		time.Sleep(75 * time.Millisecond)
 		_, _ = io.WriteString(server, "250 queued\r\n")
 	}()
@@ -365,15 +423,20 @@ func TestSubmissionDeadlineIncludesFinalDataResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	time.Sleep(50 * time.Millisecond)
-	if _, err := io.WriteString(dw, "body\r\n"); err != nil {
+
+	_, err = io.WriteString(dw, "body\r\n")
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	start := time.Now()
 	err = dw.Close()
 	if err == nil {
 		t.Fatal("final response exceeded the DATA submission deadline")
 	}
+
 	if time.Since(start) > 500*time.Millisecond {
 		t.Fatalf("deadline was reset during DATA close: %s", time.Since(start))
 	}
@@ -385,22 +448,20 @@ func TestNormalizeDiagnostic(t *testing.T) {
 	if !utf8.ValidString(got) || len(got) > maxDiagnosticBytes {
 		t.Fatalf("invalid normalized diagnostic: valid=%v bytes=%d", utf8.ValidString(got), len(got))
 	}
+
 	for _, r := range got {
 		if unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
 			t.Fatalf("control %U remains in %q", r, got)
 		}
 	}
+
 	if strings.ContainsAny(got, "\r\n") {
 		t.Fatalf("multiline diagnostic: %q", got)
 	}
 }
 
 func TestParseEnhancedCode(t *testing.T) {
-	tests := []struct {
-		code    int
-		message string
-		want    string
-	}{
+	tests := []enhancedCodeCase{
 		{550, "5.1.1 no such user", "5.1.1"},
 		{451, "4.7.12 deferred", "4.7.12"},
 		{550, "4.1.1 wrong class", ""},
@@ -408,8 +469,10 @@ func TestParseEnhancedCode(t *testing.T) {
 		{550, "5.1 missing component", ""},
 		{550, "rejected without enhanced code", ""},
 	}
+
 	for _, tt := range tests {
-		if got := parseEnhancedCode(tt.code, tt.message); got != tt.want {
+		got := parseEnhancedCode(tt.code, tt.message)
+		if got != tt.want {
 			t.Errorf("parseEnhancedCode(%d, %q)=%q want %q", tt.code, tt.message, got, tt.want)
 		}
 	}
@@ -423,9 +486,11 @@ func TestRestrictedDestinationTable(t *testing.T) {
 		"8.8.8.8": false, "1.1.1.1": false,
 		"2606:4700:4700::1111": false, "2001:4860:4860::8888": false,
 	}
+
 	for raw, want := range tests {
 		t.Run(raw, func(t *testing.T) {
-			if got := isRestricted(net.ParseIP(raw)); got != want {
+			got := isRestricted(net.ParseIP(raw))
+			if got != want {
 				t.Fatalf("isRestricted(%s)=%v want %v", raw, got, want)
 			}
 		})
@@ -434,7 +499,9 @@ func TestRestrictedDestinationTable(t *testing.T) {
 
 func TestBackoffSaturates(t *testing.T) {
 	d := &Deliverer{initial: time.Duration(1 << 62), maximum: time.Duration(1<<63 - 1)}
+
 	for _, attempts := range []int{2, 10, 1000} {
+
 		got := d.backoff(attempts)
 		if got < 0 || got > d.maximum {
 			t.Fatalf("backoff(%d)=%s", attempts, got)

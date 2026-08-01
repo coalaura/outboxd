@@ -14,6 +14,7 @@ func mkdirDurableComponent(path string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+
 	remove := true
 	defer func() {
 		if remove {
@@ -24,13 +25,17 @@ func mkdirDurableComponent(path string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+
 	newptr, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return false, err
 	}
-	if err := windows.MoveFileEx(oldptr, newptr, windows.MOVEFILE_WRITE_THROUGH); err != nil {
+
+	err = windows.MoveFileEx(oldptr, newptr, windows.MOVEFILE_WRITE_THROUGH)
+	if err != nil {
 		return false, err
 	}
+
 	remove = false
 	return true, nil
 }

@@ -65,6 +65,7 @@ func (DefaultResolver) LookupMX(ctx context.Context, name string) ([]*net.MX, er
 type DKIMKey struct {
 	// Selector is the DNS selector label.
 	Selector string
+
 	// PublicKey is base64 SubjectPublicKeyInfo (same form as sign.Signer.PublicKey).
 	PublicKey string
 }
@@ -72,10 +73,13 @@ type DKIMKey struct {
 // Options configures a Check run.
 type Options struct {
 	Config *config.Config
+
 	// Resolver defaults to DefaultResolver when nil.
 	Resolver Resolver
+
 	// DKIM is optional; when set, the selector TXT is compared to the key.
 	DKIM *DKIMKey
+
 	// Now overrides time for expiry-adjacent checks (unused now; reserved).
 	Now func() time.Time
 }
@@ -85,9 +89,11 @@ func Run(ctx context.Context, opts Options) []Result {
 	if opts.Resolver == nil {
 		opts.Resolver = DefaultResolver{}
 	}
+
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
+
 	cfg := opts.Config
 	r := opts.Resolver
 
@@ -108,6 +114,7 @@ func Failed(results []Result) bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -126,15 +133,21 @@ func checkHostnameAddrs(ctx context.Context, r Resolver, cfg *config.Config) []R
 
 	have4 := map[string]bool{}
 	have6 := map[string]bool{}
+
 	for _, a := range addrs {
-		if v4 := a.IP.To4(); v4 != nil {
+		v4 := a.IP.To4()
+		if v4 != nil {
 			have4[v4.String()] = true
-		} else if v6 := a.IP.To16(); v6 != nil {
-			have6[a.IP.String()] = true
+		} else {
+			v6 := a.IP.To16()
+			if v6 != nil {
+				have6[a.IP.String()] = true
+			}
 		}
 	}
 
 	var rs []Result
+
 	if cfg.DNS.PublicIPv4 != "" {
 		if !have4[cfg.DNS.PublicIPv4] {
 			rs = append(rs, Result{Name: name + "_a", Level: Fail,
@@ -144,6 +157,7 @@ func checkHostnameAddrs(ctx context.Context, r Resolver, cfg *config.Config) []R
 				Message: fmt.Sprintf("%s A includes %s", host, cfg.DNS.PublicIPv4)})
 		}
 	}
+
 	if cfg.DNS.PublicIPv6 != "" {
 		want := net.ParseIP(cfg.DNS.PublicIPv6)
 		found := false
@@ -155,6 +169,7 @@ func checkHostnameAddrs(ctx context.Context, r Resolver, cfg *config.Config) []R
 				}
 			}
 		}
+
 		if !found {
 			rs = append(rs, Result{Name: name + "_aaaa", Level: Fail,
 				Message: fmt.Sprintf("%s AAAA records do not include configured public_ipv6 %s", host, cfg.DNS.PublicIPv6)})
@@ -163,6 +178,7 @@ func checkHostnameAddrs(ctx context.Context, r Resolver, cfg *config.Config) []R
 				Message: fmt.Sprintf("%s AAAA includes %s", host, cfg.DNS.PublicIPv6)})
 		}
 	}
+
 	return rs
 }
 
@@ -175,12 +191,15 @@ func checkFCrDNS(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 		if ip == "" {
 			return
 		}
+
 		names, err := r.LookupAddr(ctx, ip)
 		if err != nil {
 			rs = append(rs, Result{Name: name, Level: Fail, Message: fmt.Sprintf("PTR for %s: %v", ip, err)})
 			return
 		}
+
 		matched := false
+
 		for _, n := range names {
 			n = strings.ToLower(strings.TrimSuffix(n, "."))
 			if n == host {
@@ -188,44 +207,53 @@ func checkFCrDNS(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 				break
 			}
 		}
+
 		if !matched {
 			rs = append(rs, Result{Name: name, Level: Fail,
 				Message: fmt.Sprintf("PTR for %s is %v, want %s", ip, names, host)})
 			return
 		}
+
 		// Confirm forward match again from PTR target.
 		addrs, err := r.LookupIPAddr(ctx, host)
 		if err != nil {
 			rs = append(rs, Result{Name: name, Level: Fail, Message: fmt.Sprintf("forward lookup after PTR: %v", err)})
 			return
 		}
+
 		want := net.ParseIP(ip)
 		ok := false
+
 		for _, a := range addrs {
 			if a.IP.Equal(want) {
 				ok = true
 				break
 			}
 		}
+
 		if !ok {
 			rs = append(rs, Result{Name: name, Level: Fail,
 				Message: fmt.Sprintf("FCrDNS broken: PTR is %s but A/AAAA does not include %s", host, ip)})
 			return
 		}
+
 		rs = append(rs, Result{Name: name, Level: Pass, Message: fmt.Sprintf("FCrDNS ok for %s ↔ %s", ip, host)})
 	}
 
 	checkIP(cfg.DNS.PublicIPv4, "v4")
 	checkIP(cfg.DNS.PublicIPv6, "v6")
+
 	if len(rs) == 0 {
 		rs = append(rs, Result{Name: "fcrdns", Level: Fail, Message: "no public IPs configured"})
 	}
+
 	return rs
 }
 
 func checkSPF(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 	owners := requiredSPFOwners(cfg)
 	var rs []Result
+
 	for _, owner := range owners {
 		name := "spf_" + strings.TrimSuffix(owner, ".")
 		txts, err := r.LookupTXT(ctx, strings.TrimSuffix(owner, "."))
@@ -233,7 +261,9 @@ func checkSPF(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 			rs = append(rs, Result{Name: name, Level: Fail, Message: fmt.Sprintf("TXT lookup %s: %v", owner, err)})
 			continue
 		}
+
 		var spf []string
+
 		for _, t := range txts {
 			tt := strings.TrimSpace(t)
 			fields := strings.Fields(tt)
@@ -241,6 +271,7 @@ func checkSPF(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 				spf = append(spf, tt)
 			}
 		}
+
 		switch len(spf) {
 		case 0:
 			rs = append(rs, Result{Name: name, Level: Fail, Message: fmt.Sprintf("no SPF TXT at %s", owner)})
@@ -255,6 +286,7 @@ func checkSPF(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 			rs = append(rs, Result{Name: name, Level: Fail, Message: fmt.Sprintf("%d SPF TXT records at %s (must be exactly one)", len(spf), owner)})
 		}
 	}
+
 	return rs
 }
 
@@ -262,6 +294,7 @@ func requiredSPFOwners(cfg *config.Config) []string {
 	domain := strings.ToLower(strings.TrimSuffix(cfg.Server.Domain, "."))
 	hostname := strings.ToLower(strings.TrimSuffix(cfg.Server.Hostname, "."))
 	set := map[string]struct{}{domain: {}}
+
 	for i := range cfg.Users {
 		for _, sender := range cfg.Users[i].AllowedSenders {
 			sender = strings.TrimSpace(sender)
@@ -269,21 +302,26 @@ func requiredSPFOwners(cfg *config.Config) []string {
 				set[strings.ToLower(sender[2:])] = struct{}{}
 				continue
 			}
+
 			at := strings.LastIndexByte(sender, '@')
 			if at > 0 {
 				set[strings.ToLower(sender[at+1:])] = struct{}{}
 			}
 		}
 	}
+
 	if hostname != domain {
 		set[hostname] = struct{}{}
 	}
+
 	owners := make([]string, 0, len(set))
+
 	for o := range set {
 		if o != "" {
 			owners = append(owners, o)
 		}
 	}
+
 	sort.Strings(owners)
 	return owners
 }
@@ -293,6 +331,7 @@ func checkDKIM(ctx context.Context, r Resolver, cfg *config.Config, key *DKIMKey
 	if key != nil && key.Selector != "" {
 		selector = key.Selector
 	}
+
 	name := fmt.Sprintf("%s._domainkey.%s", selector, strings.TrimSuffix(cfg.Server.Domain, "."))
 	checkName := "dkim"
 
@@ -300,16 +339,20 @@ func checkDKIM(ctx context.Context, r Resolver, cfg *config.Config, key *DKIMKey
 	if err != nil {
 		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("TXT lookup %s: %v", name, err)}}
 	}
+
 	var dkim []string
+
 	for _, t := range txts {
 		tt := strings.TrimSpace(collapseSpaces(t))
 		if strings.HasPrefix(strings.ToLower(tt), "v=dkim1") {
 			dkim = append(dkim, tt)
 		}
 	}
+
 	if len(dkim) == 0 {
 		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("no DKIM TXT at %s", name)}}
 	}
+
 	if len(dkim) > 1 {
 		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("multiple DKIM TXT at %s", name)}}
 	}
@@ -323,11 +366,13 @@ func checkDKIM(ctx context.Context, r Resolver, cfg *config.Config, key *DKIMKey
 	if !ok {
 		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("DKIM TXT at %s missing p=", name)}}
 	}
+
 	// Compare base64 payloads (ignore padding differences).
 	if normalizeB64(pub) != normalizeB64(key.PublicKey) {
 		return []Result{{Name: checkName, Level: Fail,
 			Message: fmt.Sprintf("DKIM p= at %s does not match the loaded private key", name)}}
 	}
+
 	return []Result{{Name: checkName, Level: Pass, Message: fmt.Sprintf("DKIM selector %s matches loaded key", selector)}}
 }
 
@@ -339,7 +384,9 @@ func checkDMARC(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 	if err != nil {
 		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("TXT lookup %s: %v", name, err)}}
 	}
+
 	var found []string
+
 	for _, t := range txts {
 		tt := strings.TrimSpace(t)
 		first, _, _ := strings.Cut(tt, ";")
@@ -347,9 +394,11 @@ func checkDMARC(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 			found = append(found, tt)
 		}
 	}
+
 	if len(found) == 0 {
 		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("no DMARC TXT at %s", name)}}
 	}
+
 	if len(found) > 1 {
 		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("multiple DMARC TXT at %s", name)}}
 	}
@@ -358,7 +407,9 @@ func checkDMARC(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 	if err != nil {
 		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("DMARC record invalid: %v", err)}}
 	}
+
 	p := strings.ToLower(tags["p"])
+
 	switch p {
 	case "none", "quarantine", "reject":
 	case "":
@@ -371,6 +422,7 @@ func checkDMARC(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 	if want == "" {
 		want = "none"
 	}
+
 	level := Pass
 	msg := fmt.Sprintf("DMARC p=%s", p)
 	if p != want {
@@ -380,41 +432,56 @@ func checkDMARC(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 		level = Warn
 		msg = "DMARC p=none (monitor only); stage to quarantine/reject after verifying alignment"
 	}
-	if rua := tags["rua"]; rua == "" {
+
+	rua := tags["rua"]
+	if rua == "" {
 		if level == Pass {
 			level = Warn
 		}
+
 		msg += "; no rua= (no aggregate reports)"
-	} else if err := config.ValidateDMARCReportURIList(rua); err != nil {
-		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("DMARC rua invalid: %v", err)}}
+	} else {
+		err = config.ValidateDMARCReportURIList(rua)
+		if err != nil {
+			return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("DMARC rua invalid: %v", err)}}
+		}
 	}
+
 	return []Result{{Name: checkName, Level: level, Message: msg}}
 }
 
 func parseDMARCTags(record string) (map[string]string, error) {
 	parts := strings.Split(record, ";")
 	tags := make(map[string]string, len(parts))
+
 	for i, part := range parts {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			if i == len(parts)-1 {
 				continue
 			}
+
 			return nil, errors.New("empty tag")
 		}
+
 		key, value, ok := strings.Cut(part, "=")
 		key, value = strings.ToLower(strings.TrimSpace(key)), strings.TrimSpace(value)
 		if !ok || key == "" || value == "" || !asciiLetters(key) {
 			return nil, fmt.Errorf("malformed tag %q", part)
 		}
-		if _, duplicate := tags[key]; duplicate {
+
+		_, duplicate := tags[key]
+		if duplicate {
 			return nil, fmt.Errorf("duplicate %s tag", key)
 		}
+
 		tags[key] = value
 	}
+
 	if !strings.EqualFold(tags["v"], "DMARC1") {
 		return nil, errors.New("first tag must be exactly v=DMARC1")
 	}
+
 	return tags, nil
 }
 
@@ -424,33 +491,40 @@ func asciiLetters(value string) bool {
 			return false
 		}
 	}
+
 	return value != ""
 }
 
 func checkEnvelopeMX(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 	domains := envelopeDomains(cfg)
 	var rs []Result
+
 	for _, d := range domains {
 		name := "envelope_mx_" + d
 		mxs, err := r.LookupMX(ctx, d)
 		if err == nil && len(mxs) > 0 {
 			null := 0
+
 			for _, mx := range mxs {
 				if mx != nil && strings.TrimSpace(mx.Host) == "." {
 					null++
 				}
 			}
+
 			if null > 0 {
 				message := fmt.Sprintf("%s publishes a null MX and does not accept bounces", d)
 				if len(mxs) > 1 || null > 1 {
 					message = fmt.Sprintf("%s publishes an invalid null MX mixed with other MX records", d)
 				}
+
 				rs = append(rs, Result{Name: name, Level: Fail, Message: message})
 				continue
 			}
+
 			rs = append(rs, Result{Name: name, Level: Pass, Message: fmt.Sprintf("%s has MX", d)})
 			continue
 		}
+
 		// Implicit MX: A/AAAA on the domain apex (RFC 5321).
 		addrs, aerr := r.LookupIPAddr(ctx, d)
 		if aerr == nil && len(addrs) > 0 {
@@ -458,12 +532,15 @@ func checkEnvelopeMX(ctx context.Context, r Resolver, cfg *config.Config) []Resu
 				Message: fmt.Sprintf("%s has no MX; using A/AAAA implicit MX (ensure a mailbox accepts bounces)", d)})
 			continue
 		}
+
 		msg := fmt.Sprintf("%s has no MX and no A/AAAA (bounces cannot be delivered)", d)
 		if err != nil {
 			msg = fmt.Sprintf("%s MX lookup failed (%v) and no A/AAAA", d, err)
 		}
+
 		rs = append(rs, Result{Name: name, Level: Fail, Message: msg})
 	}
+
 	return rs
 }
 
@@ -471,6 +548,7 @@ func envelopeDomains(cfg *config.Config) []string {
 	set := map[string]struct{}{
 		strings.ToLower(strings.TrimSuffix(cfg.Server.Domain, ".")): {},
 	}
+
 	for i := range cfg.Users {
 		for _, sender := range cfg.Users[i].AllowedSenders {
 			sender = strings.TrimSpace(sender)
@@ -478,27 +556,33 @@ func envelopeDomains(cfg *config.Config) []string {
 				set[strings.ToLower(strings.TrimSuffix(sender[2:], "."))] = struct{}{}
 				continue
 			}
+
 			at := strings.LastIndexByte(sender, '@')
 			if at > 0 {
 				set[strings.ToLower(strings.TrimSuffix(sender[at+1:], "."))] = struct{}{}
 			}
 		}
 	}
+
 	out := make([]string, 0, len(set))
+
 	for d := range set {
 		if d != "" {
 			out = append(out, d)
 		}
 	}
+
 	sort.Strings(out)
 	return out
 }
 
 func keys(m map[string]bool) []string {
 	out := make([]string, 0, len(m))
+
 	for k := range m {
 		out = append(out, k)
 	}
+
 	sort.Strings(out)
 	return out
 }
@@ -515,17 +599,21 @@ func dkimP(record string) (string, bool) {
 
 func parseTags(record string) map[string]string {
 	out := make(map[string]string)
+
 	for _, part := range strings.Split(record, ";") {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
+
 		k, v, ok := strings.Cut(part, "=")
 		if !ok {
 			continue
 		}
+
 		out[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
 	}
+
 	return out
 }
 
@@ -538,6 +626,7 @@ func normalizeB64(s string) string {
 			return s
 		}
 	}
+
 	return base64.StdEncoding.EncodeToString(raw)
 }
 

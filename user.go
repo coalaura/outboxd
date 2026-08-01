@@ -49,17 +49,20 @@ func user(configPath string, arguments []string) error {
 	if err != nil {
 		return err
 	}
+
 	if created {
 		fmt.Fprintf(os.Stderr, "created default config at %q\n", cfg.Path())
 	}
 
-	if err := cfg.AddUser(entry); err != nil {
+	err = cfg.AddUser(entry)
+	if err != nil {
 		return err
 	}
 
 	var out strings.Builder
 	out.Grow(256)
 	fmt.Fprintf(&out, "Added user %q to %q\n", escapeControl(entry.Username), cfg.Path())
+
 	if generated {
 		fmt.Fprintf(&out, "\nGenerated password (store it now; shown once):\n\n  %s\n", password)
 	}
@@ -87,6 +90,7 @@ func password() (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
+
 	return supplied, false, nil
 }
 
@@ -101,6 +105,7 @@ func readPassword(r io.Reader, maxBytes int) (string, error) {
 	if maxBytes <= 0 {
 		return "", errors.New("invalid password length limit")
 	}
+
 	// maxBytes password + optional CRLF + one overflow detector byte.
 	body, err := io.ReadAll(io.LimitReader(r, int64(maxBytes)+3))
 	if err != nil {
@@ -108,6 +113,7 @@ func readPassword(r io.Reader, maxBytes int) (string, error) {
 	}
 
 	pass := body
+
 	switch {
 	case len(pass) >= 2 && pass[len(pass)-2] == '\r' && pass[len(pass)-1] == '\n':
 		pass = pass[:len(pass)-2]
@@ -118,17 +124,21 @@ func readPassword(r io.Reader, maxBytes int) (string, error) {
 	if len(pass) == 0 {
 		return "", errors.New("empty password on stdin")
 	}
+
 	if len(pass) > maxBytes {
 		return "", fmt.Errorf("password exceeds maximum length of %d bytes", maxBytes)
 	}
+
 	// Additional lines after the optional ending, or an embedded newline mid-password.
 	if containsByte(pass, '\n') {
 		return "", errors.New("password must be a single line")
 	}
+
 	// NUL is rejected; treat passwords as opaque UTF-8/binary otherwise.
 	if containsByte(pass, 0) {
 		return "", errors.New("password contains NUL")
 	}
+
 	return string(pass), nil
 }
 
@@ -138,5 +148,6 @@ func containsByte(b []byte, c byte) bool {
 			return true
 		}
 	}
+
 	return false
 }

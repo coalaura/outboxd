@@ -44,10 +44,13 @@ func loadReadyEnvelope(t *testing.T, root, id string) *queue.Envelope {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	env := new(queue.Envelope)
-	if err := json.Unmarshal(raw, env); err != nil {
+	err = json.Unmarshal(raw, env)
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	return env
 }
 
@@ -58,6 +61,7 @@ func TestCompleteIgnoresDeferredTrashCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	t.Cleanup(func() { _ = q.Close() })
 	now := time.Now()
 	env := &queue.Envelope{
@@ -72,22 +76,28 @@ func TestCompleteIgnoresDeferredTrashCleanup(t *testing.T) {
 		Created:     now,
 		NextAttempt: now,
 	}
-	if err := q.Add(env, []byte("body")); err != nil {
+	err = q.Add(env, []byte("body"))
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	got, err := q.Next(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	got.Recipients[0].Status = queue.StatusSent
 	disk.SetHooks(disk.Hooks{BeforeRemoveAll: func(string) error {
 		return os.ErrPermission
 	}})
 	d := New(&config.Config{Server: config.Server{Hostname: "mail.test"}}, q, nopLog{})
-	if err := d.complete(got); err != nil {
+	err = d.complete(got)
+	if err != nil {
 		t.Fatalf("complete returned cleanup warning: %v", err)
 	}
-	if messages, bytes := q.Stats(); messages != 0 || bytes != 0 {
+
+	messages, bytes := q.Stats()
+	if messages != 0 || bytes != 0 {
 		t.Fatalf("Stats=(%d, %d) want (0, 0)", messages, bytes)
 	}
 }
@@ -98,6 +108,7 @@ func TestEnsureDSNFlagsASCII(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	t.Cleanup(func() { _ = q.Close() })
 	d := New(&config.Config{Server: config.Server{Hostname: "mail.test", Domain: "test"}}, q, nopLog{})
 
@@ -111,19 +122,25 @@ func TestEnsureDSNFlagsASCII(t *testing.T) {
 		Created: now, NextAttempt: now,
 	}
 	body := []byte("From: alice@ex.com\r\nTo: bob@ex.com\r\nSubject: t\r\n\r\nHi\r\n")
-	if err := q.Add(orig, body); err != nil {
+	err = q.Add(orig, body)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.ensureDSN(orig); err != nil {
+
+	err = d.ensureDSN(orig)
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	if orig.DSNID == "" {
 		t.Fatal("DSNID")
 	}
+
 	env := loadReadyEnvelope(t, q.Path(), queue.DSNID(orig.ID, orig.Incarnation, orig.DSNGeneration))
 	if env.SMTPUTF8 {
 		t.Fatal("ASCII sender DSN SMTPUTF8 must be false")
 	}
+
 	if env.EightBit {
 		t.Fatal("ASCII DSN body EightBit must be false")
 	}
@@ -135,6 +152,7 @@ func TestEnsureDSNFlagsUTF8Recipient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	t.Cleanup(func() { _ = q.Close() })
 	d := New(&config.Config{Server: config.Server{Hostname: "mail.test"}}, q, nopLog{})
 	now := time.Now()
@@ -147,12 +165,16 @@ func TestEnsureDSNFlagsUTF8Recipient(t *testing.T) {
 		Created: now, NextAttempt: now,
 		SMTPUTF8: true,
 	}
-	if err := q.Add(orig, []byte("From: x\r\nTo: y\r\nSubject: t\r\n\r\nHi\r\n")); err != nil {
+	err = q.Add(orig, []byte("From: x\r\nTo: y\r\nSubject: t\r\n\r\nHi\r\n"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.ensureDSN(orig); err != nil {
+
+	err = d.ensureDSN(orig)
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	env := loadReadyEnvelope(t, q.Path(), queue.DSNID(orig.ID, orig.Incarnation, orig.DSNGeneration))
 	if !env.SMTPUTF8 {
 		t.Fatal("UTF-8 DSN recipient must set SMTPUTF8")
@@ -165,6 +187,7 @@ func TestEnsureDSNEightBitFromHighOctets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	t.Cleanup(func() { _ = q.Close() })
 	d := New(&config.Config{Server: config.Server{Hostname: "mail.test"}}, q, nopLog{})
 	now := time.Now()
@@ -176,12 +199,16 @@ func TestEnsureDSNEightBitFromHighOctets(t *testing.T) {
 		}},
 		Created: now, NextAttempt: now,
 	}
-	if err := q.Add(orig, []byte("From: a\r\nTo: b\r\nSubject: t\r\n\r\nHi\r\n")); err != nil {
+	err = q.Add(orig, []byte("From: a\r\nTo: b\r\nSubject: t\r\n\r\nHi\r\n"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.ensureDSN(orig); err != nil {
+
+	err = d.ensureDSN(orig)
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	env := loadReadyEnvelope(t, q.Path(), queue.DSNID(orig.ID, orig.Incarnation, orig.DSNGeneration))
 	if !env.EightBit {
 		t.Fatal("high-bit DSN content must set EightBit")
@@ -196,12 +223,15 @@ func TestReadDSNOriginalBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if r.read > dsnOriginalLimit+1 {
 		t.Fatalf("read=%d exceeds bound=%d", r.read, dsnOriginalLimit+1)
 	}
+
 	if !r.closed {
 		t.Fatal("original reader was not closed")
 	}
+
 	if string(original) != header {
 		t.Fatalf("retained original=%q", original)
 	}
@@ -213,9 +243,11 @@ func TestReadDSNOriginalCapsMissingHeaderTerminator(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if len(original) != dsnOriginalLimit || r.read != dsnOriginalLimit+1 {
 		t.Fatalf("retained=%d read=%d", len(original), r.read)
 	}
+
 	if !r.closed {
 		t.Fatal("original reader was not closed")
 	}
@@ -234,7 +266,9 @@ func TestBuildDSNUsesEnhancedStatusAndFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	for _, status := range []string{"Status: 5.1.1\r\n", "Status: 5.0.0\r\n"} {
+
 		if !bytes.Contains(msg, []byte(status)) {
 			t.Fatalf("missing %q in DSN", status)
 		}
@@ -255,6 +289,7 @@ func TestCompletedDSNDoesNotRegenerateBeforeSourceTransition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	d := New(&config.Config{Server: config.Server{Hostname: "mail.test"}}, q, nopLog{})
 	now := time.Now()
 	source := &queue.Envelope{
@@ -265,26 +300,37 @@ func TestCompletedDSNDoesNotRegenerateBeforeSourceTransition(t *testing.T) {
 		}},
 		Created: now, NextAttempt: now,
 	}
-	if err := q.Add(source, []byte("From: a\r\nTo: b\r\n\r\nbody\r\n")); err != nil {
+	err = q.Add(source, []byte("From: a\r\nTo: b\r\n\r\nbody\r\n"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := q.Next(context.Background()); err != nil {
+
+	_, err = q.Next(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.ensureDSN(source); err != nil {
+
+	err = d.ensureDSN(source)
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	dsn, err := q.Next(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if dsn.ID != source.DSNID {
 		t.Fatalf("scheduled DSN %s, source links %s", dsn.ID, source.DSNID)
 	}
-	if err := q.Finish(dsn); err != nil {
+
+	err = q.Finish(dsn)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := q.Close(); err != nil {
+
+	err = q.Close()
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -292,18 +338,23 @@ func TestCompletedDSNDoesNotRegenerateBeforeSourceTransition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	t.Cleanup(func() { _ = q.Close() })
 	d = New(&config.Config{Server: config.Server{Hostname: "mail.test"}}, q, nopLog{})
 	recovered, err := q.Next(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if recovered.ID != source.ID || recovered.DSNID == "" {
 		t.Fatalf("recovered source lost DSN link: %#v", recovered)
 	}
-	if err := d.ensureDSN(recovered); err != nil {
+
+	err = d.ensureDSN(recovered)
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	if q.Len() != 0 {
 		t.Fatalf("completed DSN was regenerated; Len=%d", q.Len())
 	}

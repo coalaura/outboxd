@@ -22,9 +22,11 @@ func AllocationSize(size int64) int64 {
 	if size <= 0 {
 		return allocationUnit
 	}
+
 	if size > math.MaxInt64-(allocationUnit-1) {
 		return math.MaxInt64
 	}
+
 	return ((size + allocationUnit - 1) / allocationUnit) * allocationUnit
 }
 
@@ -36,14 +38,17 @@ func AllocatedBytes(root string) (int64, error) {
 		if walkErr != nil {
 			return walkErr
 		}
+
 		info, err := entry.Info()
 		if err != nil {
 			return err
 		}
+
 		charge := AllocationSize(info.Size())
 		if total > math.MaxInt64-charge {
 			return errors.New("filesystem usage overflow")
 		}
+
 		total += charge
 		return nil
 	})
@@ -55,18 +60,25 @@ func AllocatedBytes(root string) (int64, error) {
 type Hooks struct {
 	// BeforeRemoveAll is called immediately before recursively removing a path.
 	BeforeRemoveAll func(path string) error
+
 	// BeforeSyncFile is called immediately before syncing an open file.
 	BeforeSyncFile func(path string) error
+
 	// AfterSyncFile is called after a successful file sync.
 	AfterSyncFile func(path string) error
+
 	// AfterClose is called after a successful file.Close before rename.
 	AfterClose func(path string) error
+
 	// AfterRename is called after a successful rename.
 	AfterRename func(oldpath, newpath string) error
+
 	// AfterSyncDir is called after a successful directory Sync.
 	AfterSyncDir func(path string) error
+
 	// BeforeSyncDir is called immediately before syncing a directory.
 	BeforeSyncDir func(path string) error
+
 	// BeforeRename is called just before rename.
 	BeforeRename func(oldpath, newpath string) error
 }
@@ -91,17 +103,24 @@ func currentHooks() Hooks {
 
 // SyncFile flushes an open file and runs the file-sync fault hook.
 func SyncFile(file *os.File) error {
-	if h := currentHooks(); h.BeforeSyncFile != nil {
-		if err := h.BeforeSyncFile(file.Name()); err != nil {
+	h := currentHooks()
+	if h.BeforeSyncFile != nil {
+		err := h.BeforeSyncFile(file.Name())
+		if err != nil {
 			return err
 		}
 	}
-	if err := file.Sync(); err != nil {
+
+	err := file.Sync()
+	if err != nil {
 		return err
 	}
-	if h := currentHooks(); h.AfterSyncFile != nil {
+
+	h = currentHooks()
+	if h.AfterSyncFile != nil {
 		return h.AfterSyncFile(file.Name())
 	}
+
 	return nil
 }
 
@@ -116,23 +135,30 @@ func MkdirDurable(path string) error {
 	if err != nil {
 		return err
 	}
+
 	missing := make([]string, 0, 4)
+
 	for current := abs; ; current = filepath.Dir(current) {
 		info, statErr := os.Stat(current)
 		if statErr == nil {
 			if !info.IsDir() {
 				return &os.PathError{Op: "mkdir", Path: current, Err: os.ErrExist}
 			}
+
 			break
 		}
+
 		if !os.IsNotExist(statErr) {
 			return statErr
 		}
+
 		missing = append(missing, current)
-		if parent := filepath.Dir(current); parent == current {
+		parent := filepath.Dir(current)
+		if parent == current {
 			return statErr
 		}
 	}
+
 	if len(missing) == 0 {
 		// Repair a prior attempt that created a component but could not confirm
 		// its parent sync. Walk all ancestors because the failed component is
@@ -142,43 +168,56 @@ func MkdirDurable(path string) error {
 			if parent == current {
 				break
 			}
-			if err := Sync(parent); err != nil {
+
+			err = Sync(parent)
+			if err != nil {
 				return err
 			}
 		}
+
 		return nil
 	}
+
 	for i := len(missing) - 1; i >= 0; i-- {
 		created, err := mkdirDurableComponent(missing[i])
 		if err != nil {
 			if !os.IsExist(err) {
 				return err
 			}
+
 			info, statErr := os.Stat(missing[i])
 			if statErr != nil {
 				return statErr
 			}
+
 			if !info.IsDir() {
 				return &os.PathError{Op: "mkdir", Path: missing[i], Err: os.ErrExist}
 			}
 		}
-		if err := Sync(filepath.Dir(missing[i])); err != nil {
+
+		err = Sync(filepath.Dir(missing[i]))
+		if err != nil {
 			if created {
 				_ = os.Remove(missing[i])
 			}
+
 			return err
 		}
 	}
+
 	return nil
 }
 
 // RemoveAll recursively removes path through the test fault seam.
 func RemoveAll(path string) error {
-	if h := currentHooks(); h.BeforeRemoveAll != nil {
-		if err := h.BeforeRemoveAll(path); err != nil {
+	h := currentHooks()
+	if h.BeforeRemoveAll != nil {
+		err := h.BeforeRemoveAll(path)
+		if err != nil {
 			return err
 		}
 	}
+
 	return os.RemoveAll(path)
 }
 
@@ -204,6 +243,7 @@ func Commit(file *os.File, path string, mode os.FileMode) error {
 		os.Remove(temp)
 		return err
 	}
+
 	return nil
 }
 
@@ -254,8 +294,11 @@ func WriteExclusive(path string, body []byte, mode os.FileMode) error {
 		file.Close()
 		return err
 	}
-	if h := currentHooks(); h.AfterSyncFile != nil {
-		if err := h.AfterSyncFile(path); err != nil {
+
+	h := currentHooks()
+	if h.AfterSyncFile != nil {
+		err = h.AfterSyncFile(path)
+		if err != nil {
 			file.Close()
 			return err
 		}
@@ -265,8 +308,11 @@ func WriteExclusive(path string, body []byte, mode os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	if h := currentHooks(); h.AfterClose != nil {
-		if err := h.AfterClose(path); err != nil {
+
+	h = currentHooks()
+	if h.AfterClose != nil {
+		err = h.AfterClose(path)
+		if err != nil {
 			return err
 		}
 	}
@@ -277,29 +323,41 @@ func WriteExclusive(path string, body []byte, mode os.FileMode) error {
 
 // Rename replaces newpath with oldpath and syncs the parent directory.
 func Rename(oldpath, newpath string) error {
-	if h := currentHooks(); h.BeforeRename != nil {
-		if err := h.BeforeRename(oldpath, newpath); err != nil {
+	h := currentHooks()
+	if h.BeforeRename != nil {
+		err := h.BeforeRename(oldpath, newpath)
+		if err != nil {
 			return err
 		}
 	}
-	if err := rename(oldpath, newpath); err != nil {
+
+	err := rename(oldpath, newpath)
+	if err != nil {
 		return err
 	}
-	if h := currentHooks(); h.AfterRename != nil {
-		if err := h.AfterRename(oldpath, newpath); err != nil {
+
+	h = currentHooks()
+	if h.AfterRename != nil {
+		err := h.AfterRename(oldpath, newpath)
+		if err != nil {
 			return err
 		}
 	}
-	if err := Sync(filepath.Dir(newpath)); err != nil {
+
+	err = Sync(filepath.Dir(newpath))
+	if err != nil {
 		return err
 	}
+
 	// A cross-directory rename is durable only after both the destination entry
 	// and the source removal have been persisted.
 	if filepath.Dir(oldpath) != filepath.Dir(newpath) {
-		if err := Sync(filepath.Dir(oldpath)); err != nil {
+		err := Sync(filepath.Dir(oldpath))
+		if err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
@@ -313,8 +371,11 @@ func commit(file *os.File, temp, path string, mode os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	if h := currentHooks(); h.AfterSyncFile != nil {
-		if err := h.AfterSyncFile(temp); err != nil {
+
+	h := currentHooks()
+	if h.AfterSyncFile != nil {
+		err = h.AfterSyncFile(temp)
+		if err != nil {
 			return err
 		}
 	}
@@ -323,14 +384,19 @@ func commit(file *os.File, temp, path string, mode os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	if h := currentHooks(); h.AfterClose != nil {
-		if err := h.AfterClose(temp); err != nil {
+
+	h = currentHooks()
+	if h.AfterClose != nil {
+		err = h.AfterClose(temp)
+		if err != nil {
 			return err
 		}
 	}
 
-	if h := currentHooks(); h.BeforeRename != nil {
-		if err := h.BeforeRename(temp, path); err != nil {
+	h = currentHooks()
+	if h.BeforeRename != nil {
+		err = h.BeforeRename(temp, path)
+		if err != nil {
 			return err
 		}
 	}
@@ -339,8 +405,11 @@ func commit(file *os.File, temp, path string, mode os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	if h := currentHooks(); h.AfterRename != nil {
-		if err := h.AfterRename(temp, path); err != nil {
+
+	h = currentHooks()
+	if h.AfterRename != nil {
+		err = h.AfterRename(temp, path)
+		if err != nil {
 			return err
 		}
 	}

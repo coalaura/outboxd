@@ -20,8 +20,11 @@ func TestPrepareStripsBccResentBccReturnPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	s := string(msg.Data)
+
 	for _, bad := range []string{"Bcc:", "Resent-Bcc:", "Return-Path:"} {
+
 		if strings.Contains(s, bad) {
 			t.Fatalf("outgoing still contains %s", bad)
 		}
@@ -34,6 +37,7 @@ func TestFromPreservesLocalPartCase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if msg.From != "User.Name@example.com" {
 		t.Fatalf("From=%q", msg.From)
 	}
@@ -45,9 +49,11 @@ func TestEightBitAndUTF8Flags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if !msg.EightBit {
 		t.Fatal("expected EightBit")
 	}
+
 	if !msg.NeedsUTF8 {
 		t.Fatal("expected NeedsUTF8 for raw UTF-8 subject")
 	}
@@ -59,12 +65,14 @@ func TestEightBitCharsetInferenceRequiresValidUTF8(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if !bytes.Contains(msg.Data, []byte("charset=utf-8")) {
 		t.Fatal("valid UTF-8 body did not infer UTF-8 charset")
 	}
 
 	invalid := []byte("From: a@b.co\r\n\r\nbad\xff\r\n")
-	if _, err := Prepare(bytes.NewReader(invalid), Options{Hostname: "h"}); err == nil {
+	_, err = Prepare(bytes.NewReader(invalid), Options{Hostname: "h"})
+	if err == nil {
 		t.Fatal("invalid UTF-8 8-bit body accepted with inferred semantics")
 	}
 }
@@ -83,6 +91,7 @@ func TestEncodedWordDoesNotRequireSMTPUTF8(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if msg.NeedsUTF8 {
 		t.Fatal("ASCII encoded-words must not require SMTPUTF8")
 	}
@@ -102,13 +111,16 @@ func TestReplacesBadDateAndMessageID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	s := string(msg.Data)
 	if strings.Contains(s, "Date: not-a-date") {
 		t.Fatal("bad Date retained")
 	}
+
 	if strings.Contains(s, "Message-ID: bad") {
 		t.Fatal("bad Message-ID retained")
 	}
+
 	if !strings.Contains(s, "Message-ID: <") {
 		t.Fatal("missing replacement Message-ID")
 	}
@@ -128,9 +140,11 @@ func TestKeepsValidMessageID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if msg.ID != "<abc@example.com>" {
 		t.Fatalf("ID=%q", msg.ID)
 	}
+
 	// Should appear only once.
 	if strings.Count(string(msg.Data), "Message-ID:") != 1 {
 		t.Fatal("duplicate Message-ID")

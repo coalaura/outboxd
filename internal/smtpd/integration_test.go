@@ -24,15 +24,23 @@ import (
 	"github.com/emersion/go-smtp"
 )
 
+type submissionMessageSizeCase struct {
+	name string
+	size int64
+	code int
+}
+
 // testServerWithUser builds a submission stack with one Argon2id user and DKIM.
 func testServerWithUser(t *testing.T, password string) (*Server, *config.Config, *queue.Queue, *sign.Signer, *x509.CertPool) {
 	t.Helper()
 	base := t.TempDir()
 	cfgPath := filepath.Join(base, "config.yml")
 	dataDir := filepath.Join(base, "data")
-	if err := os.MkdirAll(dataDir, 0700); err != nil {
+	err := os.MkdirAll(dataDir, 0700)
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	body := strings.Join([]string{
 		"server:",
 		"  hostname: mail.test.example",
@@ -81,63 +89,79 @@ func testServerWithUser(t *testing.T, password string) (*Server, *config.Config,
 		"  output_file: dns-records.txt",
 		"",
 	}, "\n")
-	if err := os.WriteFile(cfgPath, []byte(body), 0600); err != nil {
+	err = os.WriteFile(cfgPath, []byte(body), 0600)
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	cfg, err := config.LoadFile(cfgPath)
 	if err != nil {
 		t.Fatalf("LoadFile: %v", err)
 	}
+
 	hash, err := passwd.Hash(password)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cfg.AddUser(config.User{
+
+	err = cfg.AddUser(config.User{
 		Username:       "alice",
 		PasswordHash:   hash,
 		Enabled:        true,
 		AllowedSenders: []string{"Alice.Sender@test.example", "alice@test.example"},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	k, _, err := certs.Ensure(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	signer, _, err := sign.Ensure(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	spool, err := queue.OpenDefault(filepath.Join(dataDir, "queue"))
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	t.Cleanup(func() { _ = spool.Close() })
 	srv := New(cfg, k, signer, spool, testLog{})
-	if err := srv.Listen(); err != nil {
+	err = srv.Listen()
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	// Trust self-signed submission cert.
 	pool := x509.NewCertPool()
 	raw, err := os.ReadFile(cfg.ResolvePath(cfg.TLS.CertificateFile))
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	for {
 		var block *pem.Block
 		block, raw = pem.Decode(raw)
 		if block == nil {
 			break
 		}
+
 		if block.Type != "CERTIFICATE" {
 			continue
 		}
+
 		c, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
 			t.Fatal(err)
 		}
+
 		pool.AddCert(c)
 	}
+
 	return srv, cfg, spool, signer, pool
 }
 
@@ -153,6 +177,7 @@ func dialSTARTTLS(t *testing.T, addr string, roots *x509.CertPool) *smtpClient {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	cl := &smtpClient{conn: c, br: bufio.NewReader(c)}
 	cl.readCode(t, 220)
 	cl.cmd(t, "EHLO client.test", 250)
@@ -163,9 +188,11 @@ func dialSTARTTLS(t *testing.T, addr string, roots *x509.CertPool) *smtpClient {
 		RootCAs:    roots,
 		MinVersion: tls.VersionTLS12,
 	})
-	if err := tlsConn.Handshake(); err != nil {
+	err = tlsConn.Handshake()
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	cl.conn = tlsConn
 	cl.br = bufio.NewReader(tlsConn)
 	cl.cmd(t, "EHLO client.test", 250)
@@ -180,23 +207,29 @@ func (c *smtpClient) writeLine(s string) {
 func (c *smtpClient) readCode(t *testing.T, want int) string {
 	t.Helper()
 	var last string
+
 	for {
 		line, err := c.br.ReadString('\n')
 		if err != nil {
 			t.Fatal(err)
 		}
+
 		last = strings.TrimRight(line, "\r\n")
 		if len(last) < 4 {
 			t.Fatalf("short reply %q", last)
 		}
+
 		code := 0
 		fmt.Sscanf(last[:3], "%d", &code)
+
 		if last[3] == ' ' {
 			if code != want {
 				t.Fatalf("want %d got %q", want, last)
 			}
+
 			return last
 		}
+
 		if last[3] != '-' {
 			t.Fatalf("bad reply %q", last)
 		}
@@ -220,7 +253,8 @@ func (c *smtpClient) close() { _ = c.conn.Close() }
 func (c *smtpClient) expectClosed(t *testing.T) {
 	t.Helper()
 	_ = c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if _, err := c.br.ReadByte(); err == nil {
+	_, err := c.br.ReadByte()
+	if err == nil {
 		t.Fatal("connection remained open after DATA admission denial")
 	}
 }
@@ -234,6 +268,7 @@ func runTestSubmission(t *testing.T, srv *Server) {
 	awaitCh(t, entered, 3*time.Second, "serve")
 	t.Cleanup(func() {
 		cancel()
+
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
@@ -248,6 +283,7 @@ func beginMessage(t *testing.T, cl *smtpClient, bodyOpt string) {
 	if bodyOpt != "" {
 		mail += " BODY=" + bodyOpt
 	}
+
 	cl.cmd(t, mail, 250)
 	cl.cmd(t, "RCPT TO:<dest@example.com>", 250)
 	cl.cmd(t, "DATA", 354)
@@ -263,11 +299,13 @@ func messageOfSize(size int64) string {
 	var body strings.Builder
 	body.Grow(int(size))
 	body.WriteString(headers)
+
 	for remaining > 998 {
 		body.WriteString(strings.Repeat("x", 998))
 		body.WriteString("\r\n")
 		remaining -= 1000
 	}
+
 	body.WriteString(strings.Repeat("x", remaining))
 	body.WriteString("\r\n")
 	return body.String()
@@ -278,14 +316,11 @@ func TestSubmissionMessageSizeBoundary(t *testing.T) {
 	srv, cfg, _, _, pool := testServerWithUser(t, password)
 	runTestSubmission(t, srv)
 
-	for _, tt := range []struct {
-		name string
-		size int64
-		code int
-	}{
+	for _, tt := range []submissionMessageSizeCase{
 		{"exact maximum", cfg.Server.MaxMessageBytes, 250},
 		{"one over maximum", cfg.Server.MaxMessageBytes + 1, 552},
 	} {
+
 		t.Run(tt.name, func(t *testing.T) {
 			cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
 			defer cl.close()
@@ -307,6 +342,7 @@ func TestSubmissionUnnecessarySMTPUTF8OptIn(t *testing.T) {
 	awaitCh(t, entered, 3*time.Second, "serve")
 	t.Cleanup(func() {
 		cancel()
+
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
@@ -316,6 +352,7 @@ func TestSubmissionUnnecessarySMTPUTF8OptIn(t *testing.T) {
 	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
 	defer cl.close()
 	cl.authPlain(t, "alice", password)
+
 	// Opt in to SMTPUTF8 with fully ASCII envelope and body.
 	cl.cmd(t, "MAIL FROM:<Alice.Sender@test.example> SMTPUTF8", 250)
 	cl.cmd(t, "RCPT TO:<Bob.Recipient@example.com>", 250)
@@ -330,15 +367,19 @@ func TestSubmissionUnnecessarySMTPUTF8OptIn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if env.SMTPUTF8 {
 		t.Fatal("unnecessary SMTPUTF8 opt-in must store SMTPUTF8=false")
 	}
+
 	if env.Sender != "Alice.Sender@test.example" {
 		t.Fatalf("sender casing: %q", env.Sender)
 	}
+
 	if env.Recipients[0].Address != "Bob.Recipient@example.com" {
 		t.Fatalf("rcpt casing: %q", env.Recipients[0].Address)
 	}
+
 	// Requeue so we do not leave the item active for delivery.
 	spool.Requeue(env)
 }
@@ -355,9 +396,11 @@ func TestDataProcessingSemaphoreNonblockingAndReleased(t *testing.T) {
 	beginMessage(t, first, "")
 	_, _ = io.WriteString(first.conn, "From: Alice.Sender@test.example\r\nTo: dest@example.com\r\n\r\nblocked")
 	deadline := time.Now().Add(3 * time.Second)
+
 	for len(srv.dataWork) != 1 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
+
 	if len(srv.dataWork) != 1 {
 		t.Fatal("first DATA did not acquire processing slot")
 	}
@@ -370,9 +413,11 @@ func TestDataProcessingSemaphoreNonblockingAndReleased(t *testing.T) {
 
 	_, _ = io.WriteString(first.conn, "\r\n.\r\n")
 	first.readCode(t, 250)
+
 	if len(srv.dataWork) != 0 {
 		t.Fatal("processing slot not released after success")
 	}
+
 	third := dialSTARTTLS(t, srv.starttls.Addr, pool)
 	defer third.close()
 	third.authPlain(t, "alice", password)
@@ -395,9 +440,11 @@ func TestIncompleteBDATAbsoluteDeadlineReleasesWorker(t *testing.T) {
 	cl.cmd(t, "BDAT 0", 250)
 
 	deadline := time.Now().Add(time.Second)
+
 	for len(srv.dataWork) != 1 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
+
 	if len(srv.dataWork) != 1 {
 		t.Fatal("BDAT did not acquire DATA worker")
 	}
@@ -407,14 +454,17 @@ func TestIncompleteBDATAbsoluteDeadlineReleasesWorker(t *testing.T) {
 		time.Sleep(40 * time.Millisecond)
 		cl.cmd(t, "NOOP", 250)
 	}
+
 	time.Sleep(60 * time.Millisecond)
 	cl.expectClosed(t)
 	cl.close()
 
 	deadline = time.Now().Add(time.Second)
+
 	for len(srv.dataWork) != 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
+
 	if len(srv.dataWork) != 0 {
 		t.Fatal("DATA worker remained held after BDAT deadline")
 	}
@@ -442,6 +492,7 @@ func TestMalformedDataConsumesSubmissionBudget(t *testing.T) {
 		_, _ = io.WriteString(cl.conn, "not-a-header\r\n\r\nbody\r\n.\r\n")
 		cl.readCode(t, 550)
 	}
+
 	beginMessage(t, cl, "")
 	cl.expectClosed(t)
 }
@@ -467,6 +518,7 @@ func TestSigningAndQueueFailuresConsumeSubmissionBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	t.Cleanup(func() { _ = full.Close() })
 	originalQueue := srv.queue
 	srv.queue = full
@@ -499,6 +551,7 @@ func TestBody7BitAndReset(t *testing.T) {
 
 	s := &session{body: smtp.Body7Bit, sender: "a@example.com", smtpUTF8: true}
 	s.Reset()
+
 	if s.body != "" || s.sender != "" || s.smtpUTF8 {
 		t.Fatalf("Reset retained transaction state: body=%q sender=%q utf8=%v", s.body, s.sender, s.smtpUTF8)
 	}

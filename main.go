@@ -43,12 +43,14 @@ func main() {
 			log.MustFail(errors.New("usage: outboxd dns"))
 			return
 		}
+
 		log.MustFail(dns(configPath))
 	case "check":
 		if len(args) != 1 {
 			log.MustFail(errors.New("usage: outboxd check"))
 			return
 		}
+
 		log.MustFail(runCheck(configPath))
 	case "dead":
 		log.MustFail(dead(configPath, args[1:]))
@@ -59,6 +61,7 @@ func main() {
 			log.MustFail(errors.New("usage: outboxd serve"))
 			return
 		}
+
 		log.MustFail(serve(configPath))
 	default:
 		log.MustFail(fmt.Errorf("unknown command %q, expected user, dns, check, dead, corrupt, or serve (default)", args[0]))
@@ -70,11 +73,14 @@ func parseGlobalFlags(args []string) (configPath string, rest []string) {
 	fs := flag.NewFlagSet("outboxd", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	fs.StringVar(&configPath, "config", "", "path to config.yml (or set OUTBOXD_CONFIG)")
+
 	// Stop at first non-flag so subcommands keep their own args.
-	if err := fs.Parse(args); err != nil {
+	err := fs.Parse(args)
+	if err != nil {
 		// flag package already printed; exit like a normal CLI.
 		os.Exit(2)
 	}
+
 	return configPath, fs.Args()
 }
 
@@ -110,7 +116,8 @@ func serve(configPath string) error {
 		return err
 	}
 
-	if err := verifyBindAddresses(cfg); err != nil {
+	err = verifyBindAddresses(cfg)
+	if err != nil {
 		return err
 	}
 
@@ -127,15 +134,18 @@ func serve(configPath string) error {
 	if err != nil {
 		return err
 	}
+
 	defer spool.Close()
 	spool.FreeDisk = disk.FreeBytes
 
 	for _, cerr := range spool.Corrupt {
 		log.Warnln("corrupt queue entry:", escapeControl(cerr.Error()))
 	}
+
 	for _, warning := range spool.Warnings {
 		log.Warnln("queue maintenance warning:", escapeControl(warning.Error()))
 	}
+
 	logSpoolStats(spool)
 
 	log.Println("Ensuring DKIM keys...")
@@ -159,6 +169,7 @@ func serve(configPath string) error {
 	if generated {
 		log.Println("Generated self-signed TLS certificate")
 	}
+
 	keeper.SetReloadErrorHandler(func(err error) {
 		log.Warnln("TLS certificate reload failed:", escapeControl(err.Error()))
 	})
@@ -197,6 +208,7 @@ func serve(configPath string) error {
 	wg.Go(func() {
 		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -208,6 +220,7 @@ func serve(configPath string) error {
 				} else if dead+corrupt > 0 {
 					log.Printf("Pruned %d dead and %d corrupt queue entries\n", dead, corrupt)
 				}
+
 				logSpoolStats(spool)
 			}
 		}
@@ -225,10 +238,12 @@ func serve(configPath string) error {
 func logSpoolStats(spool *queue.Queue) {
 	stats := spool.SpoolStats()
 	message := fmt.Sprintf("Spool physical usage: %d bytes used, %d reserved, %d hard limit", stats.Used, stats.Reserved, stats.Limit)
+
 	if stats.HighWater {
 		log.Warnln("HIGH WATER:", message)
 		return
 	}
+
 	log.Println(message)
 }
 
@@ -240,15 +255,19 @@ func verifyBindAddresses(cfg *config.Config) error {
 		if ip == nil || ip.To4() == nil {
 			return fmt.Errorf("invalid delivery.bind_ipv4 %q", cfg.Delivery.BindIPv4)
 		}
+
 		need = append(need, ip)
 	}
+
 	if cfg.Delivery.BindIPv6 != "" {
 		ip := net.ParseIP(cfg.Delivery.BindIPv6)
 		if ip == nil || ip.To4() != nil {
 			return fmt.Errorf("invalid delivery.bind_ipv6 %q", cfg.Delivery.BindIPv6)
 		}
+
 		need = append(need, ip)
 	}
+
 	if len(need) == 0 {
 		return nil
 	}
@@ -259,14 +278,17 @@ func verifyBindAddresses(cfg *config.Config) error {
 	}
 
 	local := make([]net.IP, 0, len(addrs))
+
 	for _, a := range addrs {
 		var ip net.IP
+
 		switch v := a.(type) {
 		case *net.IPNet:
 			ip = v.IP
 		case *net.IPAddr:
 			ip = v.IP
 		}
+
 		if ip != nil {
 			local = append(local, ip)
 		}
@@ -274,16 +296,19 @@ func verifyBindAddresses(cfg *config.Config) error {
 
 	for _, want := range need {
 		found := false
+
 		for _, have := range local {
 			if have.Equal(want) {
 				found = true
 				break
 			}
 		}
+
 		if !found {
 			return fmt.Errorf("delivery bind address %s is not configured on any local interface", want)
 		}
 	}
+
 	return nil
 }
 
@@ -292,7 +317,9 @@ func runCheck(configPath string) error {
 	if err != nil {
 		return err
 	}
-	if err := cfg.IsReady(); err != nil {
+
+	err = cfg.IsReady()
+	if err != nil {
 		return fmt.Errorf("configuration not ready: %w", err)
 	}
 
@@ -302,8 +329,10 @@ func runCheck(configPath string) error {
 	if err != nil {
 		return fmt.Errorf("load local DKIM key: %w", err)
 	}
+
 	opts.DKIM = &check.DKIMKey{Selector: cfg.DKIM.Selector, PublicKey: signer.PublicKey}
-	if err := certs.Check(cfg); err != nil {
+	err = certs.Check(cfg)
+	if err != nil {
 		return fmt.Errorf("check serving TLS certificate: %w", err)
 	}
 
@@ -313,15 +342,19 @@ func runCheck(configPath string) error {
 	defer cancel()
 	results := check.Run(ctx, opts)
 	var failed bool
+
 	for _, r := range results {
 		fmt.Printf("%s  %-24s  %s\n", r.Level, escapeControl(r.Name), escapeControl(r.Message))
+
 		if r.Level == check.Fail {
 			failed = true
 		}
 	}
+
 	if failed {
 		return errors.New("one or more deployment checks failed")
 	}
+
 	return nil
 }
 
@@ -353,6 +386,7 @@ func terminationContext(parent context.Context) (context.Context, context.Cancel
 
 func escapeControl(value string) string {
 	var out strings.Builder
+
 	for _, r := range value {
 		if unicode.IsControl(r) {
 			if r <= 0xff {
@@ -360,9 +394,12 @@ func escapeControl(value string) string {
 			} else {
 				fmt.Fprintf(&out, `\u%04x`, r)
 			}
+
 			continue
 		}
+
 		out.WriteRune(r)
 	}
+
 	return out.String()
 }

@@ -21,9 +21,10 @@ const (
 	keyLength  = 32
 )
 
-var ErrInvalidHash = errors.New("malformed argon2id hash")
-
-var encoding = base64.RawStdEncoding
+var (
+	ErrInvalidHash = errors.New("malformed argon2id hash")
+	encoding       = base64.RawStdEncoding
+)
 
 // PHCParams holds strict, validated parameters for Argon2id. Memory is in KiB.
 type PHCParams struct {
@@ -71,6 +72,7 @@ func Waste() {
 }
 
 const (
+
 	// Bound the entire PHC string before field work.
 	maxPHCLength = 512
 )
@@ -107,6 +109,7 @@ func parsePHC(hash string) (*PHCParams, error) {
 	if len(parts[4]) > maxEncodedLen(saltLength) {
 		return nil, fmt.Errorf("%w: salt size", ErrInvalidHash)
 	}
+
 	if len(parts[5]) > maxEncodedLen(keyLength) {
 		return nil, fmt.Errorf("%w: output size", ErrInvalidHash)
 	}

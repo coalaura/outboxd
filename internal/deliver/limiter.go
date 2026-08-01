@@ -21,6 +21,7 @@ func newDomainLimiter(limit int) *domainLimiter {
 	if limit < 1 {
 		limit = 1
 	}
+
 	return &domainLimiter{
 		limit: limit,
 		slots: make(map[string]*slot),
@@ -34,6 +35,7 @@ func (l *domainLimiter) acquire(ctx context.Context, domain string) error {
 		entry = &slot{tokens: make(chan struct{}, l.limit)}
 		l.slots[domain] = entry
 	}
+
 	entry.holders++
 	tokens := entry.tokens
 	l.mu.Unlock()
@@ -51,6 +53,7 @@ func (l *domainLimiter) release(domain string) {
 	l.mu.Lock()
 	entry, ok := l.slots[domain]
 	l.mu.Unlock()
+
 	if !ok {
 		return
 	}
@@ -61,6 +64,7 @@ func (l *domainLimiter) release(domain string) {
 		// no token held
 		return
 	}
+
 	l.drop(domain)
 }
 
@@ -72,7 +76,9 @@ func (l *domainLimiter) drop(domain string) {
 	if !ok {
 		return
 	}
+
 	entry.holders--
+
 	if entry.holders <= 0 {
 		delete(l.slots, domain)
 	}

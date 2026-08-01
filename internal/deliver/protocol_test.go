@@ -27,6 +27,14 @@ import (
 	"github.com/coalaura/outboxd/internal/queue"
 )
 
+type initialEHLOUnsafeCase struct {
+	name     string
+	code     int
+	utf8     bool
+	eightBit bool
+	required bool
+}
+
 // sessionSnapshot is an immutable view of one SMTP session for tests.
 type sessionSnapshot struct {
 	Commands  []string
@@ -85,9 +93,11 @@ type fakeMX struct {
 	// dataDone is closed on first successful DATA (do not wait with sleeps).
 	dataOnce sync.Once
 	dataDone chan struct{}
+
 	// sessionDone receives after each connection handler exits.
 	// Buffered enough for test fan-out so completions are never dropped; never nonblocking-select-default.
 	sessionDone chan struct{}
+
 	// done closed when the accept loop stops.
 	done chan struct{}
 
@@ -111,6 +121,7 @@ func startFakeMX(t *testing.T, mx *fakeMX) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	mx.ln = ln
 	mx.ready = make(chan struct{})
 	mx.dataDone = make(chan struct{})
@@ -120,6 +131,7 @@ func startFakeMX(t *testing.T, mx *fakeMX) string {
 	close(mx.ready)
 	t.Cleanup(func() {
 		_ = ln.Close()
+
 		select {
 		case <-mx.done:
 		case <-time.After(5 * time.Second):
@@ -131,12 +143,14 @@ func startFakeMX(t *testing.T, mx *fakeMX) string {
 func (mx *fakeMX) serve() {
 	defer close(mx.done)
 	var wg sync.WaitGroup
+
 	for {
 		c, err := mx.ln.Accept()
 		if err != nil {
 			wg.Wait()
 			return
 		}
+
 		mx.conns.Add(1)
 		log := &sessionLog{}
 		mx.mu.Lock()
@@ -163,55 +177,70 @@ func (mx *fakeMX) handle(c net.Conn, log *sessionLog) {
 
 	write("220 mx.test ESMTP\r\n")
 	secured := false
+
 	for {
 		line, err := readLine()
 		if err != nil {
 			return
 		}
+
 		raw := strings.TrimRight(line, "\r\n")
 		log.add(raw)
 		upper := strings.ToUpper(raw)
+
 		switch {
 		case strings.HasPrefix(upper, "EHLO"):
 			code := mx.initialEHLOCode
 			if secured {
 				code = mx.postTLSEHLOCode
 			}
+
 			if code != 0 {
 				write(fmt.Sprintf("%d rejected\r\n", code))
 				continue
 			}
+
 			write("250-mx.test\r\n")
+
 			if mx.startTLS && !secured {
 				write("250-STARTTLS\r\n")
 			}
+
 			if mx.ext8bit {
 				write("250-8BITMIME\r\n")
 			}
+
 			if mx.extUTF8 {
 				write("250-SMTPUTF8\r\n")
 			}
+
 			write("250 OK\r\n")
 		case strings.HasPrefix(upper, "STARTTLS"):
 			if !mx.startTLS || secured {
 				write("503 bad\r\n")
 				continue
 			}
+
 			if mx.startTLSEr {
 				write("454 TLS not available\r\n")
 				continue
 			}
+
 			write("220 ready\r\n")
+
 			if mx.brokenTLS {
 				// Fail during the handshake, not after a successful one.
 				_, _ = rw.Write([]byte("NOT_TLS_HANDSHAKE"))
 				return
 			}
+
 			cfg := &tls.Config{Certificates: []tls.Certificate{mx.cert}}
 			tlsConn := tls.Server(rw, cfg)
-			if err := tlsConn.Handshake(); err != nil {
+			err = tlsConn.Handshake()
+			if err != nil {
 				return
 			}
+
 			cs := tlsConn.ConnectionState()
 			log.mu.Lock()
 			log.sni = cs.ServerName
@@ -229,6 +258,7 @@ func (mx *fakeMX) handle(c net.Conn, log *sessionLog) {
 			log.mu.Lock()
 			log.rcptLines = append(log.rcptLines, raw)
 			log.mu.Unlock()
+
 			if mx.rcptReply != "" {
 				write(mx.rcptReply + "\r\n")
 			} else {
@@ -239,21 +269,25 @@ func (mx *fakeMX) handle(c net.Conn, log *sessionLog) {
 			log.data = true
 			log.mu.Unlock()
 			write("354 go\r\n")
+
 			for {
 				l, err := readLine()
 				if err != nil {
 					return
 				}
+
 				trimmed := strings.TrimRight(l, "\r\n")
 				if trimmed == "." {
 					break
 				}
+
 				if mx.captureBody {
 					log.mu.Lock()
 					log.dataBody.WriteString(l)
 					log.mu.Unlock()
 				}
 			}
+
 			write("250 queued\r\n")
 			mx.dataOnce.Do(func() { close(mx.dataDone) })
 		case strings.HasPrefix(upper, "QUIT"):
@@ -270,19 +304,23 @@ func (mx *fakeMX) snapshots() []sessionSnapshot {
 	logs := append([]*sessionLog(nil), mx.sessions...)
 	mx.mu.Unlock()
 	out := make([]sessionSnapshot, 0, len(logs))
+
 	for _, s := range logs {
 		out = append(out, s.snapshot())
 	}
+
 	return out
 }
 
 func (mx *fakeMX) mailLines() []string {
 	var out []string
+
 	for _, s := range mx.snapshots() {
 		if s.MailLine != "" {
 			out = append(out, s.MailLine)
 		}
 	}
+
 	return out
 }
 
@@ -292,6 +330,7 @@ func (mx *fakeMX) anyData() bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -305,6 +344,7 @@ func mintCert(t *testing.T, cn string) (tls.Certificate, *x509.CertPool, *x509.C
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: cn},
@@ -318,20 +358,24 @@ func mintCert(t *testing.T, cn string) (tls.Certificate, *x509.CertPool, *x509.C
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	parsed, err := x509.ParseCertificate(der)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	pool := x509.NewCertPool()
 	pool.AddCert(parsed)
 	return tlsCert, pool, parsed
@@ -383,6 +427,7 @@ func runDeliverer(t *testing.T, d *deliver.Deliverer) (cancel context.CancelFunc
 
 func await(t *testing.T, ch <-chan struct{}, timeout time.Duration, what string) {
 	t.Helper()
+
 	select {
 	case <-ch:
 	case <-time.After(timeout):
@@ -392,6 +437,7 @@ func await(t *testing.T, ch <-chan struct{}, timeout time.Duration, what string)
 
 func awaitSession(t *testing.T, mx *fakeMX, timeout time.Duration) {
 	t.Helper()
+
 	select {
 	case <-mx.sessionDone:
 	case <-time.After(timeout):
@@ -413,7 +459,9 @@ func addEnvelope(t *testing.T, q *queue.Queue, id, sender, rcpt, domain string, 
 	if body == nil {
 		body = []byte("From: " + sender + "\r\nTo: " + rcpt + "\r\nSubject: t\r\n\r\nHi\r\n")
 	}
-	if err := q.Add(env, body); err != nil {
+
+	err := q.Add(env, body)
+	if err != nil {
 		t.Fatal(err)
 	}
 }
@@ -436,6 +484,7 @@ func TestASCIINoUTF8No8BitParams(t *testing.T) {
 	if len(lines) == 0 {
 		t.Fatal("no MAIL")
 	}
+
 	if strings.Contains(lines[0], "SMTPUTF8") || strings.Contains(lines[0], "BODY=8BITMIME") {
 		t.Fatalf("unexpected params: %s", lines[0])
 	}
@@ -471,17 +520,21 @@ func TestSMTPUTF8MissingPermanent(t *testing.T) {
 	awaitSession(t, mx, 3*time.Second)
 	cancel()
 	<-done
+
 	if mx.anyData() {
 		t.Fatal("DATA must not be sent")
 	}
+
 	ids, _ := q.DeadIDs()
 	if len(ids) == 0 {
 		t.Fatal("expected permanent bury")
 	}
+
 	env, err := q.LoadDead(ids[0])
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if !strings.Contains(env.Recipients[0].Detail, "SMTPUTF8") {
 		t.Fatalf("detail=%q", env.Recipients[0].Detail)
 	}
@@ -519,13 +572,16 @@ func Test8BitMIMEMissingPermanent(t *testing.T) {
 	awaitSession(t, mx, 3*time.Second)
 	cancel()
 	<-done
+
 	if mx.anyData() {
 		t.Fatal("DATA must not be sent")
 	}
+
 	ids, _ := q.DeadIDs()
 	if len(ids) == 0 {
 		t.Fatal("expected bury")
 	}
+
 	env, _ := q.LoadDead(ids[0])
 	if !strings.Contains(env.Recipients[0].Detail, "8BITMIME") {
 		t.Fatalf("detail=%q", env.Recipients[0].Detail)
@@ -546,6 +602,7 @@ func TestBothCapabilitiesRequired(t *testing.T) {
 	awaitSession(t, mx, 3*time.Second)
 	cancel()
 	<-done
+
 	if mx.anyData() {
 		t.Fatal("missing 8BITMIME must block DATA")
 	}
@@ -597,6 +654,7 @@ func TestTLSAbsentPlainAllowed(t *testing.T) {
 	await(t, mx.dataDone, 3*time.Second, "DATA")
 	cancel()
 	<-done
+
 	if mx.conns.Load() != 1 {
 		t.Fatalf("conns=%d", mx.conns.Load())
 	}
@@ -604,6 +662,7 @@ func TestTLSAbsentPlainAllowed(t *testing.T) {
 
 func TestInitialEHLOFallbackToHELO(t *testing.T) {
 	for _, code := range []int{500, 502, 504} {
+
 		t.Run(fmt.Sprint(code), func(t *testing.T) {
 			mx := &fakeMX{initialEHLOCode: code}
 			addr := startFakeMX(t, mx)
@@ -624,19 +683,14 @@ func TestInitialEHLOFallbackToHELO(t *testing.T) {
 }
 
 func TestInitialEHLODoesNotFallbackWhenUnsafe(t *testing.T) {
-	tests := []struct {
-		name     string
-		code     int
-		utf8     bool
-		eightBit bool
-		required bool
-	}{
+	tests := []initialEHLOUnsafeCase{
 		{name: "policy failure", code: 550},
 		{name: "transient failure", code: 421},
 		{name: "SMTPUTF8 required", code: 500, utf8: true},
 		{name: "8BITMIME required", code: 500, eightBit: true},
 		{name: "TLS required", code: 500, required: true},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mx := &fakeMX{initialEHLOCode: tt.code}
@@ -648,6 +702,7 @@ func TestInitialEHLODoesNotFallbackWhenUnsafe(t *testing.T) {
 				cfg.Delivery.TLSMode = "required"
 				cfg.Delivery.AllowPlaintext = &allow
 			}
+
 			cfg.Delivery.MaxAttempts = 1
 			d := deliver.New(cfg, q, memLog{})
 			wireMX(t, d, "ex.com", "mx.ex.com", addr)
@@ -656,6 +711,7 @@ func TestInitialEHLODoesNotFallbackWhenUnsafe(t *testing.T) {
 			awaitSession(t, mx, 3*time.Second)
 			cancel()
 			<-done
+
 			for _, command := range mx.snapshots()[0].Commands {
 				if strings.HasPrefix(strings.ToUpper(command), "HELO ") {
 					t.Fatalf("unsafe HELO fallback: %v", mx.snapshots()[0].Commands)
@@ -680,6 +736,7 @@ func TestPostSTARTTLSEHLODoesNotFallback(t *testing.T) {
 	awaitSession(t, mx, 3*time.Second)
 	cancel()
 	<-done
+
 	for _, command := range mx.snapshots()[0].Commands {
 		if strings.HasPrefix(strings.ToUpper(command), "HELO ") {
 			t.Fatalf("post-STARTTLS HELO fallback: %v", mx.snapshots()[0].Commands)
@@ -704,10 +761,12 @@ func TestEnhancedStatusPersisted(t *testing.T) {
 	if err != nil || len(ids) != 1 {
 		t.Fatalf("DeadIDs=%v err=%v", ids, err)
 	}
+
 	env, err := q.LoadDead(ids[0])
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	r := env.Recipients[0]
 	if r.Code != 550 || r.EnhancedCode != "5.1.1" {
 		t.Fatalf("recipient status code=%d enhanced=%q", r.Code, r.EnhancedCode)
@@ -731,6 +790,7 @@ func TestTLSAbsentRequired(t *testing.T) {
 	awaitSession(t, mx, 3*time.Second)
 	cancel()
 	<-done
+
 	if mx.anyData() {
 		t.Fatal("must not DATA")
 	}
@@ -753,27 +813,35 @@ func TestTLSVerifiedTrusted(t *testing.T) {
 	cancel()
 	<-done
 	snaps := mx.snapshots()
-	var sni string
-	var ehlos int
+	var (
+		sni   string
+		ehlos int
+	)
+
 	for _, s := range snaps {
 		if s.SNI != "" {
 			sni = s.SNI
 		}
+
 		for _, c := range s.Commands {
 			if strings.HasPrefix(strings.ToUpper(c), "EHLO ") {
 				ehlos++
+
 				if !strings.Contains(c, "outboxd.test") {
 					t.Fatalf("EHLO hostname: %s", c)
 				}
 			}
 		}
 	}
+
 	if sni != "mx.ex.com" {
 		t.Fatalf("SNI=%q", sni)
 	}
+
 	if ehlos < 2 {
 		t.Fatalf("expected re-EHLO after TLS, ehlos=%d", ehlos)
 	}
+
 	if mx.conns.Load() != 1 {
 		t.Fatalf("conns=%d want 1", mx.conns.Load())
 	}
@@ -796,9 +864,11 @@ func TestTLSUntrustedNoInsecureRetry(t *testing.T) {
 	awaitSession(t, mx, 3*time.Second)
 	cancel()
 	<-done
+
 	if mx.anyData() {
 		t.Fatal("must not deliver after verify fail")
 	}
+
 	if mx.conns.Load() != 1 {
 		t.Fatalf("must not reconnect insecurely, conns=%d", mx.conns.Load())
 	}
@@ -819,6 +889,7 @@ func TestTLSInsecureModeSingleConn(t *testing.T) {
 	await(t, mx.dataDone, 3*time.Second, "DATA")
 	cancel()
 	<-done
+
 	if mx.conns.Load() != 1 {
 		t.Fatalf("conns=%d want 1", mx.conns.Load())
 	}
@@ -839,6 +910,7 @@ func TestTLSStartTLSCommandError(t *testing.T) {
 	awaitSession(t, mx, 3*time.Second)
 	cancel()
 	<-done
+
 	if mx.anyData() {
 		t.Fatal("no plaintext DATA after STARTTLS error")
 	}
@@ -857,13 +929,16 @@ func TestOrdinaryDeliveryPathRegression(t *testing.T) {
 	addEnvelope(t, q, "reg1", "sender@ex.com", "dest@ex.com", "ex.com", false, false, body)
 	cancel, done := runDeliverer(t, d)
 	await(t, mx.dataDone, 3*time.Second, "DATA")
+
 	// Wait session end so Finish can complete before inspecting queue.
 	awaitSession(t, mx, 3*time.Second)
 	cancel()
 	<-done
+
 	if q.Len() != 0 {
 		t.Fatal("queue should finish")
 	}
+
 	if mx.conns.Load() != 1 {
 		t.Fatalf("conns=%d", mx.conns.Load())
 	}
@@ -878,6 +953,7 @@ func (m mapDialer) DialContext(ctx context.Context, network, address string) (ne
 	if !ok {
 		return nil, &net.OpError{Op: "dial", Net: network, Err: errUnmapped(address)}
 	}
+
 	var nd net.Dialer
 	return nd.DialContext(ctx, "tcp", target)
 }
@@ -921,12 +997,15 @@ func TestMultiMXUTF8Fallback(t *testing.T) {
 	awaitSession(t, mxBad, 3*time.Second)
 	cancel()
 	<-done
+
 	if mxBad.anyData() || mxBad.anyMail() {
 		t.Fatal("bad MX must not receive MAIL/DATA")
 	}
+
 	if mxBad.conns.Load() != 1 || mxGood.conns.Load() != 1 {
 		t.Fatalf("conns bad=%d good=%d", mxBad.conns.Load(), mxGood.conns.Load())
 	}
+
 	lines := mxGood.mailLines()
 	if len(lines) == 0 || !strings.Contains(lines[0], "SMTPUTF8") {
 		t.Fatalf("good MAIL=%v", lines)
@@ -944,12 +1023,15 @@ func TestMultiMX8BitFallback(t *testing.T) {
 	awaitSession(t, mxBad, 3*time.Second)
 	cancel()
 	<-done
+
 	if mxBad.anyMail() || mxBad.anyData() {
 		t.Fatal("bad MX MAIL/DATA")
 	}
+
 	if mxBad.conns.Load() != 1 || mxGood.conns.Load() != 1 {
 		t.Fatalf("conns bad=%d good=%d", mxBad.conns.Load(), mxGood.conns.Load())
 	}
+
 	lines := mxGood.mailLines()
 	if len(lines) == 0 || !strings.Contains(lines[0], "BODY=8BITMIME") {
 		t.Fatalf("MAIL=%v", lines)
@@ -967,9 +1049,11 @@ func TestMultiMXBothCapabilities(t *testing.T) {
 	awaitSession(t, mxPartial, 3*time.Second)
 	cancel()
 	<-done
+
 	if mxPartial.anyMail() || mxPartial.anyData() {
 		t.Fatal("partial MX must not receive MAIL/DATA")
 	}
+
 	lines := mxFull.mailLines()
 	if len(lines) != 1 || !strings.Contains(lines[0], "SMTPUTF8") || !strings.Contains(lines[0], "BODY=8BITMIME") {
 		t.Fatalf("MAIL=%v", lines)
@@ -1007,13 +1091,16 @@ func TestMultiMXAllLackCapability(t *testing.T) {
 	awaitSession(t, mx2, 3*time.Second)
 	cancel()
 	<-done
+
 	if mx1.anyData() || mx2.anyData() {
 		t.Fatal("no DATA")
 	}
+
 	ids, _ := q.DeadIDs()
 	if len(ids) == 0 {
 		t.Fatal("expected dead")
 	}
+
 	env, _ := q.LoadDead(ids[0])
 	if !strings.Contains(env.Recipients[0].Detail, "SMTPUTF8") {
 		t.Fatalf("detail=%q", env.Recipients[0].Detail)
@@ -1027,6 +1114,7 @@ func TestMultiMXMixedNetworkAndCapability(t *testing.T) {
 	ipCap := net.ParseIP("10.255.201.2")
 	q := openQueue(t)
 	cfg := deliverCfg()
+
 	// Multiple attempts so a temporary outcome persists a retry rather than exhausting.
 	cfg.Delivery.MaxAttempts = 5
 	d := deliver.New(cfg, q, memLog{})
@@ -1048,16 +1136,20 @@ func TestMultiMXMixedNetworkAndCapability(t *testing.T) {
 	// Deliverer will retry; cancel after first MX hosts have been tried (cap session ended).
 	cancel, done := runDeliverer(t, d)
 	awaitSession(t, mxCap, 3*time.Second)
+
 	// Give Finish path no permanent reject: wait for retry persistence by cancelling after session.
 	cancel()
 	<-done
+
 	if mxCap.anyData() {
 		t.Fatal("no DATA")
 	}
+
 	ids, _ := q.DeadIDs()
 	if len(ids) != 0 {
 		t.Fatalf("must not permanently bury on mixed temporary+capability, dead=%v", ids)
 	}
+
 	// Message remains pending for retry (not finished).
 	if q.Len() == 0 {
 		t.Fatal("expected message still queued for retry")
@@ -1079,9 +1171,11 @@ func TestTLSHandshakeFailure(t *testing.T) {
 	awaitSession(t, mx, 3*time.Second)
 	cancel()
 	<-done
+
 	if mx.anyData() || mx.anyMail() {
 		t.Fatal("no MAIL/DATA after handshake failure")
 	}
+
 	if mx.conns.Load() != 1 {
 		t.Fatalf("no policy-changing reconnect, conns=%d", mx.conns.Load())
 	}
@@ -1102,8 +1196,10 @@ func TestTLSCandidateIPRetryKeepsPolicy(t *testing.T) {
 		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com.", Pref: 10}}},
 		ips: map[string][]net.IP{"mx.ex.com": {ipBad, ipGood}},
 	})
-	var dials []string
-	var mu sync.Mutex
+	var (
+		dials []string
+		mu    sync.Mutex
+	)
 	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
 		mu.Lock()
 		dials = append(dials, address)
@@ -1112,6 +1208,7 @@ func TestTLSCandidateIPRetryKeepsPolicy(t *testing.T) {
 		if host == ipBad.String() {
 			return nil, errors.New("network down")
 		}
+
 		var nd net.Dialer
 		return nd.DialContext(ctx, "tcp", addr)
 	}))
@@ -1120,20 +1217,25 @@ func TestTLSCandidateIPRetryKeepsPolicy(t *testing.T) {
 	await(t, mx.dataDone, 4*time.Second, "DATA")
 	cancel()
 	<-done
+
 	// Deterministic dial order is asserted in package deliver TestCandidateIPFallbackOrder.
 	// Here, success pathway: one verified STARTTLS connection, one MAIL/DATA.
 	if mx.conns.Load() != 1 {
 		t.Fatalf("conns=%d", mx.conns.Load())
 	}
+
 	snaps := mx.snapshots()
 	if len(snaps) != 1 || !snaps[0].TLS || !snaps[0].Data {
 		t.Fatalf("expected one TLS DATA session, snaps=%+v", snaps)
 	}
+
 	mu.Lock()
 	defer mu.Unlock()
+
 	if len(dials) == 0 {
 		t.Fatal("expected dials")
 	}
+
 	_ = dials
 }
 
@@ -1149,6 +1251,7 @@ func TestIDNARoutingUsesALabel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if routing == unicodeDomain || strings.Contains(routing, "ä") {
 		t.Fatalf("expected A-label got %q", routing)
 	}
@@ -1177,16 +1280,19 @@ func TestIDNARoutingUsesALabel(t *testing.T) {
 	if len(lookedMX) == 0 || lookedMX[0] != routing {
 		t.Fatalf("MX lookups=%v want first %q", lookedMX, routing)
 	}
+
 	for _, name := range lookedMX {
 		if strings.Contains(name, "ä") {
 			t.Fatalf("DNS used U-label %q", name)
 		}
 	}
+
 	snaps := mx.snapshots()
 	rcptLine := ""
 	if len(snaps) > 0 && len(snaps[0].RcptLines) > 0 {
 		rcptLine = snaps[0].RcptLines[0]
 	}
+
 	if !strings.Contains(rcptLine, "User@exämple.com") {
 		t.Fatalf("RCPT must preserve submitted mailbox, got %q", rcptLine)
 	}
@@ -1211,7 +1317,8 @@ func TestQueueDomainMismatchRejected(t *testing.T) {
 		Created:     now,
 		NextAttempt: now,
 	}
-	if err := q.Add(env, []byte("From: a@ex.com\r\nTo: b@ex.com\r\nSubject: t\r\n\r\nHi\r\n")); err == nil {
+	err := q.Add(env, []byte("From: a@ex.com\r\nTo: b@ex.com\r\nSubject: t\r\n\r\nHi\r\n"))
+	if err == nil {
 		t.Fatal("expected domain mismatch")
 	}
 }
@@ -1223,6 +1330,7 @@ func TestQueueDomainALabelAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	env := &queue.Envelope{
 		ID: "goodmeta", Username: "u", Sender: "a@ex.com",
 		Recipients:  []queue.Recipient{{Address: "b@exämple.com", Domain: routing, Status: queue.StatusPending}},
@@ -1230,7 +1338,8 @@ func TestQueueDomainALabelAccepted(t *testing.T) {
 		NextAttempt: now,
 		SMTPUTF8:    true,
 	}
-	if err := q.Add(env, []byte("From: a@ex.com\r\nTo: b@exämple.com\r\nSubject: t\r\n\r\nHi\r\n")); err != nil {
+	err = q.Add(env, []byte("From: a@ex.com\r\nTo: b@exämple.com\r\nSubject: t\r\n\r\nHi\r\n"))
+	if err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1251,6 +1360,7 @@ func TestBothParamsRequiredSingleMAIL(t *testing.T) {
 	if len(lines) != 1 {
 		t.Fatalf("want one MAIL, got %v", lines)
 	}
+
 	if !strings.Contains(lines[0], "SMTPUTF8") || !strings.Contains(lines[0], "BODY=8BITMIME") {
 		t.Fatalf("MAIL=%s", lines[0])
 	}
@@ -1272,6 +1382,7 @@ func TestASCIIRCPTCasingPreserved(t *testing.T) {
 	if len(snaps) > 0 && len(snaps[0].RcptLines) > 0 {
 		rcptLine = snaps[0].RcptLines[0]
 	}
+
 	if !strings.Contains(rcptLine, "User.Name@ex.com") {
 		t.Fatalf("RCPT=%q", rcptLine)
 	}

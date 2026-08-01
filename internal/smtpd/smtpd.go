@@ -60,6 +60,7 @@ const (
 	DefaultImplicitTLSAddr = ":465"
 
 	maxResponseLength = 256
+
 	// Account conservatively for ReadAll capacity growth, newline normalization
 	// up to twice the input size, prepared output, and the signed copy.
 	dataMemoryBudget   = int64(512 << 20)
@@ -92,6 +93,7 @@ type Server struct {
 
 	// Bound concurrent Argon2id derivations (worker slots).
 	hashing chan struct{}
+
 	// Bound concurrent DATA parsing, normalization, signing, and queueing.
 	dataWork chan struct{}
 
@@ -103,8 +105,10 @@ type Server struct {
 
 	// shutdownHook is invoked once when shutdown starts (tests).
 	shutdownHook func()
+
 	// serveEntered is invoked once when a Serve loop has started (tests).
 	serveEntered func()
+
 	// shutdownContext builds the context used for graceful Shutdown (tests may inject).
 	shutdownContext func(parent context.Context) (context.Context, context.CancelFunc)
 }
@@ -115,12 +119,14 @@ func New(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signer, spool *q
 	if authWorkers <= 0 {
 		authWorkers = 4
 	}
+
 	dataWorkers := dataWorkerCount(cfg.Server.MaxMessageBytes)
 
 	msgBurst := cfg.Server.MessageBurst
 	if msgBurst <= 0 {
 		msgBurst = burstDefault(cfg.Server.MaxMessagesPerHour)
 	}
+
 	rcptBurst := cfg.Server.RecipientBurst
 	if rcptBurst <= 0 {
 		rcptBurst = burstDefault(cfg.Server.MaxRecipientsPerHour)
@@ -152,10 +158,12 @@ func dataWorkerCount(maxMessageBytes int64) int {
 	if !ok {
 		return 1
 	}
+
 	workers := int(dataMemoryBudget / perWorker)
 	if workers < 1 {
 		return 1
 	}
+
 	return min(workers, maxDataWorkers)
 }
 
@@ -163,6 +171,7 @@ func dataWorkerMemory(maxMessageBytes int64) (int64, bool) {
 	if maxMessageBytes <= 0 || maxMessageBytes > (math.MaxInt64-dataMemoryOverhead)/dataMemoryCopies {
 		return 0, false
 	}
+
 	return maxMessageBytes*dataMemoryCopies + dataMemoryOverhead, true
 }
 
@@ -170,6 +179,7 @@ func incrementLimit(limit int64) int64 {
 	if limit == math.MaxInt64 {
 		return math.MaxInt64
 	}
+
 	return limit + 1
 }
 
@@ -177,13 +187,16 @@ func burstDefault(hourly int) int {
 	if hourly <= 0 {
 		return 1
 	}
+
 	b := hourly / 60
 	if b < 1 {
 		b = 1
 	}
+
 	if b > hourly {
 		b = hourly
 	}
+
 	return b
 }
 
@@ -212,26 +225,31 @@ func (s *Server) Listen() error {
 		for _, l := range opened {
 			_ = l.Close()
 		}
+
 		s.starttlsListener = nil
 		s.implicitListener = nil
 	}
 
-	if addr := s.cfg.Server.SubmissionListenAddr(); addr != "" {
+	addr := s.cfg.Server.SubmissionListenAddr()
+	if addr != "" {
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
 			return fmt.Errorf("listen on %s: %w", addr, err)
 		}
+
 		s.starttlsListener = ln
 		opened = append(opened, ln)
 		s.starttls.Addr = ln.Addr().String()
 	}
 
-	if addr := s.cfg.Server.ImplicitTLSListenAddr(); addr != "" {
+	addr = s.cfg.Server.ImplicitTLSListenAddr()
+	if addr != "" {
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
 			cleanup()
 			return fmt.Errorf("listen on %s: %w", addr, err)
 		}
+
 		s.implicitListener = ln
 		opened = append(opened, ln)
 		s.implicit.Addr = ln.Addr().String()
@@ -245,9 +263,11 @@ func (s *Server) Listen() error {
 	if s.starttlsListener != nil {
 		parts = append(parts, fmt.Sprintf("%s (STARTTLS)", s.starttls.Addr))
 	}
+
 	if s.implicitListener != nil {
 		parts = append(parts, fmt.Sprintf("%s (implicit TLS)", s.implicit.Addr))
 	}
+
 	s.log.Printf("Listening for submission on %s\n", strings.Join(parts, " and "))
 	return nil
 }
@@ -275,22 +295,27 @@ func (s *Server) Run(ctx context.Context) error {
 	if s.starttlsListener != nil {
 		listenerCount++
 	}
+
 	if s.implicitListener != nil {
 		listenerCount++
 	}
+
 	startup.Add(listenerCount)
 	go func() {
 		startup.Wait()
 		close(started)
+
 		if s.serveEntered != nil {
 			s.serveEntered()
 		}
 	}()
 
 	record := func(err error) {
-		if err = ignoreClosed(err); err == nil {
+		err = ignoreClosed(err)
+		if err == nil {
 			return
 		}
+
 		mu.Lock()
 		errs = append(errs, err)
 		mu.Unlock()
@@ -302,6 +327,7 @@ func (s *Server) Run(ctx context.Context) error {
 		<-started
 		once.Do(func() {
 			close(shutdownStarted)
+
 			if s.shutdownHook != nil {
 				s.shutdownHook()
 			}
@@ -310,27 +336,34 @@ func (s *Server) Run(ctx context.Context) error {
 				shutdownCtx context.Context
 				done        context.CancelFunc
 			)
+
 			if s.shutdownContext != nil {
 				shutdownCtx, done = s.shutdownContext(context.Background())
 			} else {
 				shutdownCtx, done = context.WithTimeout(context.Background(), shutdownTimeout)
 			}
+
 			defer done()
 
 			if s.starttls != nil && s.starttlsListener != nil {
-				if err := s.starttls.Shutdown(shutdownCtx); err != nil {
+				err := s.starttls.Shutdown(shutdownCtx)
+				if err != nil {
 					record(fmt.Errorf("starttls shutdown: %w", err))
 				}
 			}
+
 			if s.implicit != nil && s.implicitListener != nil {
-				if err := s.implicit.Shutdown(shutdownCtx); err != nil {
+				err := s.implicit.Shutdown(shutdownCtx)
+				if err != nil {
 					record(fmt.Errorf("implicit shutdown: %w", err))
 				}
 			}
+
 			// Ensure accept loops unblock even if Shutdown times out.
 			if s.starttlsListener != nil {
 				_ = s.starttlsListener.Close()
 			}
+
 			if s.implicitListener != nil {
 				_ = s.implicitListener.Close()
 			}
@@ -345,9 +378,12 @@ func (s *Server) Run(ctx context.Context) error {
 					shutdown()
 				}
 			}()
-			if err := srv.Serve(&startListener{Listener: listener, entered: startup.Done}); err != nil {
+
+			err := srv.Serve(&startListener{Listener: listener, entered: startup.Done})
+			if err != nil {
 				record(fmt.Errorf("%s serve: %w", name, err))
 			}
+
 			// Unexpected exit of either listener shuts down the other.
 			shutdown()
 		})
@@ -356,6 +392,7 @@ func (s *Server) Run(ctx context.Context) error {
 	if s.starttlsListener != nil {
 		serveOne("starttls", newLimitListener(s.starttlsListener, s.connLimit), s.starttls)
 	}
+
 	if s.implicitListener != nil {
 		ln := tls.NewListener(newLimitListener(s.implicitListener, s.connLimit), s.implicit.TLSConfig)
 		serveOne("implicit", ln, s.implicit)
@@ -426,6 +463,7 @@ func (s *Server) dataTimeout() time.Duration {
 	if timeout <= 0 {
 		return defaultDataTimeout
 	}
+
 	return timeout
 }
 
@@ -438,11 +476,13 @@ func needsUTF8(s string) bool {
 	if !utf8.ValidString(s) {
 		return true
 	}
+
 	for i := 0; i < len(s); i++ {
 		if s[i] >= 0x80 {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -455,10 +495,12 @@ func host(c *smtp.Conn) string {
 	if addr == nil {
 		return "unknown"
 	}
+
 	ip, _, err := net.SplitHostPort(addr.String())
 	if err != nil {
 		return addr.String()
 	}
+
 	return ip
 }
 
@@ -466,6 +508,7 @@ func ignoreClosed(err error) error {
 	if err == nil || errors.Is(err, net.ErrClosed) || errors.Is(err, smtp.ErrServerClosed) {
 		return nil
 	}
+
 	return err
 }
 
@@ -474,14 +517,17 @@ func responseText(value string) string {
 		if char < 32 || char > 126 {
 			return ' '
 		}
+
 		return char
 	}, value)
 	value = strings.Join(strings.Fields(value), " ")
 	if value == "" {
 		return "Invalid message"
 	}
+
 	if len(value) > maxResponseLength {
 		return value[:maxResponseLength]
 	}
+
 	return value
 }

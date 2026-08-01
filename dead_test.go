@@ -11,6 +11,11 @@ import (
 	"github.com/coalaura/outboxd/internal/queue"
 )
 
+type administrativeCommandArityCase struct {
+	name string
+	call func() error
+}
+
 func TestReportQueueIssuesEscapesTerminalControls(t *testing.T) {
 	spool := &queue.Queue{
 		Corrupt:  []error{errors.New("bad\nentry")},
@@ -22,6 +27,7 @@ func TestReportQueueIssuesEscapesTerminalControls(t *testing.T) {
 	if strings.Contains(got, "bad\nentry") || strings.Contains(got, "warn\tentry") {
 		t.Fatalf("terminal controls were not escaped: %q", got)
 	}
+
 	if !strings.Contains(got, `corrupt queue entry: bad\x0aentry`) ||
 		!strings.Contains(got, `queue maintenance warning: warn\x09entry`) {
 		t.Fatalf("unexpected report: %q", got)
@@ -30,13 +36,12 @@ func TestReportQueueIssuesEscapesTerminalControls(t *testing.T) {
 
 func TestAdministrativeCommandsRequireExactArity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yml")
-	if _, _, err := config.EnsurePath(path); err != nil {
+	_, _, err := config.EnsurePath(path)
+	if err != nil {
 		t.Fatal(err)
 	}
-	tests := []struct {
-		name string
-		call func() error
-	}{
+
+	tests := []administrativeCommandArityCase{
 		{"dead list extra", func() error { return dead(path, []string{"list", "extra"}) }},
 		{"dead show missing", func() error { return dead(path, []string{"show"}) }},
 		{"dead show extra", func() error { return dead(path, []string{"show", "id", "extra"}) }},
@@ -47,9 +52,11 @@ func TestAdministrativeCommandsRequireExactArity(t *testing.T) {
 		{"corrupt delete missing", func() error { return corrupt(path, []string{"delete"}) }},
 		{"corrupt delete extra", func() error { return corrupt(path, []string{"delete", "name", "extra"}) }},
 	}
+
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if err := test.call(); err == nil || !strings.Contains(err.Error(), "usage:") {
+			err := test.call()
+			if err == nil || !strings.Contains(err.Error(), "usage:") {
 				t.Fatalf("error=%v want usage error", err)
 			}
 		})

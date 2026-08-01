@@ -22,6 +22,7 @@ func TestServeDataDirectoryResolvedAgainstConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	cfgBody := "server:\n  hostname: mail.example.com\n  domain: example.com\n  data_directory: ./data\n" +
 		"  max_message_bytes: 1048576\n  max_recipients: 10\n  max_messages_per_hour: 100\n" +
 		"  max_recipients_per_hour: 1000\n  read_timeout: 5m\n  write_timeout: 5m\n" +
@@ -35,7 +36,8 @@ func TestServeDataDirectoryResolvedAgainstConfig(t *testing.T) {
 		"    allowed_senders: [\"alice@example.com\"]\n    enabled: true\n"
 
 	cfgPath := filepath.Join(cfgDir, "config.yml")
-	if err := os.WriteFile(cfgPath, []byte(cfgBody), 0600); err != nil {
+	err = os.WriteFile(cfgPath, []byte(cfgBody), 0600)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -46,17 +48,22 @@ func TestServeDataDirectoryResolvedAgainstConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	// Mirror serve: create the resolved data directory (not the raw relative path).
-	if err := disk.Mkdir(cfg.ResolvedDataDir()); err != nil {
+	err = disk.Mkdir(cfg.ResolvedDataDir())
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	want := filepath.Join(cfgDir, "data")
-	if st, err := os.Stat(want); err != nil || !st.IsDir() {
+	st, err := os.Stat(want)
+	if err != nil || !st.IsDir() {
 		t.Fatalf("data dir next to config: %v (stat err %v)", want, err)
 	}
+
 	stray := filepath.Join(cwd, "data")
-	if _, err := os.Stat(stray); !os.IsNotExist(err) {
+	_, err = os.Stat(stray)
+	if !os.IsNotExist(err) {
 		t.Fatalf("stray data dir created under CWD %s", stray)
 	}
 }
@@ -68,29 +75,39 @@ func TestRunCheckDoesNotGenerateMissingDKIMKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	hash, err := passwd.Hash("test-password-123")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	cfg.Server.Hostname = "mail.example.com"
 	cfg.Server.Domain = "example.com"
 	cfg.DNS.PublicIPv4 = "203.0.113.10"
 	cfg.TLS.AllowSelfSignedServing = true
 	cfg.Users = []config.User{{Username: "alice", PasswordHash: hash, AllowedSenders: []string{"alice@example.com"}, Enabled: true}}
-	if err := cfg.Init(); err != nil {
+	err = cfg.Init()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cfg.Save(); err != nil {
+
+	err = cfg.Save()
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	keyPath, err := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runCheck(path); err == nil || !strings.Contains(err.Error(), "DKIM") {
+
+	err = runCheck(path)
+	if err == nil || !strings.Contains(err.Error(), "DKIM") {
 		t.Fatalf("missing DKIM key must fail check, got %v", err)
 	}
-	if _, err := os.Stat(keyPath); !os.IsNotExist(err) {
+
+	_, err = os.Stat(keyPath)
+	if !os.IsNotExist(err) {
 		t.Fatalf("check generated DKIM key: %v", err)
 	}
 }
@@ -102,31 +119,43 @@ func TestRunCheckMissingTLSDoesNotMutateFilesystem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	hash, err := passwd.Hash("test-password-123")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	cfg.Server.Hostname = "mail.example.com"
 	cfg.Server.Domain = "example.com"
 	cfg.DNS.PublicIPv4 = "203.0.113.10"
 	cfg.TLS.AllowSelfSignedServing = true
 	cfg.Users = []config.User{{Username: "alice", PasswordHash: hash, AllowedSenders: []string{"alice@example.com"}, Enabled: true}}
-	if err := cfg.Init(); err != nil {
+	err = cfg.Init()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cfg.Save(); err != nil {
+
+	err = cfg.Save()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := disk.Mkdir(cfg.ResolvedDataDir()); err != nil {
+
+	err = disk.Mkdir(cfg.ResolvedDataDir())
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := sign.Ensure(cfg); err != nil {
+
+	_, _, err = sign.Ensure(cfg)
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	before := filesystemSnapshot(t, dir)
-	if err := runCheck(path); err == nil || !strings.Contains(err.Error(), "TLS certificate") {
+	err = runCheck(path)
+	if err == nil || !strings.Contains(err.Error(), "TLS certificate") {
 		t.Fatalf("missing TLS pair must fail check, got %v", err)
 	}
+
 	after := filesystemSnapshot(t, dir)
 	if strings.Join(before, "\n") != strings.Join(after, "\n") {
 		t.Fatalf("check mutated filesystem\nbefore: %v\nafter:  %v", before, after)
@@ -140,29 +169,35 @@ func filesystemSnapshot(t *testing.T, root string) []string {
 		if err != nil {
 			return err
 		}
+
 		rel, err := filepath.Rel(root, path)
 		if err != nil {
 			return err
 		}
+
 		entry := rel + ":" + info.Mode().String()
 		if !info.IsDir() {
 			body, err := os.ReadFile(path)
 			if err != nil {
 				return err
 			}
+
 			entry += ":" + string(body)
 		}
+
 		snapshot = append(snapshot, entry)
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	return snapshot
 }
 
 func TestEscapeControl(t *testing.T) {
-	if got := escapeControl("a\n\tb"); got != `a\x0a\x09b` {
+	got := escapeControl("a\n\tb")
+	if got != `a\x0a\x09b` {
 		t.Fatalf("escapeControl=%q", got)
 	}
 }
@@ -174,6 +209,7 @@ func TestServeLocksQueueBeforeGeneratingAssets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	cfgBody := "server:\n  hostname: mail.example.com\n  domain: example.com\n  data_directory: ./data\n" +
 		"  max_message_bytes: 1048576\n  max_recipients: 10\n  max_messages_per_hour: 100\n" +
 		"  max_recipients_per_hour: 1000\n  read_timeout: 5m\n  write_timeout: 5m\n" +
@@ -188,7 +224,8 @@ func TestServeLocksQueueBeforeGeneratingAssets(t *testing.T) {
 
 	cfgPath := filepath.Join(cfgDir, "config.yml")
 	cfgBody = strings.Replace(cfgBody, "  mode: self_signed\n", "  mode: self_signed\n  allow_self_signed_serving: true\n", 1)
-	if err := os.WriteFile(cfgPath, []byte(cfgBody), 0600); err != nil {
+	err = os.WriteFile(cfgPath, []byte(cfgBody), 0600)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -196,7 +233,9 @@ func TestServeLocksQueueBeforeGeneratingAssets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := disk.Mkdir(cfg.ResolvedDataDir()); err != nil {
+
+	err = disk.Mkdir(cfg.ResolvedDataDir())
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -204,14 +243,18 @@ func TestServeLocksQueueBeforeGeneratingAssets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer held.Close()
 
 	dkimKey := cfg.ResolvePath(cfg.DKIM.PrivateKeyFile)
 	tlsCert := cfg.ResolvePath(cfg.TLS.CertificateFile)
 	tlsKey := cfg.ResolvePath(cfg.TLS.PrivateKeyFile)
 	dnsOut := cfg.ResolvePath(cfg.DNS.OutputFile)
+
 	for _, p := range []string{dkimKey, tlsCert, tlsKey, dnsOut} {
-		if _, err := os.Stat(p); !os.IsNotExist(err) {
+
+		_, err = os.Stat(p)
+		if !os.IsNotExist(err) {
 			t.Fatalf("asset must not exist before serve: %s (%v)", p, err)
 		}
 	}
@@ -220,8 +263,11 @@ func TestServeLocksQueueBeforeGeneratingAssets(t *testing.T) {
 	if !errors.Is(err, disk.ErrLocked) {
 		t.Fatalf("serve want ErrLocked, got %v", err)
 	}
+
 	for _, p := range []string{dkimKey, tlsCert, tlsKey, dnsOut} {
-		if _, err := os.Stat(p); !os.IsNotExist(err) {
+
+		_, err = os.Stat(p)
+		if !os.IsNotExist(err) {
 			t.Fatalf("asset created despite lock failure: %s (%v)", p, err)
 		}
 	}

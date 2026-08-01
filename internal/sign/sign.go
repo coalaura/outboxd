@@ -35,7 +35,9 @@ func Ensure(cfg *config.Config) (*Signer, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	if err := cfg.CheckGeneratedParents(path); err != nil {
+
+	err = cfg.CheckGeneratedParents(path)
+	if err != nil {
 		return nil, false, err
 	}
 
@@ -48,6 +50,7 @@ func Ensure(cfg *config.Config) (*Signer, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
+
 	return loaded, created, nil
 }
 
@@ -58,13 +61,17 @@ func Load(cfg *config.Config) (*Signer, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := cfg.CheckGeneratedParents(path); err != nil {
+
+	err = cfg.CheckGeneratedParents(path)
+	if err != nil {
 		return nil, err
 	}
+
 	key, err := loadKey(path)
 	if err != nil {
 		return nil, err
 	}
+
 	return signer(cfg, key)
 }
 
@@ -73,6 +80,7 @@ func signer(cfg *config.Config, key *rsa.PrivateKey) (*Signer, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return &Signer{
 		options: dkim.SignOptions{
 			Domain:                 cfg.Server.Domain,
@@ -149,9 +157,11 @@ func ensureKey(path string) (*rsa.PrivateKey, bool, error) {
 			if readErr != nil {
 				return nil, false, readErr
 			}
+
 			parsed, parseErr := parseKey(body)
 			return parsed, false, parseErr
 		}
+
 		return nil, false, err
 	}
 
@@ -163,10 +173,12 @@ func loadKey(path string) (*rsa.PrivateKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read dkim private key: %w", err)
 	}
+
 	key, err := parseKey(body)
 	if err != nil {
 		return nil, fmt.Errorf("parse dkim private key: %w", err)
 	}
+
 	return key, nil
 }
 
@@ -182,6 +194,7 @@ func parseKey(body []byte) (*rsa.PrivateKey, error) {
 		if err != nil {
 			return nil, err
 		}
+
 		return validateKey(key)
 	case "PRIVATE KEY":
 		parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
@@ -204,8 +217,11 @@ func validateKey(key *rsa.PrivateKey) (*rsa.PrivateKey, error) {
 	if key.N == nil || key.N.BitLen() < keyBits {
 		return nil, fmt.Errorf("dkim RSA key must be at least %d bits", keyBits)
 	}
-	if err := key.Validate(); err != nil {
+
+	err := key.Validate()
+	if err != nil {
 		return nil, fmt.Errorf("invalid dkim RSA private key: %w", err)
 	}
+
 	return key, nil
 }

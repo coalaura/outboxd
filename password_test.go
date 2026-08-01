@@ -38,6 +38,7 @@ func TestReadPasswordNoNewline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got != "s3cret" {
 		t.Fatalf("got %q", got)
 	}
@@ -48,6 +49,7 @@ func TestReadPasswordNormalLF(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got != "s3cret" {
 		t.Fatalf("got %q", got)
 	}
@@ -58,6 +60,7 @@ func TestReadPasswordCRLF(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got != "s3cret" {
 		t.Fatalf("got %q", got)
 	}
@@ -70,6 +73,7 @@ func TestReadPasswordExactMax(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got != pw {
 		t.Fatal("max length not accepted")
 	}
@@ -82,6 +86,7 @@ func TestReadPasswordExactMaxLF(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got != pw {
 		t.Fatalf("got %q", got)
 	}
@@ -94,6 +99,7 @@ func TestReadPasswordExactMaxCRLF(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got != pw {
 		t.Fatalf("got %q", got)
 	}
@@ -121,6 +127,7 @@ func TestReadPasswordTrailingCRPreserved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got != "pass\r" {
 		t.Fatalf("got %q want password ending in CR", got)
 	}

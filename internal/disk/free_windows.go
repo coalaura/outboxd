@@ -31,9 +31,12 @@ func FreeBytes(path string) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("GetDiskFreeSpaceEx %s: %w", path, err)
 	}
+
 	const maxInt64 = 1<<63 - 1
+
 	if freeBytesAvailable > maxInt64 {
 		return maxInt64, nil
 	}
+
 	return int64(freeBytesAvailable), nil
 }
