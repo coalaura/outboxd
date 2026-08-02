@@ -238,6 +238,8 @@ func serve(configPath string) error {
 	spool, err := queue.Open(cfg.ResolvePath("queue"), queue.Limits{
 		MaxMessages:         cfg.Server.MaxQueueMessages,
 		MaxBytes:            cfg.Server.MaxQueueBytes,
+		MaxMessagesPerUser:  cfg.Server.MaxQueueMessagesPerUser,
+		MaxBytesPerUser:     cfg.Server.MaxQueueBytesPerUser,
 		MaxSpoolBytes:       cfg.Server.MaxSpoolBytes,
 		SpoolEmergencyBytes: cfg.Server.SpoolEmergencyBytes,
 		MinFreeDisk:         cfg.Server.MinFreeDiskBytes,

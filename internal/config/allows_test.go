@@ -10,7 +10,7 @@ type allowedSenderCase struct {
 	want bool
 }
 
-func TestUserAllowsCaseInsensitive(t *testing.T) {
+func TestUserAllowsExactLocalPart(t *testing.T) {
 	u := User{
 		Username:       "alice",
 		AllowedSenders: []string{"User.Name@example.com", "*@lists.example.com"},
@@ -18,8 +18,8 @@ func TestUserAllowsCaseInsensitive(t *testing.T) {
 
 	tests := []allowedSenderCase{
 		{"User.Name@Example.com", true},
-		{"user.name@example.com", true},
-		{"USER.NAME@EXAMPLE.COM", true},
+		{"user.name@example.com", false},
+		{"USER.NAME@EXAMPLE.COM", false},
 		{"other@example.com", false},
 		{"any@lists.example.com", true},
 		{"Any@Lists.Example.COM", true},
@@ -34,6 +34,20 @@ func TestUserAllowsCaseInsensitive(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("Allows(%q)=%v want %v", tc.addr, got, tc.want)
 		}
+	}
+}
+
+func TestUserValidateAllowsCaseDistinctExactSenders(t *testing.T) {
+	u := User{
+		Username:       "alice",
+		PasswordHash:   "$argon2id$placeholder",
+		AllowedSenders: []string{"User@Example.COM", "user@example.com"},
+	}
+	if err := u.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if got := u.AllowedSenders; got[0] != "User@example.com" || got[1] != "user@example.com" {
+		t.Fatalf("normalized senders=%q", got)
 	}
 }
 

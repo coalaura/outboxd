@@ -61,14 +61,6 @@ const (
 
 	maxResponseLength = 256
 
-	// Account conservatively for ReadAll capacity growth, newline normalization
-	// up to twice the input size, prepared output, and the signed copy.
-	dataMemoryBudget = int64(512 << 20)
-	dataMemoryCopies = int64(8)
-	// Include bounded field/slice/map/string bookkeeping in addition to buffers.
-	dataParserOverhead = int64(1000 * 128)
-	dataMemoryOverhead = int64(1<<20) + dataParserOverhead
-	maxDataWorkers     = 8
 	defaultDataTimeout = 5 * time.Minute
 )
 
@@ -84,10 +76,12 @@ type Logger interface {
 
 // Server runs both submission listeners against a shared backend.
 type Server struct {
-	cfg    *config.Config
-	queue  *queue.Queue
-	signer *sign.Signer
-	log    Logger
+	cfg         *config.Config
+	queue       *queue.Queue
+	signer      *sign.Signer
+	log         Logger
+	queueAdd    func(context.Context, *queue.Envelope, []byte) error
+	signMessage func(context.Context, []byte) (string, error)
 
 	connLimit   *connectionLimiter
 	connections *connectionTracker
@@ -114,6 +108,8 @@ type Server struct {
 
 	// shutdownContext builds the context used for graceful Shutdown (tests may inject).
 	shutdownContext func(parent context.Context) (context.Context, context.CancelFunc)
+
+	authConnections sync.Map
 }
 
 // New builds the submission server.
@@ -147,6 +143,15 @@ func New(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signer, spool *q
 		hashing:     make(chan struct{}, authWorkers),
 		dataWork:    make(chan struct{}, dataWorkers),
 	}
+	srv.queueAdd = func(ctx context.Context, envelope *queue.Envelope, data []byte) error {
+		return srv.queue.AddContext(ctx, envelope, data)
+	}
+	srv.signMessage = func(ctx context.Context, data []byte) (string, error) {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		return srv.signer.Signature(data)
+	}
 
 	srv.starttls = srv.newSMTP(cfg, keeper)
 	srv.implicit = srv.newSMTP(cfg, keeper)
@@ -163,20 +168,20 @@ func dataWorkerCount(maxMessageBytes int64) int {
 		return 1
 	}
 
-	workers := int(dataMemoryBudget / perWorker)
+	workers := int(config.DataMemoryBudget / perWorker)
 	if workers < 1 {
 		return 1
 	}
 
-	return min(workers, maxDataWorkers)
+	return min(workers, config.MaxDataWorkers)
 }
 
 func dataWorkerMemory(maxMessageBytes int64) (int64, bool) {
-	if maxMessageBytes <= 0 || maxMessageBytes > (math.MaxInt64-dataMemoryOverhead)/dataMemoryCopies {
+	if maxMessageBytes <= 0 || maxMessageBytes > (math.MaxInt64-config.DataMemoryOverhead)/config.DataMemoryCopies {
 		return 0, false
 	}
 
-	return maxMessageBytes*dataMemoryCopies + dataMemoryOverhead, true
+	return maxMessageBytes*config.DataMemoryCopies + config.DataMemoryOverhead, true
 }
 
 func incrementLimit(limit int64) int64 {
@@ -328,6 +333,13 @@ func (s *Server) Run(ctx context.Context) error {
 		<-started
 		once.Do(func() {
 			close(shutdownStarted)
+			// Stop both accept paths before either server begins draining sessions.
+			if s.starttlsListener != nil {
+				_ = s.starttlsListener.Close()
+			}
+			if s.implicitListener != nil {
+				_ = s.implicitListener.Close()
+			}
 
 			if s.shutdownHook != nil {
 				s.shutdownHook()
@@ -362,14 +374,6 @@ func (s *Server) Run(ctx context.Context) error {
 
 			s.connections.closeAll()
 
-			// Ensure accept loops unblock even if Shutdown times out.
-			if s.starttlsListener != nil {
-				_ = s.starttlsListener.Close()
-			}
-
-			if s.implicitListener != nil {
-				_ = s.implicitListener.Close()
-			}
 		})
 	}
 
@@ -393,13 +397,15 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	if s.starttlsListener != nil {
-		ln := newTrackListener(newLimitListener(s.starttlsListener, s.connLimit), s.connections)
+		tracked := newTrackListener(newLimitListener(s.starttlsListener, s.connLimit), s.connections)
+		ln := newAuthDeadlineListener(tracked, s, config.Duration(s.cfg.Server.ReadTimeout))
 		serveOne("starttls", ln, s.starttls)
 	}
 
 	if s.implicitListener != nil {
 		tracked := newTrackListener(newLimitListener(s.implicitListener, s.connLimit), s.connections)
-		ln := tls.NewListener(tracked, s.implicit.TLSConfig)
+		bounded := newAuthDeadlineListener(tracked, s, config.Duration(s.cfg.Server.ReadTimeout))
+		ln := tls.NewListener(bounded, s.implicit.TLSConfig)
 		serveOne("implicit", ln, s.implicit)
 	}
 
@@ -432,7 +438,7 @@ func (l *startListener) Accept() (net.Conn, error) {
 }
 
 func (s *Server) session(c *smtp.Conn) (smtp.Session, error) {
-	return &session{server: s, conn: c}, nil
+	return &session{server: s, conn: c, authDeadline: s.authDeadline(c.Conn())}, nil
 }
 
 // acquireHashSlot admits hashing immediately. SMTP sessions have no cancellation

@@ -58,6 +58,9 @@ func AllocatedBytes(root string) (int64, error) {
 // Hooks provide a narrow fault-injection seam for tests. Production code
 // leaves them nil.
 type Hooks struct {
+	// BeforeRead is called before queue recovery opens a durable file.
+	BeforeRead func(path string) error
+
 	// BeforeRemoveAll is called immediately before recursively removing a path.
 	BeforeRemoveAll func(path string) error
 
@@ -81,6 +84,15 @@ type Hooks struct {
 
 	// BeforeRename is called just before rename.
 	BeforeRename func(oldpath, newpath string) error
+}
+
+// CheckRead runs the recovery read fault seam.
+func CheckRead(path string) error {
+	h := currentHooks()
+	if h.BeforeRead != nil {
+		return h.BeforeRead(path)
+	}
+	return nil
 }
 
 var (

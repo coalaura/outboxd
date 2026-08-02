@@ -25,6 +25,7 @@ const (
 	terminalEnhancedCode       = "5.4.7"
 	storageRetryDelay          = 30 * time.Second
 	defaultAdmissionRetryDelay = 30 * time.Second
+	generatedDSNOwner          = "\x00generated-dsn"
 )
 
 var (
@@ -81,6 +82,8 @@ var (
 	errTLSFailed           = errors.New("STARTTLS failed; refusing plaintext downgrade")
 	errNoUsableIP          = errors.New("no usable destination address")
 	errPrivateDestination  = errors.New("destination address is not publicly routable")
+	errAttemptTimeout      = errors.New("delivery attempt timeout exceeded")
+	errLifetime            = errors.New("maximum queue lifetime exceeded")
 )
 
 // outboundTLS is the effective TLS policy for one dial attempt, computed before connect.
@@ -128,15 +131,18 @@ type Deliverer struct {
 	// When nil, Go's system roots are used.
 	tlsRootCAs *x509.CertPool
 
-	// orderIPs optionally reorders resolved candidate addresses before dial attempts.
-	// Production defaults to a light shuffle. Tests may replace it for deterministic order.
+	// orderIPs rotates sorted candidates before truncation. Production shuffles;
+	// tests may replace it for deterministic ordering.
 	orderIPs func([]net.IP)
+	// orderMX rotates one sorted equal-preference group before truncation.
+	orderMX func([]*net.MX)
 
 	// active bounds concurrent attempt goroutines. Run admits the first pending
 	// domain before spawning, so these slots are never consumed by domain waiters.
 	active  chan struct{}
 	global  chan struct{}
 	domains *domainLimiter
+	users   *domainLimiter
 
 	command    time.Duration
 	submission time.Duration
@@ -144,7 +150,11 @@ type Deliverer struct {
 	initial    time.Duration
 	maximum    time.Duration
 	connTO     time.Duration
+	dnsTO      time.Duration
+	attemptTO  time.Duration
 	admission  time.Duration
+	maxMX      int
+	maxIP      int
 
 	allowlist map[string]struct{}
 
@@ -166,6 +176,28 @@ func New(cfg *config.Config, spool *queue.Queue, log Logger) *Deliverer {
 
 // NewWithSigner is New with an optional DKIM signer for failure DSNs.
 func NewWithSigner(cfg *config.Config, spool *queue.Queue, log Logger, signer Signer) *Deliverer {
+	defaults := config.Default().Delivery
+	userConcurrency := cfg.Delivery.UserConcurrency
+	if userConcurrency <= 0 {
+		userConcurrency = defaults.UserConcurrency
+	}
+	maxMX := cfg.Delivery.MaxMXCandidates
+	if maxMX <= 0 {
+		maxMX = defaults.MaxMXCandidates
+	}
+	maxIP := cfg.Delivery.MaxIPCandidatesPerMX
+	if maxIP <= 0 {
+		maxIP = defaults.MaxIPCandidatesPerMX
+	}
+	dnsTimeout := config.Duration(cfg.Delivery.DNSTimeout)
+	if dnsTimeout <= 0 {
+		dnsTimeout = config.Duration(defaults.DNSTimeout)
+	}
+	attemptTimeout := config.Duration(cfg.Delivery.AttemptTimeout)
+	if attemptTimeout <= 0 {
+		attemptTimeout = config.Duration(defaults.AttemptTimeout)
+	}
+
 	// Cap attempt workers above global MX concurrency while preventing unbounded
 	// goroutine growth.
 	attemptLimit := max(cfg.Delivery.GlobalConcurrency*4, 8)
@@ -179,6 +211,7 @@ func NewWithSigner(cfg *config.Config, spool *queue.Queue, log Logger, signer Si
 		resolver: netResolver{r: net.DefaultResolver},
 		dialer:   &net.Dialer{Timeout: config.Duration(cfg.Delivery.ConnectionTimeout)},
 		orderIPs: shuffleIPs,
+		orderMX:  shuffleMX,
 		next:     spool.Next,
 		reader: func(id string) (io.ReadCloser, error) {
 			return spool.Reader(id)
@@ -187,6 +220,7 @@ func NewWithSigner(cfg *config.Config, spool *queue.Queue, log Logger, signer Si
 		active:  make(chan struct{}, attemptLimit),
 		global:  make(chan struct{}, cfg.Delivery.GlobalConcurrency),
 		domains: newDomainLimiter(cfg.Delivery.DomainConcurrency),
+		users:   newDomainLimiter(userConcurrency),
 
 		command:    config.Duration(cfg.Delivery.CommandTimeout),
 		submission: config.Duration(cfg.Delivery.SubmissionTimeout),
@@ -194,7 +228,11 @@ func NewWithSigner(cfg *config.Config, spool *queue.Queue, log Logger, signer Si
 		initial:    config.Duration(cfg.Delivery.InitialRetryDelay),
 		maximum:    config.Duration(cfg.Delivery.MaximumRetryDelay),
 		connTO:     config.Duration(cfg.Delivery.ConnectionTimeout),
+		dnsTO:      dnsTimeout,
+		attemptTO:  attemptTimeout,
 		admission:  defaultAdmissionRetryDelay,
+		maxMX:      maxMX,
+		maxIP:      maxIP,
 
 		allowlist: make(map[string]struct{}),
 	}
@@ -273,8 +311,15 @@ func (d *Deliverer) Run(ctx context.Context) error {
 			return nil
 		}
 
+		admittedOwner := deliveryOwner(envelope)
+		if !d.users.tryAcquire(admittedOwner) {
+			d.queue.RequeueAfter(envelope, d.admission)
+			continue
+		}
+
 		admittedDomain := nextPendingDomain(envelope)
 		if !d.domains.tryAcquire(admittedDomain) {
+			d.users.release(admittedOwner)
 			// Admission is an in-memory scheduling decision, not a delivery attempt.
 			d.queue.RequeueAfter(envelope, d.admission)
 			continue
@@ -285,6 +330,7 @@ func (d *Deliverer) Run(ctx context.Context) error {
 		case d.active <- struct{}{}:
 		case <-ctx.Done():
 			d.domains.release(admittedDomain)
+			d.users.release(admittedOwner)
 			d.queue.Requeue(envelope)
 
 			ferr := d.fatalErr()
@@ -298,8 +344,21 @@ func (d *Deliverer) Run(ctx context.Context) error {
 		wg.Go(func() {
 			defer func() { <-d.active }()
 
-			err := d.attemptAdmitted(ctx, envelope, admittedDomain)
+			err := d.attemptAdmitted(ctx, envelope, admittedOwner, admittedDomain)
 			if err != nil {
+				if queue.IsCorruption(err) {
+					quarantineErr := d.queue.QuarantineCheckedOut(envelope, err)
+					if quarantineErr != nil {
+						d.log.Printf("failed to quarantine corrupt queue item %s; item blocked: %s\n", envelope.ID, quarantineErr)
+						if errors.Is(quarantineErr, queue.ErrIDConflict) {
+							d.setFatal(fmt.Errorf("quarantine %s after %w failed with ambiguous identity: %w", envelope.ID, err, quarantineErr))
+							cancel()
+						}
+					} else {
+						d.log.Printf("quarantined corrupt queue item %s: %s\n", envelope.ID, err)
+					}
+					return
+				}
 				if queue.IsStoragePressure(err) {
 					d.queue.RequeueAfter(envelope, storageRetryDelay)
 					d.log.Printf("storage pressure handling %s; retrying queue state in %s: %s\n", envelope.ID, storageRetryDelay, err)
@@ -324,6 +383,13 @@ func nextPendingDomain(envelope *queue.Envelope) string {
 	return ""
 }
 
+func deliveryOwner(envelope *queue.Envelope) string {
+	if envelope.DSNSourceID != "" {
+		return generatedDSNOwner
+	}
+	return envelope.Username
+}
+
 func (d *Deliverer) setFatal(err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -340,8 +406,18 @@ func (d *Deliverer) fatalErr() error {
 }
 
 func (d *Deliverer) attempt(ctx context.Context, envelope *queue.Envelope) error {
+	owner := deliveryOwner(envelope)
+	if !d.users.tryAcquire(owner) {
+		envelope.NextAttempt = time.Now().Add(d.admission)
+		if err := d.queue.Retry(envelope); err != nil {
+			return fmt.Errorf("reschedule %s for user capacity: %w", envelope.ID, err)
+		}
+		return nil
+	}
+
 	domain := nextPendingDomain(envelope)
 	if !d.domains.tryAcquire(domain) {
+		d.users.release(owner)
 		envelope.NextAttempt = time.Now().Add(d.admission)
 		d.log.Printf("rescheduling %s for domain capacity in %s\n", envelope.ID, d.admission)
 		if err := d.queue.Retry(envelope); err != nil {
@@ -350,10 +426,11 @@ func (d *Deliverer) attempt(ctx context.Context, envelope *queue.Envelope) error
 		return nil
 	}
 
-	return d.attemptAdmitted(ctx, envelope, domain)
+	return d.attemptAdmitted(ctx, envelope, owner, domain)
 }
 
-func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelope, admittedDomain string) error {
+func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelope, admittedOwner, admittedDomain string) error {
+	defer d.users.release(admittedOwner)
 	heldDomain := admittedDomain
 	defer func() {
 		if heldDomain != "" {
@@ -375,13 +452,17 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 		return nil
 	}
 
-	deadline := envelope.Created.Add(d.lifetime)
-	current, ok := ctx.Deadline()
-	if !ok || deadline.Before(current) {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithDeadline(ctx, deadline)
-		defer cancel()
+	parentCtx := ctx
+	lifetimeDeadline := envelope.Created.Add(d.lifetime)
+	deadline := lifetimeDeadline
+	deadlineCause := error(errLifetime)
+	attemptDeadline := time.Now().Add(d.attemptTO)
+	if attemptDeadline.Before(deadline) {
+		deadline = attemptDeadline
+		deadlineCause = errAttemptTimeout
 	}
+	ctx, cancel := context.WithDeadlineCause(ctx, deadline, deadlineCause)
+	defer cancel()
 
 	envelope.Attempts++
 	envelope.LastError = ""
@@ -425,6 +506,9 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 		err := d.domain(ctx, envelope, domain, indexes)
 		d.domains.release(domain)
 		heldDomain = ""
+		if queue.IsCorruption(err) {
+			return err
+		}
 
 		if ctx.Err() != nil {
 			for i, index := range indexes {
@@ -446,13 +530,20 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 			}
 		}
 	}
+	outcomeCause := context.Cause(ctx)
+	if outcomeCause == nil && !time.Now().Before(deadline) {
+		outcomeCause = deadlineCause
+	}
+	if errors.Is(outcomeCause, errAttemptTimeout) {
+		diagnostics = append(diagnostics, errAttemptTimeout.Error())
+	}
 
 	envelope.LastError = normalizeDiagnostic(strings.Join(diagnostics, "; "))
 
 	switch {
 	case envelope.Pending() == 0:
 		return d.complete(envelope)
-	case ctx.Err() != nil && time.Now().Before(deadline):
+	case parentCtx.Err() != nil:
 		envelope.Attempts--
 		envelope.NextAttempt = time.Now()
 		err = d.queue.Retry(envelope)
@@ -461,7 +552,7 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 		}
 
 		return nil
-	case ctx.Err() != nil:
+	case errors.Is(outcomeCause, errLifetime):
 		return d.expirePending(envelope)
 	case envelope.Attempts >= d.cfg.Delivery.MaxAttempts:
 
@@ -855,29 +946,15 @@ func (d *Deliverer) connect(ctx context.Context, host string, noExtensions bool)
 		return nil, errNoUsableIP
 	}
 
-	var (
-		last      error
-		sawPublic bool
-	)
+	var last error
 
 	for _, ip := range ips {
-		err = d.checkDestination(ip)
-		if err != nil {
-			last = err
-			continue
-		}
-
-		sawPublic = true
 		client, err := d.dialAndSession(ctx, host, ip, noExtensions)
 		if err == nil {
 			return client, nil
 		}
 
 		last = err
-	}
-
-	if !sawPublic && last != nil {
-		return nil, last
 	}
 
 	if last == nil {
@@ -889,13 +966,46 @@ func (d *Deliverer) connect(ctx context.Context, host string, noExtensions bool)
 
 func (d *Deliverer) lookupHostIPs(ctx context.Context, host string) ([]net.IP, error) {
 	network := d.lookupNetwork()
-	addrs, err := d.resolver.LookupNetIP(ctx, network, host)
+	lookupCtx, cancel := context.WithTimeout(ctx, d.dnsTO)
+	addrs, err := d.resolver.LookupNetIP(lookupCtx, network, host)
+	cancel()
 	if err != nil {
 		return nil, err
 	}
 
+	unique := make(map[netip.Addr]struct{}, len(addrs))
+	ordered := make([]netip.Addr, 0, len(addrs))
+	var disallowed error
+	for _, ip := range addrs {
+		if err := d.checkDestination(ip); err != nil {
+			disallowed = err
+			continue
+		}
+		addr, ok := netip.AddrFromSlice(ip)
+		if !ok {
+			continue
+		}
+		addr = addr.Unmap()
+		if _, exists := unique[addr]; exists {
+			continue
+		}
+		unique[addr] = struct{}{}
+		ordered = append(ordered, addr)
+	}
+	if len(ordered) == 0 && disallowed != nil {
+		return nil, disallowed
+	}
+	slices.SortFunc(ordered, func(a, b netip.Addr) int { return a.Compare(b) })
+	addrs = make([]net.IP, len(ordered))
+	for i, addr := range ordered {
+		addrs[i] = net.IP(addr.AsSlice())
+	}
+
 	if d.orderIPs != nil {
 		d.orderIPs(addrs)
+	}
+	if len(addrs) > d.maxIP {
+		addrs = addrs[:d.maxIP]
 	}
 
 	return addrs, nil
@@ -905,6 +1015,12 @@ func (d *Deliverer) lookupHostIPs(ctx context.Context, host string) ([]net.IP, e
 func shuffleIPs(addrs []net.IP) {
 	rand.Shuffle(len(addrs), func(i, j int) {
 		addrs[i], addrs[j] = addrs[j], addrs[i]
+	})
+}
+
+func shuffleMX(records []*net.MX) {
+	rand.Shuffle(len(records), func(i, j int) {
+		records[i], records[j] = records[j], records[i]
 	})
 }
 
@@ -1009,6 +1125,7 @@ var restrictedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("3fff::/20"),
 	netip.MustParsePrefix("5f00::/16"),
 	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fec0::/10"),
 	netip.MustParsePrefix("fe80::/10"),
 	netip.MustParsePrefix("ff00::/8"),
 }
@@ -1032,7 +1149,9 @@ func (d *Deliverer) dialAndSession(ctx context.Context, mxHost string, ip net.IP
 		dialer = &cp
 	}
 
-	conn, err := dialer.DialContext(ctx, network, addr)
+	dialCtx, cancel := context.WithTimeout(ctx, d.connTO)
+	conn, err := dialer.DialContext(dialCtx, network, addr)
+	cancel()
 	if err != nil {
 		return nil, err
 	}
@@ -1138,14 +1257,18 @@ func (d *Deliverer) bindFor(ip net.IP) (network string, local net.Addr) {
 }
 
 func (d *Deliverer) hosts(ctx context.Context, domain string) ([]string, error) {
-	records, err := d.resolver.LookupMX(ctx, domain)
+	lookupCtx, cancel := context.WithTimeout(ctx, d.dnsTO)
+	records, err := d.resolver.LookupMX(lookupCtx, domain)
+	cancel()
 	if err != nil {
 		dnsErr, ok := errors.AsType[*net.DNSError](err)
 		if !ok || !dnsErr.IsNotFound {
 			return nil, err
 		}
 
-		_, err = d.resolver.LookupNetIP(ctx, d.lookupNetwork(), domain)
+		lookupCtx, cancel = context.WithTimeout(ctx, d.dnsTO)
+		_, err = d.resolver.LookupNetIP(lookupCtx, d.lookupNetwork(), domain)
+		cancel()
 		if err != nil {
 			dnsErr, ok = errors.AsType[*net.DNSError](err)
 			if ok && dnsErr.IsNotFound {
@@ -1162,24 +1285,51 @@ func (d *Deliverer) hosts(ctx context.Context, domain string) ([]string, error) 
 		return []string{domain}, nil
 	}
 
-	if len(records) == 1 && records[0].Host == "." {
+	if len(records) == 1 && records[0] != nil && records[0].Host == "." {
 		return nil, errNullMX
 	}
 
-	// Shuffle equal preferences, then stable-sort by preference.
-	rand.Shuffle(len(records), func(i, j int) {
-		records[i], records[j] = records[j], records[i]
-	})
-	slices.SortStableFunc(records, func(a, b *net.MX) int {
-		return int(a.Pref) - int(b.Pref)
-	})
-
-	hosts := make([]string, 0, len(records))
-
+	valid := make([]*net.MX, 0, len(records))
 	for _, record := range records {
-		host := strings.TrimSuffix(record.Host, ".")
+		if record != nil {
+			valid = append(valid, record)
+		}
+	}
+
+	// Establish deterministic groups, then rotate only within equal preference.
+	// Processing groups in order keeps the lowest-preference occurrence of a
+	// duplicate host before the candidate cap is applied.
+	slices.SortFunc(valid, func(a, b *net.MX) int {
+		if a.Pref != b.Pref {
+			return int(a.Pref) - int(b.Pref)
+		}
+		return strings.Compare(strings.ToLower(a.Host), strings.ToLower(b.Host))
+	})
+	if d.orderMX != nil {
+		for start := 0; start < len(valid); {
+			end := start + 1
+			for end < len(valid) && valid[end].Pref == valid[start].Pref {
+				end++
+			}
+			d.orderMX(valid[start:end])
+			start = end
+		}
+	}
+
+	hosts := make([]string, 0, min(len(valid), d.maxMX))
+	seen := make(map[string]struct{}, len(valid))
+
+	for _, record := range valid {
+		host := strings.ToLower(strings.TrimSuffix(record.Host, "."))
 		if host != "" && host != "." {
+			if _, exists := seen[host]; exists {
+				continue
+			}
+			seen[host] = struct{}{}
 			hosts = append(hosts, host)
+			if len(hosts) == d.maxMX {
+				break
+			}
 		}
 	}
 

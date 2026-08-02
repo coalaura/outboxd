@@ -417,8 +417,8 @@ func TestAllowDataTerminatorReaderGuards(t *testing.T) {
 }
 
 func TestDataWorkerCountMemoryBound(t *testing.T) {
-	if dataMemoryCopies < 8 {
-		t.Fatalf("DATA memory factor=%d want at least 8", dataMemoryCopies)
+	if config.DataMemoryCopies < 8 {
+		t.Fatalf("DATA memory factor=%d want at least 8", config.DataMemoryCopies)
 	}
 
 	for _, tt := range []dataWorkerCountCase{
@@ -434,17 +434,17 @@ func TestDataWorkerCountMemoryBound(t *testing.T) {
 		})
 	}
 
-	for _, maxBytes := range []int64{1, 100 << 20, dataMemoryBudget, math.MaxInt64} {
+	for _, maxBytes := range []int64{1, config.MaxMessageBytes, config.DataMemoryBudget, math.MaxInt64} {
 
 		workers := dataWorkerCount(maxBytes)
-		if workers < 1 || workers > maxDataWorkers {
+		if workers < 1 || workers > config.MaxDataWorkers {
 			t.Fatalf("maxBytes=%d workers=%d", maxBytes, workers)
 		}
 
 		perWorker, ok := dataWorkerMemory(maxBytes)
-		if ok && perWorker <= dataMemoryBudget {
+		if ok && perWorker <= config.DataMemoryBudget {
 			workingSet := int64(workers) * perWorker
-			if workingSet > dataMemoryBudget {
+			if workingSet > config.DataMemoryBudget {
 				t.Fatalf("maxBytes=%d working set=%d exceeds budget", maxBytes, workingSet)
 			}
 		}

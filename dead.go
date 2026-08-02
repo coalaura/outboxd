@@ -64,9 +64,11 @@ func dead(configPath string, arguments []string) error {
 			return errors.New("usage: outboxd dead retry <id>")
 		}
 
-		spool, err := queue.Open(queueDir, queue.Limits{
+		spool, err := queue.OpenForMaintenance(queueDir, queue.Limits{
 			MaxMessages:         cfg.Server.MaxQueueMessages,
 			MaxBytes:            cfg.Server.MaxQueueBytes,
+			MaxMessagesPerUser:  cfg.Server.MaxQueueMessagesPerUser,
+			MaxBytesPerUser:     cfg.Server.MaxQueueBytesPerUser,
 			MaxSpoolBytes:       cfg.Server.MaxSpoolBytes,
 			SpoolEmergencyBytes: cfg.Server.SpoolEmergencyBytes,
 			MinFreeDisk:         cfg.Server.MinFreeDiskBytes,
@@ -152,9 +154,11 @@ func corrupt(configPath string, arguments []string) error {
 }
 
 func openAdministrativeSpool(queueDir string, cfg *config.Config) (*queue.Queue, error) {
-	spool, err := queue.Open(queueDir, queue.Limits{
+	spool, err := queue.OpenForMaintenance(queueDir, queue.Limits{
 		MaxMessages:         cfg.Server.MaxQueueMessages,
 		MaxBytes:            cfg.Server.MaxQueueBytes,
+		MaxMessagesPerUser:  cfg.Server.MaxQueueMessagesPerUser,
+		MaxBytesPerUser:     cfg.Server.MaxQueueBytesPerUser,
 		MaxSpoolBytes:       cfg.Server.MaxSpoolBytes,
 		SpoolEmergencyBytes: cfg.Server.SpoolEmergencyBytes,
 		MinFreeDisk:         cfg.Server.MinFreeDiskBytes,

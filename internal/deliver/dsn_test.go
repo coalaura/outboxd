@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -441,5 +442,64 @@ func TestCompletedDSNDoesNotRegenerateBeforeSourceTransition(t *testing.T) {
 
 	if q.Len() != 0 {
 		t.Fatalf("completed DSN was regenerated; Len=%d", q.Len())
+	}
+}
+
+func TestGeneratedDSNHasIndependentSchedulingOwner(t *testing.T) {
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	d := New(&config.Config{Server: config.Server{Hostname: "mail.test"}}, q, nopLog{})
+	now := time.Now()
+	source := &queue.Envelope{
+		ID: "dsn-fair-source", Username: "source-user", Sender: "alice@ex.com",
+		Recipients: []queue.Recipient{{
+			Address: "bob@ex.com", Domain: "ex.com", Status: queue.StatusFailed, Detail: "gone",
+		}},
+		Created: now, NextAttempt: now,
+	}
+	if err := q.Add(source, []byte("From: alice@ex.com\r\n\r\nbody\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	checkedOut, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ensureDSN(checkedOut); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Bury(checkedOut); err != nil {
+		t.Fatal(err)
+	}
+
+	backlogTime := now.Add(-time.Hour)
+	for i := range 100 {
+		envelope := &queue.Envelope{
+			ID: fmt.Sprintf("mailer-daemon-%03d", i), Username: "mailer-daemon", Sender: "sender@ex.com",
+			Recipients: []queue.Recipient{{Address: "r@ex.com", Domain: "ex.com", Status: queue.StatusPending}},
+			Created:    backlogTime, NextAttempt: backlogTime,
+		}
+		if err := q.Add(envelope, []byte("body\r\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	found := false
+	for range 2 {
+		envelope, err := q.Next(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if envelope.DSNSourceID != "" {
+			found = true
+			if envelope.Username != generatedDSNOwner || envelope.Username == "mailer-daemon" {
+				t.Fatalf("generated DSN owner=%q", envelope.Username)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("generated DSN did not receive an independent scheduling quantum")
 	}
 }

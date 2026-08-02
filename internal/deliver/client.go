@@ -43,14 +43,15 @@ type MailOpts struct {
 
 // Client is an outbound SMTP submission client built on net/textproto.
 type Client struct {
-	conn       net.Conn
-	text       *textproto.Conn
-	ext        map[string]string
-	tls        bool
-	command    time.Duration
-	submission time.Duration
-	bounded    *boundedResponseConn
-	stopWatch  context.CancelFunc
+	conn        net.Conn
+	text        *textproto.Conn
+	ext         map[string]string
+	tls         bool
+	command     time.Duration
+	submission  time.Duration
+	bounded     *boundedResponseConn
+	stopWatch   context.CancelFunc
+	ctxDeadline time.Time
 }
 
 // NewClient wraps an established connection after dial; call Greet next.
@@ -75,6 +76,7 @@ func NewClient(conn net.Conn, command, submission time.Duration) *Client {
 }
 
 func (c *Client) bindContext(ctx context.Context) {
+	c.ctxDeadline, _ = ctx.Deadline()
 	watch, stop := context.WithCancel(context.Background())
 	c.stopWatch = stop
 	conn := c.conn
@@ -87,9 +89,17 @@ func (c *Client) bindContext(ctx context.Context) {
 	}()
 }
 
+func (c *Client) setDeadline(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	if !c.ctxDeadline.IsZero() && c.ctxDeadline.Before(deadline) {
+		deadline = c.ctxDeadline
+	}
+	_ = c.conn.SetDeadline(deadline)
+}
+
 // Greet reads the server banner.
 func (c *Client) Greet() error {
-	c.conn.SetDeadline(time.Now().Add(c.command))
+	c.setDeadline(c.command)
 	defer c.conn.SetDeadline(time.Time{})
 
 	c.bounded.reset()
@@ -99,7 +109,7 @@ func (c *Client) Greet() error {
 
 // EHLO sends EHLO with the given hostname and records extensions.
 func (c *Client) EHLO(hostname string) error {
-	c.conn.SetDeadline(time.Now().Add(c.command))
+	c.setDeadline(c.command)
 	defer c.conn.SetDeadline(time.Time{})
 
 	id, err := c.text.Cmd("EHLO %s", hostname)
@@ -122,7 +132,7 @@ func (c *Client) EHLO(hostname string) error {
 
 // HELO sends the legacy greeting and clears ESMTP extensions.
 func (c *Client) HELO(hostname string) error {
-	c.conn.SetDeadline(time.Now().Add(c.command))
+	c.setDeadline(c.command)
 	defer c.conn.SetDeadline(time.Time{})
 
 	err := c.cmd(250, "HELO %s", hostname)
@@ -142,7 +152,7 @@ func (c *Client) Extension(name string) (bool, string) {
 
 // StartTLS upgrades the connection. ServerName on cfg provides SNI.
 func (c *Client) StartTLS(cfg *tls.Config) error {
-	c.conn.SetDeadline(time.Now().Add(c.command))
+	c.setDeadline(c.command)
 	defer c.conn.SetDeadline(time.Time{})
 
 	err := c.cmd(220, "STARTTLS")
@@ -171,7 +181,7 @@ func (c *Client) TLS() bool {
 
 // Mail issues MAIL FROM.
 func (c *Client) Mail(from string, opts MailOpts) error {
-	c.conn.SetDeadline(time.Now().Add(c.command))
+	c.setDeadline(c.command)
 	defer c.conn.SetDeadline(time.Time{})
 
 	var b strings.Builder
@@ -207,7 +217,7 @@ func (c *Client) Mail(from string, opts MailOpts) error {
 
 // Rcpt issues RCPT TO.
 func (c *Client) Rcpt(to string) error {
-	c.conn.SetDeadline(time.Now().Add(c.command))
+	c.setDeadline(c.command)
 	defer c.conn.SetDeadline(time.Time{})
 
 	// c.cmd(25, ...) accepts the 250 reply class (exact code may vary, e.g. 250/251).
@@ -216,7 +226,7 @@ func (c *Client) Rcpt(to string) error {
 
 // Data starts the DATA phase; Close on the writer finalizes and reads the reply.
 func (c *Client) Data() (*dataWriter, error) {
-	c.conn.SetDeadline(time.Now().Add(c.command))
+	c.setDeadline(c.command)
 
 	err := c.cmd(354, "DATA")
 	if err != nil {
@@ -224,13 +234,13 @@ func (c *Client) Data() (*dataWriter, error) {
 		return nil, err
 	}
 
-	c.conn.SetDeadline(time.Now().Add(c.submission))
+	c.setDeadline(c.submission)
 	return &dataWriter{client: c, w: c.text.DotWriter()}, nil
 }
 
 // Quit sends QUIT.
 func (c *Client) Quit() error {
-	c.conn.SetDeadline(time.Now().Add(c.command))
+	c.setDeadline(c.command)
 	defer c.conn.SetDeadline(time.Time{})
 	err := c.cmd(221, "QUIT")
 	c.Close()

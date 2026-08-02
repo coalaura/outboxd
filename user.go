@@ -13,6 +13,11 @@ import (
 	"github.com/coalaura/outboxd/internal/passwd"
 )
 
+const (
+	minPasswordBytes = 12
+	maxPasswordBytes = 1024
+)
+
 func user(configPath string, arguments []string) error {
 	if len(arguments) < 2 || arguments[0] != "add" {
 		return errors.New("usage: outboxd user add <username> [sender...]")
@@ -85,8 +90,6 @@ func password() (string, bool, error) {
 		return strings.ToLower(rand.Text()), true, nil
 	}
 
-	// maxPasswordBytes is the maximum accepted piped password length.
-	const maxPasswordBytes = 1024
 	supplied, err := readPassword(os.Stdin, maxPasswordBytes)
 	if err != nil {
 		return "", false, err
@@ -124,6 +127,9 @@ func readPassword(r io.Reader, maxBytes int) (string, error) {
 
 	if len(pass) == 0 {
 		return "", errors.New("empty password on stdin")
+	}
+	if len(pass) < minPasswordBytes {
+		return "", fmt.Errorf("password must be at least %d bytes", minPasswordBytes)
 	}
 
 	if len(pass) > maxBytes {

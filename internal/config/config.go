@@ -67,6 +67,8 @@ type Server struct {
 	AuthWorkers               int    `yaml:"auth_workers"`
 	MaxQueueMessages          int    `yaml:"max_queue_messages"`
 	MaxQueueBytes             int64  `yaml:"max_queue_bytes"`
+	MaxQueueMessagesPerUser   int    `yaml:"max_queue_messages_per_user"`
+	MaxQueueBytesPerUser      int64  `yaml:"max_queue_bytes_per_user"`
 	MaxSpoolBytes             int64  `yaml:"max_spool_bytes"`
 	SpoolEmergencyBytes       int64  `yaml:"spool_emergency_bytes"`
 	MinFreeDiskBytes          int64  `yaml:"min_free_disk_bytes"`
@@ -93,15 +95,20 @@ type Delivery struct {
 	TLSMode        string `yaml:"tls_mode"`
 	AllowPlaintext *bool  `yaml:"allow_plaintext,omitempty"`
 
-	MaxAttempts       int    `yaml:"max_attempts"`
-	MaximumLifetime   string `yaml:"maximum_lifetime"`
-	InitialRetryDelay string `yaml:"initial_retry_delay"`
-	MaximumRetryDelay string `yaml:"maximum_retry_delay"`
-	DomainConcurrency int    `yaml:"domain_concurrency"`
-	GlobalConcurrency int    `yaml:"global_concurrency"`
-	ConnectionTimeout string `yaml:"connection_timeout"`
-	CommandTimeout    string `yaml:"command_timeout"`
-	SubmissionTimeout string `yaml:"submission_timeout"`
+	MaxAttempts          int    `yaml:"max_attempts"`
+	MaximumLifetime      string `yaml:"maximum_lifetime"`
+	InitialRetryDelay    string `yaml:"initial_retry_delay"`
+	MaximumRetryDelay    string `yaml:"maximum_retry_delay"`
+	DomainConcurrency    int    `yaml:"domain_concurrency"`
+	GlobalConcurrency    int    `yaml:"global_concurrency"`
+	UserConcurrency      int    `yaml:"user_concurrency"`
+	DNSTimeout           string `yaml:"dns_timeout"`
+	AttemptTimeout       string `yaml:"attempt_timeout"`
+	MaxMXCandidates      int    `yaml:"max_mx_candidates"`
+	MaxIPCandidatesPerMX int    `yaml:"max_ip_candidates_per_mx"`
+	ConnectionTimeout    string `yaml:"connection_timeout"`
+	CommandTimeout       string `yaml:"command_timeout"`
+	SubmissionTimeout    string `yaml:"submission_timeout"`
 
 	RequireValidMXTLSCert bool `yaml:"require_valid_mx_tls_certificate"`
 
@@ -138,18 +145,25 @@ type durationEntry struct {
 
 const (
 	defaultConfigName    = "config.yml"
-	MaxMessageBytes      = int64(100 << 20)
+	DataMemoryBudget     = int64(512 << 20)
+	DataMemoryCopies     = int64(8)
+	DataMemoryOverhead   = int64(1<<20) + 1000*128
+	MaxDataWorkers       = 8
+	MaxMessageBytes      = (DataMemoryBudget - DataMemoryOverhead) / DataMemoryCopies
 	MaxRecipients        = 1000
 	MaxMessagesPerHour   = 1_000_000
 	MaxRecipientsPerHour = 10_000_000
 	MaxMessageBurst      = MaxMessagesPerHour
 	MaxRecipientBurst    = MaxRecipientsPerHour
-	MaxDeliveryAttempts  = 1000
-	MaxDomainConcurrency = 1024
-	MaxGlobalConcurrency = 4096
-	MaxConnections       = 100000
-	MaxConnectionsPerIP  = 10000
-	MaxAuthWorkers       = 16
+	MaxDeliveryAttempts  = 100
+	MaxDomainConcurrency = 64
+	MaxGlobalConcurrency = 256
+	MaxUserConcurrency   = 64
+	MaxMXCandidates      = 100
+	MaxIPCandidatesPerMX = 64
+	MaxConnections       = 3840
+	MaxConnectionsPerIP  = 256
+	MaxAuthWorkers       = 8
 	SPFDNSLookupLimit    = 10
 
 	MaxSMTPReadTimeout           = 30 * time.Minute
@@ -159,6 +173,8 @@ const (
 	MaxDeliveryLifetime          = 30 * 24 * time.Hour
 	MaxInitialRetryDelay         = 24 * time.Hour
 	MaxRetryDelay                = 7 * 24 * time.Hour
+	MaxDeliveryDNSTimeout        = 2 * time.Minute
+	MaxDeliveryAttemptTimeout    = time.Hour
 	MaxDeliveryConnectionTimeout = 2 * time.Minute
 	MaxDeliveryCommandTimeout    = 10 * time.Minute
 	MaxDeliverySubmissionTimeout = 30 * time.Minute
@@ -173,27 +189,29 @@ func Default() *Config {
 
 	return &Config{
 		Server: Server{
-			Hostname:             "mail.example.invalid",
-			Domain:               "example.invalid",
-			MaxMessageBytes:      25 << 20,
-			MaxRecipients:        100,
-			MaxMessagesPerHour:   1000,
-			MaxRecipientsPerHour: 10000,
-			ReadTimeout:          "5m",
-			WriteTimeout:         "5m",
-			DataDirectory:        "./data",
-			SubmissionAddr:       ":587",
-			ImplicitTLSAddr:      ":465",
-			MaxConnections:       256,
-			MaxConnectionsPerIP:  16,
-			AuthWorkers:          4,
-			MaxQueueMessages:     10000,
-			MaxQueueBytes:        10 << 30,
-			MaxSpoolBytes:        16 << 30,
-			SpoolEmergencyBytes:  512 << 20,
-			MinFreeDiskBytes:     1 << 30,
-			DeadRetention:        "720h",
-			CorruptRetention:     "336h",
+			Hostname:                "mail.example.invalid",
+			Domain:                  "example.invalid",
+			MaxMessageBytes:         25 << 20,
+			MaxRecipients:           100,
+			MaxMessagesPerHour:      1000,
+			MaxRecipientsPerHour:    10000,
+			ReadTimeout:             "5m",
+			WriteTimeout:            "5m",
+			DataDirectory:           "./data",
+			SubmissionAddr:          ":587",
+			ImplicitTLSAddr:         ":465",
+			MaxConnections:          256,
+			MaxConnectionsPerIP:     16,
+			AuthWorkers:             4,
+			MaxQueueMessages:        10000,
+			MaxQueueBytes:           10 << 30,
+			MaxQueueMessagesPerUser: 1000,
+			MaxQueueBytesPerUser:    1 << 30,
+			MaxSpoolBytes:           16 << 30,
+			SpoolEmergencyBytes:     512 << 20,
+			MinFreeDiskBytes:        1 << 30,
+			DeadRetention:           "720h",
+			CorruptRetention:        "336h",
 		},
 		TLS: TLS{
 			Mode:            "self_signed",
@@ -227,6 +245,11 @@ func Default() *Config {
 			MaximumRetryDelay:     "8h",
 			DomainConcurrency:     2,
 			GlobalConcurrency:     16,
+			UserConcurrency:       2,
+			DNSTimeout:            "30s",
+			AttemptTimeout:        "30m",
+			MaxMXCandidates:       10,
+			MaxIPCandidatesPerMX:  8,
 			ConnectionTimeout:     "30s",
 			CommandTimeout:        "5m",
 			SubmissionTimeout:     "12m",
@@ -651,10 +674,9 @@ func (cfg *Config) Validate() error {
 		return errors.New("auth worker limit is invalid or exceeds supported bounds")
 	}
 
-	if cfg.Server.MaxQueueMessages < 0 || cfg.Server.MaxQueueBytes < 0 || cfg.Server.MinFreeDiskBytes < 0 {
+	if cfg.Server.MaxQueueMessages < 0 || cfg.Server.MaxQueueBytes < 0 || cfg.Server.MaxQueueMessagesPerUser < 0 || cfg.Server.MaxQueueBytesPerUser < 0 || cfg.Server.MinFreeDiskBytes < 0 {
 		return errors.New("queue caps and minimum free disk must not be negative")
 	}
-
 	if cfg.Server.MaxSpoolBytes <= 0 {
 		return errors.New("server.max_spool_bytes must be positive")
 	}
@@ -671,6 +693,8 @@ func (cfg *Config) Validate() error {
 		{"delivery.maximum_lifetime", cfg.Delivery.MaximumLifetime, MaxDeliveryLifetime},
 		{"delivery.initial_retry_delay", cfg.Delivery.InitialRetryDelay, MaxInitialRetryDelay},
 		{"delivery.maximum_retry_delay", cfg.Delivery.MaximumRetryDelay, MaxRetryDelay},
+		{"delivery.dns_timeout", cfg.Delivery.DNSTimeout, MaxDeliveryDNSTimeout},
+		{"delivery.attempt_timeout", cfg.Delivery.AttemptTimeout, MaxDeliveryAttemptTimeout},
 		{"delivery.connection_timeout", cfg.Delivery.ConnectionTimeout, MaxDeliveryConnectionTimeout},
 		{"delivery.command_timeout", cfg.Delivery.CommandTimeout, MaxDeliveryCommandTimeout},
 		{"delivery.submission_timeout", cfg.Delivery.SubmissionTimeout, MaxDeliverySubmissionTimeout},
@@ -698,6 +722,8 @@ func (cfg *Config) Validate() error {
 	connection := Duration(cfg.Delivery.ConnectionTimeout)
 	command := Duration(cfg.Delivery.CommandTimeout)
 	submission := Duration(cfg.Delivery.SubmissionTimeout)
+	dnsTimeout := Duration(cfg.Delivery.DNSTimeout)
+	attemptTimeout := Duration(cfg.Delivery.AttemptTimeout)
 
 	if connection > command {
 		return errors.New("delivery.connection_timeout must be <= command_timeout")
@@ -709,6 +735,9 @@ func (cfg *Config) Validate() error {
 
 	if connection > lifetime || command > lifetime || submission > lifetime {
 		return errors.New("delivery connection, command, and submission timeouts must be <= maximum_lifetime")
+	}
+	if dnsTimeout > attemptTimeout || submission > attemptTimeout {
+		return errors.New("delivery dns and SMTP timeouts must be <= attempt_timeout")
 	}
 
 	switch cfg.TLS.Mode {
@@ -791,8 +820,11 @@ func (cfg *Config) Validate() error {
 		return fmt.Errorf("delivery.max_attempts must be between 1 and %d", MaxDeliveryAttempts)
 	}
 
-	if cfg.Delivery.DomainConcurrency <= 0 || cfg.Delivery.DomainConcurrency > MaxDomainConcurrency || cfg.Delivery.GlobalConcurrency <= 0 || cfg.Delivery.GlobalConcurrency > MaxGlobalConcurrency || cfg.Delivery.DomainConcurrency > cfg.Delivery.GlobalConcurrency {
+	if cfg.Delivery.DomainConcurrency <= 0 || cfg.Delivery.DomainConcurrency > MaxDomainConcurrency || cfg.Delivery.GlobalConcurrency <= 0 || cfg.Delivery.GlobalConcurrency > MaxGlobalConcurrency || cfg.Delivery.UserConcurrency <= 0 || cfg.Delivery.UserConcurrency > MaxUserConcurrency || cfg.Delivery.DomainConcurrency > cfg.Delivery.GlobalConcurrency {
 		return errors.New("delivery concurrency limits are invalid or exceed supported bounds")
+	}
+	if cfg.Delivery.MaxMXCandidates <= 0 || cfg.Delivery.MaxMXCandidates > MaxMXCandidates || cfg.Delivery.MaxIPCandidatesPerMX <= 0 || cfg.Delivery.MaxIPCandidatesPerMX > MaxIPCandidatesPerMX {
+		return errors.New("delivery candidate limits are invalid or exceed supported bounds")
 	}
 
 	if cfg.Delivery.BindIPv4 != "" {
@@ -962,7 +994,8 @@ func (u *User) Validate() error {
 			return fmt.Errorf("user %q has invalid sender %q", u.Username, sender)
 		}
 
-		canonicalSender := strings.ToLower(address)
+		at := strings.LastIndexByte(address, '@')
+		canonicalSender := address[:at] + "@" + strings.ToLower(address[at+1:])
 		_, exists := senders[canonicalSender]
 		if exists {
 			return fmt.Errorf("user %q has duplicate sender %q", u.Username, sender)
@@ -970,8 +1003,8 @@ func (u *User) Validate() error {
 
 		senders[canonicalSender] = struct{}{}
 
-		// Preserve local-part case for policy storage / comparisons via Allows.
-		u.AllowedSenders[i] = address
+		// Preserve local-part case while normalizing the case-insensitive domain.
+		u.AllowedSenders[i] = canonicalSender
 	}
 
 	return nil
@@ -1140,7 +1173,7 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.server":                               {yaml.HeadComment(" SMTP submission server (send-only; no inbound MX)")},
 		"$.server.hostname":                      {yaml.HeadComment(" public SMTP hostname used for EHLO, TLS, and reverse DNS")},
 		"$.server.domain":                        {yaml.HeadComment(" sending domain used for DKIM, SPF, and DMARC; prefer a dedicated subdomain")},
-		"$.server.max_message_bytes":             {yaml.HeadComment(" maximum accepted message size in bytes")},
+		"$.server.max_message_bytes":             {yaml.HeadComment(" maximum accepted message size in bytes (bounded so one DATA worker fits the 512 MiB processing budget)")},
 		"$.server.max_recipients":                {yaml.HeadComment(" maximum recipients accepted for one message")},
 		"$.server.max_messages_per_hour":         {yaml.HeadComment(" per-user hourly message rate (maximum 1000000)")},
 		"$.server.max_recipients_per_hour":       {yaml.HeadComment(" per-user hourly recipient rate (maximum 10000000)")},
@@ -1148,11 +1181,13 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.server.recipient_burst":               {yaml.HeadComment(" token-bucket burst for recipients (0 = hourly/60; otherwise no greater than hourly rate)")},
 		"$.server.submission_addr":               {yaml.HeadComment(` STARTTLS submission listen address; default ":587"; empty disables`)},
 		"$.server.implicit_tls_addr":             {yaml.HeadComment(` implicit TLS submission listen address; default ":465"; empty disables`)},
-		"$.server.max_connections":               {yaml.HeadComment(" global concurrent submission connections")},
-		"$.server.max_connections_per_ip":        {yaml.HeadComment(" per-IP concurrent submission connections")},
-		"$.server.auth_workers":                  {yaml.HeadComment(" concurrent Argon2id authentications (19 MiB each; maximum 16)")},
+		"$.server.max_connections":               {yaml.HeadComment(" global concurrent submission connections (maximum 3840; leaves room for bounded DATA, auth, and delivery workers)")},
+		"$.server.max_connections_per_ip":        {yaml.HeadComment(" per-IP concurrent submission connections (maximum 256 and no greater than global)")},
+		"$.server.auth_workers":                  {yaml.HeadComment(" concurrent Argon2id authentications (19 MiB each; maximum 8)")},
 		"$.server.max_queue_messages":            {yaml.HeadComment(" maximum ready queue message count (0 = unlimited)")},
 		"$.server.max_queue_bytes":               {yaml.HeadComment(" logical quota for ready message bodies only (0 = unlimited)")},
+		"$.server.max_queue_messages_per_user":   {yaml.HeadComment(" per-user ready queue message cap (0 = unlimited; generated DSNs are exempt)")},
+		"$.server.max_queue_bytes_per_user":      {yaml.HeadComment(" per-user ready message-body quota (0 = unlimited; generated DSNs are exempt)")},
 		"$.server.max_spool_bytes":               {yaml.HeadComment(" conservative admission estimate across ready, tmp, dsn, dead, corrupt, and trash; use a dedicated quota-controlled volume for a hard limit")},
 		"$.server.spool_emergency_bytes":         {yaml.HeadComment(" estimated spool headroom reserved from submissions for DSNs and state transitions")},
 		"$.server.min_free_disk_bytes":           {yaml.HeadComment(" refuse submissions when free disk is below this threshold")},
@@ -1186,6 +1221,11 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.delivery.maximum_retry_delay":              {yaml.HeadComment(" upper bound for exponential retry delays (maximum 7d and no greater than lifetime)")},
 		"$.delivery.domain_concurrency":               {yaml.HeadComment(" maximum simultaneous deliveries to one recipient domain")},
 		"$.delivery.global_concurrency":               {yaml.HeadComment(" maximum simultaneous outbound deliveries")},
+		"$.delivery.user_concurrency":                 {yaml.HeadComment(" maximum active deliveries owned by one SMTP user; generated DSNs use an isolated internal owner")},
+		"$.delivery.dns_timeout":                      {yaml.HeadComment(" timeout for each outbound DNS lookup (maximum 2m and no greater than attempt_timeout)")},
+		"$.delivery.attempt_timeout":                  {yaml.HeadComment(" aggregate deadline for one queue delivery attempt across domains, DNS, candidates, and SMTP (maximum 1h)")},
+		"$.delivery.max_mx_candidates":                {yaml.HeadComment(" maximum sorted unique MX hosts tried per recipient domain (maximum 100)")},
+		"$.delivery.max_ip_candidates_per_mx":         {yaml.HeadComment(" maximum sorted unique addresses tried per MX host (maximum 64)")},
 		"$.delivery.connection_timeout":               {yaml.HeadComment(" timeout while dialing a destination MX (maximum 2m; no greater than command_timeout)")},
 		"$.delivery.command_timeout":                  {yaml.HeadComment(" timeout while waiting for normal SMTP responses (maximum 10m)")},
 		"$.delivery.submission_timeout":               {yaml.HeadComment(" timeout while waiting for the response after message data (maximum 30m; at least command_timeout)")},

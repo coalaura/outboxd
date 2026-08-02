@@ -34,34 +34,34 @@ func TestReadPasswordCRLFOnly(t *testing.T) {
 }
 
 func TestReadPasswordNoNewline(t *testing.T) {
-	got, err := readPassword(strings.NewReader("s3cret"), 1024)
+	got, err := readPassword(strings.NewReader("s3cret-secure"), 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if got != "s3cret" {
+	if got != "s3cret-secure" {
 		t.Fatalf("got %q", got)
 	}
 }
 
 func TestReadPasswordNormalLF(t *testing.T) {
-	got, err := readPassword(strings.NewReader("s3cret\n"), 1024)
+	got, err := readPassword(strings.NewReader("s3cret-secure\n"), 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if got != "s3cret" {
+	if got != "s3cret-secure" {
 		t.Fatalf("got %q", got)
 	}
 }
 
 func TestReadPasswordCRLF(t *testing.T) {
-	got, err := readPassword(strings.NewReader("s3cret\r\n"), 1024)
+	got, err := readPassword(strings.NewReader("s3cret-secure\r\n"), 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if got != "s3cret" {
+	if got != "s3cret-secure" {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -115,7 +115,7 @@ func TestReadPasswordMaxPlusOne(t *testing.T) {
 }
 
 func TestReadPasswordAdditionalLine(t *testing.T) {
-	_, err := readPassword(strings.NewReader("s3cret\nextra\n"), 1024)
+	_, err := readPassword(strings.NewReader("s3cret-secure\nextra\n"), 1024)
 	if err == nil {
 		t.Fatal("expected reject")
 	}
@@ -123,13 +123,22 @@ func TestReadPasswordAdditionalLine(t *testing.T) {
 
 func TestReadPasswordTrailingCRPreserved(t *testing.T) {
 	// Final intended character is \r (no LF): must not be stripped.
-	got, err := readPassword(strings.NewReader("pass\r"), 1024)
+	got, err := readPassword(strings.NewReader("long-password\r"), 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if got != "pass\r" {
+	if got != "long-password\r" {
 		t.Fatalf("got %q want password ending in CR", got)
+	}
+}
+
+func TestReadPasswordMinimum(t *testing.T) {
+	if _, err := readPassword(strings.NewReader(strings.Repeat("x", minPasswordBytes-1)), 1024); err == nil || !strings.Contains(err.Error(), "at least") {
+		t.Fatalf("short password err=%v", err)
+	}
+	if _, err := readPassword(strings.NewReader(strings.Repeat("x", minPasswordBytes)), 1024); err != nil {
+		t.Fatalf("minimum password rejected: %v", err)
 	}
 }
 

@@ -74,7 +74,7 @@ func (d *Deliverer) ensureDSN(envelope *queue.Envelope) error {
 	now := time.Now()
 	dsnEnv := &queue.Envelope{
 		ID:       dsnID,
-		Username: "mailer-daemon",
+		Username: generatedDSNOwner,
 		Sender:   "",
 		Recipients: []queue.Recipient{{
 			Address: envelope.Sender,

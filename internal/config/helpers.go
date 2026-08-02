@@ -15,9 +15,9 @@ func (cfg *Config) MinimumTLSVersion() uint16 {
 	return tls.VersionTLS12
 }
 
-// Allows reports whether the user may send as the given address.
-// Comparison is case-insensitive for both local-part and domain; the address
-// placed on the SMTP wire is not modified by this check.
+// Allows reports whether the user may send as the given address. Exact entries
+// compare local-parts byte-for-byte and domains case-insensitively. Wildcards
+// authorize every local-part in their domain.
 func (u User) Allows(address string) bool {
 	address = strings.TrimSpace(address)
 
@@ -26,15 +26,16 @@ func (u User) Allows(address string) bool {
 		return false
 	}
 
-	domain := strings.ToLower(address[at+1:])
-	canon := strings.ToLower(address)
+	local := address[:at]
+	domain := address[at+1:]
 
 	for _, sender := range u.AllowedSenders {
-		if strings.EqualFold(sender, address) || strings.ToLower(sender) == canon {
+		if strings.HasPrefix(sender, "*@") && strings.EqualFold(sender[2:], domain) {
 			return true
 		}
 
-		if strings.HasPrefix(sender, "*@") && strings.EqualFold(sender[2:], domain) {
+		senderAt := strings.LastIndexByte(sender, '@')
+		if senderAt > 0 && sender[:senderAt] == local && strings.EqualFold(sender[senderAt+1:], domain) {
 			return true
 		}
 	}

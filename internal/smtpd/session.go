@@ -2,12 +2,14 @@ package smtpd
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -24,11 +26,18 @@ type session struct {
 	server *Server
 	conn   *smtp.Conn
 
-	user       config.User
-	sender     string
-	recipients []string
-	smtpUTF8   bool
-	body       smtp.BodyType
+	user         config.User
+	sender       string
+	recipients   []string
+	smtpUTF8     bool
+	body         smtp.BodyType
+	authDeadline *authDeadlineConn
+
+	dataDeadlineMu     sync.Mutex
+	dataDeadlineCtx    context.Context
+	dataDeadlineCancel context.CancelFunc
+	dataDeadlineStop   func() bool
+	dataDeadlineDone   chan struct{}
 }
 
 func (s *session) AuthMechanisms() []string {
@@ -160,9 +169,21 @@ func (s *session) Rcpt(to string, opts *smtp.RcptOptions) error {
 func (s *session) Data(r io.Reader) error {
 	// go-smtp starts Data on the first BDAT chunk. Its per-command deadline can
 	// be renewed by later commands, so independently bound the whole Data call.
+	ctx, cancel := context.WithTimeout(context.Background(), s.server.dataTimeout())
 	conn := s.conn.Conn()
-	timer := time.AfterFunc(s.server.dataTimeout(), func() { _ = conn.Close() })
-	defer timer.Stop()
+	closed := make(chan struct{})
+	// Reset clears this callback only after go-smtp writes the final DATA/BDAT
+	// response, so response delivery remains bounded by the same deadline.
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+		close(closed)
+	})
+	s.dataDeadlineMu.Lock()
+	s.dataDeadlineCtx = ctx
+	s.dataDeadlineCancel = cancel
+	s.dataDeadlineStop = stop
+	s.dataDeadlineDone = closed
+	s.dataDeadlineMu.Unlock()
 
 	if s.sender == "" || len(s.recipients) == 0 {
 		return &smtp.SMTPError{
@@ -202,7 +223,7 @@ func (s *session) Data(r io.Reader) error {
 		body = io.LimitReader(r, incrementLimit(maxBytes))
 	}
 
-	prepared, err := message.Prepare(body, message.Options{
+	prepared, err := message.PrepareContext(ctx, body, message.Options{
 		Hostname: s.server.cfg.Server.Hostname,
 		Helo:     s.conn.Hostname(),
 		Remote:   remoteAddress,
@@ -211,6 +232,10 @@ func (s *session) Data(r io.Reader) error {
 	})
 
 	if err != nil {
+		if ctx.Err() != nil {
+			s.waitDataDeadlineClose()
+			return errTemporaryFailure
+		}
 		if errors.Is(err, message.ErrOversized) || errors.Is(err, smtp.ErrDataTooLarge) {
 			return &smtp.SMTPError{
 				Code:         552,
@@ -262,8 +287,15 @@ func (s *session) Data(r io.Reader) error {
 		}
 	}
 
-	signature, err := s.server.signer.Signature(prepared.Data)
+	if err := ctx.Err(); err != nil {
+		s.waitDataDeadlineClose()
+		return errTemporaryFailure
+	}
+	signature, err := s.server.signMessage(ctx, prepared.Data)
 	if err != nil {
+		if ctx.Err() != nil {
+			s.waitDataDeadlineClose()
+		}
 		s.server.log.Printf("dkim signing failed: %v\n", err)
 
 		return errTemporaryFailure
@@ -308,20 +340,64 @@ func (s *session) Data(r io.Reader) error {
 		})
 	}
 
-	err = s.server.queue.Add(envelope, data)
-	if err != nil {
-		s.server.log.Printf("failed to queue message: %v\n", err)
-
-		if errors.Is(err, queue.ErrQueueFull) || errors.Is(err, queue.ErrInsufficientDisk) {
-			return errQueueFull
-		}
-
+	if err := ctx.Err(); err != nil {
+		s.waitDataDeadlineClose()
 		return errTemporaryFailure
 	}
+	err = s.server.queueAdd(ctx, envelope, data)
+	if err == nil {
+		if ctx.Err() != nil {
+			s.waitDataDeadlineClose()
+		}
+		s.server.log.Printf("queued %s from %s for %d recipient(s)\n", envelope.ID, s.sender, len(envelope.Recipients))
+		return nil
+	}
+	if ctx.Err() != nil {
+		s.waitDataDeadlineClose()
+	}
+	s.server.log.Printf("failed to queue message: %v\n", err)
 
-	s.server.log.Printf("queued %s from %s for %d recipient(s)\n", envelope.ID, s.sender, len(envelope.Recipients))
+	if errors.Is(err, queue.ErrQueueFull) || errors.Is(err, queue.ErrInsufficientDisk) {
+		return errQueueFull
+	}
 
-	return nil
+	return errTemporaryFailure
+}
+
+func (s *session) waitDataDeadlineClose() {
+	s.dataDeadlineMu.Lock()
+	done := s.dataDeadlineDone
+	s.dataDeadlineMu.Unlock()
+	if done != nil {
+		<-done
+	}
+}
+
+// clearDataDeadline is called by go-smtp after its final response (or on
+// logout), not when Data returns.
+func (s *session) clearDataDeadline() {
+	s.dataDeadlineMu.Lock()
+	ctx := s.dataDeadlineCtx
+	cancel := s.dataDeadlineCancel
+	stop := s.dataDeadlineStop
+	done := s.dataDeadlineDone
+	s.dataDeadlineCtx = nil
+	s.dataDeadlineCancel = nil
+	s.dataDeadlineStop = nil
+	s.dataDeadlineDone = nil
+	s.dataDeadlineMu.Unlock()
+	if stop == nil {
+		return
+	}
+
+	expired := ctx.Err() != nil
+	if !stop() {
+		<-done
+	} else if expired || ctx.Err() != nil {
+		// Do not let response cleanup suppress a deadline that raced with Stop.
+		_ = s.conn.Conn().Close()
+	}
+	cancel()
 }
 
 // go-smtp v0.24.0 counts only emitted message bytes, then needs one further
@@ -385,6 +461,7 @@ func (s *session) abortData(err error) error {
 }
 
 func (s *session) Reset() {
+	s.clearDataDeadline()
 	s.sender = ""
 	s.recipients = s.recipients[:0]
 	s.smtpUTF8 = false
@@ -392,6 +469,7 @@ func (s *session) Reset() {
 }
 
 func (s *session) Logout() error {
+	s.clearDataDeadline()
 	return nil
 }
 
@@ -432,6 +510,10 @@ func (s *session) authenticate(username, password string) error {
 
 	s.server.authLimit.succeeded(ip, username)
 	s.user = user
+	if s.authDeadline != nil {
+		s.authDeadline.clear()
+	}
+	s.server.log.Printf("authenticated user %q from %q\n", user.Username, ip)
 
 	return nil
 }

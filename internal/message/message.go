@@ -2,6 +2,7 @@ package message
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -86,13 +87,19 @@ func (f field) text() string {
 // Prepare normalizes a submitted message and adds the headers a receiving MTA
 // expects to see.
 func Prepare(r io.Reader, opts Options) (*Message, error) {
+	return PrepareContext(context.Background(), r, opts)
+}
+
+// PrepareContext is Prepare with cancellation propagated through input and
+// CPU-bound normalization/parsing stages.
+func PrepareContext(ctx context.Context, r io.Reader, opts Options) (*Message, error) {
 	var (
 		raw []byte
 		err error
 	)
 
 	if opts.MaxBytes > 0 {
-		raw, err = io.ReadAll(io.LimitReader(r, opts.MaxBytes+1))
+		raw, err = io.ReadAll(io.LimitReader(contextReader{ctx: ctx, reader: r}, opts.MaxBytes+1))
 		if err != nil {
 			return nil, err
 		}
@@ -101,7 +108,7 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 			return nil, errOversized
 		}
 	} else {
-		raw, err = io.ReadAll(r)
+		raw, err = io.ReadAll(contextReader{ctx: ctx, reader: r})
 		if err != nil {
 			return nil, err
 		}
@@ -110,8 +117,11 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 	if len(raw) == 0 {
 		return nil, errEmpty
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
-	data, err := normalize(raw)
+	data, err := normalize(ctx, raw)
 	if err != nil {
 		return nil, err
 	}
@@ -121,14 +131,20 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 		return nil, errHeaderSize
 	}
 
-	fields, err := scan(header)
+	fields, err := scan(ctx, header)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
 	present := make(map[string]int, len(fields))
 
 	for _, field := range fields {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		present[field.name]++
 	}
 
@@ -297,6 +313,18 @@ func Prepare(r io.Reader, opts Options) (*Message, error) {
 	}, nil
 }
 
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
+}
+
 func firstField(fields []field, name string) (field, bool) {
 	for _, f := range fields {
 		if f.name == name {
@@ -392,7 +420,7 @@ func fieldHasHighBit(value []byte) bool {
 	return false
 }
 
-func normalize(raw []byte) ([]byte, error) {
+func normalize(ctx context.Context, raw []byte) ([]byte, error) {
 	if bytes.IndexByte(raw, 0) >= 0 {
 		return nil, errBinary
 	}
@@ -402,6 +430,11 @@ func normalize(raw []byte) ([]byte, error) {
 	length := 0
 
 	for i := 0; i < len(raw); i++ {
+		if i&4095 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		switch raw[i] {
 		case '\r':
 			if i+1 < len(raw) && raw[i+1] == '\n' {
@@ -440,13 +473,16 @@ func split(data []byte) (header, body []byte) {
 	return data[:separator+2], data[separator+4:]
 }
 
-func scan(header []byte) ([]field, error) {
+func scan(ctx context.Context, header []byte) ([]field, error) {
 	var (
 		fields []field
 		start  int
 	)
 
 	for offset := 0; offset < len(header); {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		end := bytes.Index(header[offset:], crlf)
 		if end < 0 {
 			return nil, errMalformed

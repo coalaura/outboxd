@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +27,19 @@ type enhancedCodeCase struct {
 }
 
 type domainErrorResolver struct{}
+
+type resolverFuncs struct {
+	mx  func(context.Context, string) ([]*net.MX, error)
+	ips func(context.Context, string, string) ([]net.IP, error)
+}
+
+func (r resolverFuncs) LookupMX(ctx context.Context, name string) ([]*net.MX, error) {
+	return r.mx(ctx, name)
+}
+
+func (r resolverFuncs) LookupNetIP(ctx context.Context, network, host string) ([]net.IP, error) {
+	return r.ips(ctx, network, host)
+}
 
 func (domainErrorResolver) LookupMX(_ context.Context, name string) ([]*net.MX, error) {
 	return nil, errors.New("temporary DNS failure for " + name)
@@ -706,7 +721,8 @@ func TestEstablishedSessionClosesPromptlyOnCancel(t *testing.T) {
 	}
 
 	t.Cleanup(func() { _ = q.Close() })
-	d := New(testDeliverCfg(), q, nopLogger{})
+	log := new(captureLog)
+	d := New(testDeliverCfg(), q, log)
 	connected := make(chan struct{})
 	d.SetDialer(dialFn(func(context.Context, string, string) (net.Conn, error) {
 		client, server := net.Pipe()
@@ -893,6 +909,511 @@ func TestSubmissionDeadlineIncludesFinalDataResponse(t *testing.T) {
 	}
 }
 
+func TestRunQuarantinesCorruptBodyAndContinues(t *testing.T) {
+	root := t.TempDir()
+	q, err := queue.Open(root, queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+
+	now := time.Now()
+	corrupt := hardeningEnvelope("corrupt-runtime", now, queue.Recipient{Address: "r@bad.test", Domain: "bad.test", Status: queue.StatusPending})
+	healthy := hardeningEnvelope("healthy-runtime", now, queue.Recipient{Address: "r@good.test", Domain: "good.test", Status: queue.StatusPending})
+	healthy.Username = "other-user"
+	if err := q.Add(corrupt, []byte("body-a\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Add(healthy, []byte("body-b\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "ready", corrupt.ID, "message.eml"), []byte("body-x\r\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	log := new(captureLog)
+	d := New(testDeliverCfg(), q, log)
+	badIP, goodIP := net.ParseIP("127.0.0.1"), net.ParseIP("127.0.0.2")
+	d.SetResolver(&fixedResolver{
+		mx: map[string][]*net.MX{
+			"bad.test":  {{Host: "mx.bad.test."}},
+			"good.test": {{Host: "mx.good.test."}},
+		},
+		ips: map[string][]net.IP{"mx.bad.test": {badIP}, "mx.good.test": {goodIP}},
+	})
+	healthyAccepted := make(chan struct{}, 1)
+	d.SetDialer(dialFn(func(_ context.Context, _ string, address string) (net.Conn, error) {
+		client, server := net.Pipe()
+		host, _, _ := net.SplitHostPort(address)
+		if host == goodIP.String() {
+			go servePlainSMTP(server, healthyAccepted, nil)
+		} else {
+			go servePlainSMTP(server, nil, nil)
+		}
+		return client, nil
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+	select {
+	case <-healthyAccepted:
+	case <-time.After(time.Second):
+		cancel()
+		<-done
+		t.Fatal("healthy delivery was blocked by corrupt queue item")
+	}
+	deadline := time.Now().Add(time.Second)
+	for q.Len() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if q.Len() != 0 {
+		cancel()
+		<-done
+		t.Fatalf("queue length=%d after healthy completion and quarantine", q.Len())
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("Run stopped after item corruption: %v", err)
+	default:
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if len(q.Corrupt) != 1 || !queue.IsCorruption(q.Corrupt[0]) {
+		t.Fatalf("corrupt records=%v log=%s", q.Corrupt, log.String())
+	}
+}
+
+func TestPerUserDeliveryIsolation(t *testing.T) {
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+
+	cfg := testDeliverCfg()
+	cfg.Delivery.UserConcurrency = 1
+	cfg.Delivery.DomainConcurrency = 2
+	cfg.Delivery.GlobalConcurrency = 2
+	cfg.Delivery.CommandTimeout = "30s"
+	d := New(cfg, q, nopLogger{})
+	d.admission = 5 * time.Millisecond
+	ips := map[string]net.IP{
+		"mx.a1.test": net.ParseIP("127.0.0.1"),
+		"mx.a2.test": net.ParseIP("127.0.0.2"),
+		"mx.b.test":  net.ParseIP("127.0.0.3"),
+	}
+	d.SetResolver(&fixedResolver{
+		mx: map[string][]*net.MX{
+			"a1.test": {{Host: "mx.a1.test."}},
+			"a2.test": {{Host: "mx.a2.test."}},
+			"b.test":  {{Host: "mx.b.test."}},
+		},
+		ips: map[string][]net.IP{"mx.a1.test": {ips["mx.a1.test"]}, "mx.a2.test": {ips["mx.a2.test"]}, "mx.b.test": {ips["mx.b.test"]}},
+	})
+	var aDials atomic.Int32
+	aStarted := make(chan struct{}, 1)
+	bAccepted := make(chan struct{}, 1)
+	d.SetDialer(dialFn(func(_ context.Context, _ string, address string) (net.Conn, error) {
+		client, server := net.Pipe()
+		host, _, _ := net.SplitHostPort(address)
+		if host == ips["mx.b.test"].String() {
+			go servePlainSMTP(server, bAccepted, nil)
+			return client, nil
+		}
+		aDials.Add(1)
+		select {
+		case aStarted <- struct{}{}:
+		default:
+		}
+		go func() {
+			defer server.Close()
+			_, _ = server.Read(make([]byte, 1))
+		}()
+		return client, nil
+	}))
+
+	now := time.Now()
+	add := func(id, username, domain string) {
+		env := hardeningEnvelope(id, now, queue.Recipient{Address: "r@" + domain, Domain: domain, Status: queue.StatusPending})
+		env.Username = username
+		if err := q.Add(env, []byte("body\r\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("a-one", "user-a", "a1.test")
+	add("a-two", "user-a", "a2.test")
+	add("b-one", "user-b", "b.test")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+	select {
+	case <-aStarted:
+	case <-time.After(time.Second):
+		cancel()
+		<-done
+		t.Fatal("user A did not start")
+	}
+	select {
+	case <-bAccepted:
+	case <-time.After(time.Second):
+		cancel()
+		<-done
+		t.Fatal("user B was starved by stalled user A")
+	}
+	if got := aDials.Load(); got != 1 {
+		cancel()
+		<-done
+		t.Fatalf("user A active dials=%d want 1", got)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	ordinary := &queue.Envelope{Username: "mailer-daemon"}
+	dsn := &queue.Envelope{Username: "mailer-daemon", DSNSourceID: "source"}
+	if deliveryOwner(ordinary) == deliveryOwner(dsn) || deliveryOwner(dsn) != generatedDSNOwner {
+		t.Fatal("generated DSN owner is not isolated from ordinary users")
+	}
+}
+
+func TestCandidateCeilings(t *testing.T) {
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	cfg := testDeliverCfg()
+	cfg.Delivery.MaxMXCandidates = 3
+	cfg.Delivery.MaxIPCandidatesPerMX = 2
+	d := New(cfg, q, nopLogger{})
+
+	var addressLookups, dials atomic.Int32
+	d.SetResolver(resolverFuncs{
+		mx: func(context.Context, string) ([]*net.MX, error) {
+			return []*net.MX{
+				{Host: "MX-01.test.", Pref: 10}, {Host: "mx-01.test.", Pref: 20},
+				{Host: "mx-04.test.", Pref: 10}, {Host: "mx-03.test.", Pref: 10},
+				{Host: "mx-02.test.", Pref: 10}, {Host: "mx-00.test.", Pref: 10},
+			}, nil
+		},
+		ips: func(_ context.Context, _, host string) ([]net.IP, error) {
+			addressLookups.Add(1)
+			return []net.IP{
+				net.ParseIP("8.8.8.4"), net.ParseIP("8.8.8.3"), net.ParseIP("8.8.8.2"),
+				net.ParseIP("8.8.8.1"), net.ParseIP("8.8.8.1"),
+			}, nil
+		},
+	})
+	d.SetDialer(dialFn(func(context.Context, string, string) (net.Conn, error) {
+		dials.Add(1)
+		return nil, errors.New("blocked")
+	}))
+	env := hardeningEnvelope("candidate-cap", time.Now(), queue.Recipient{Address: "r@test", Domain: "test", Status: queue.StatusPending})
+	if err := d.domain(context.Background(), env, "test", []int{0}); err == nil {
+		t.Fatal("expected candidate failures")
+	}
+	if got := addressLookups.Load(); got != 3 {
+		t.Fatalf("address lookups=%d want 3", got)
+	}
+	if got := dials.Load(); got != 6 {
+		t.Fatalf("dials=%d want 6", got)
+	}
+}
+
+func TestMXEqualPreferenceOrderingBeforeTruncation(t *testing.T) {
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	cfg := testDeliverCfg()
+	cfg.Delivery.MaxMXCandidates = 4
+	d := New(cfg, q, nopLogger{})
+	d.SetResolver(resolverFuncs{
+		mx: func(context.Context, string) ([]*net.MX, error) {
+			return []*net.MX{
+				{Host: "e.test.", Pref: 20}, {Host: "c.test.", Pref: 10},
+				{Host: "d.test.", Pref: 20}, {Host: "a.test.", Pref: 10},
+				{Host: "b.test.", Pref: 10}, {Host: "a.test.", Pref: 30},
+			}, nil
+		},
+		ips: func(context.Context, string, string) ([]net.IP, error) {
+			return nil, errors.New("unexpected address lookup")
+		},
+	})
+	groups := make([]uint16, 0, 3)
+	d.orderMX = func(records []*net.MX) {
+		groups = append(groups, records[0].Pref)
+		for left, right := 0, len(records)-1; left < right; left, right = left+1, right-1 {
+			records[left], records[right] = records[right], records[left]
+		}
+	}
+
+	hosts, err := d.hosts(context.Background(), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(hosts, ","), "c.test,b.test,a.test,e.test"; got != want {
+		t.Fatalf("MX cap/order=%q want %q", got, want)
+	}
+	if fmt.Sprint(groups) != "[10 20 30]" {
+		t.Fatalf("preference groups=%v", groups)
+	}
+}
+
+func TestMXEqualPreferenceCandidatesCanRotateAcrossRetries(t *testing.T) {
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	cfg := testDeliverCfg()
+	cfg.Delivery.MaxMXCandidates = 2
+	d := New(cfg, q, nopLogger{})
+	d.SetResolver(resolverFuncs{
+		mx: func(context.Context, string) ([]*net.MX, error) {
+			return []*net.MX{
+				{Host: "d.test.", Pref: 10}, {Host: "b.test.", Pref: 10},
+				{Host: "a.test.", Pref: 10}, {Host: "c.test.", Pref: 10},
+			}, nil
+		},
+		ips: func(context.Context, string, string) ([]net.IP, error) {
+			return nil, errors.New("unexpected address lookup")
+		},
+	})
+	calls := 0
+	d.orderMX = func(records []*net.MX) {
+		calls++
+		if len(records) != 4 {
+			t.Fatalf("orderMX received %d candidates before truncation", len(records))
+		}
+		if calls == 1 {
+			for left, right := 0, len(records)-1; left < right; left, right = left+1, right-1 {
+				records[left], records[right] = records[right], records[left]
+			}
+		}
+	}
+
+	first, err := d.hosts(context.Background(), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := d.hosts(context.Background(), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(first, ","), "d.test,c.test"; got != want {
+		t.Fatalf("first retry MXs=%q want %q", got, want)
+	}
+	if got, want := strings.Join(second, ","), "a.test,b.test"; got != want {
+		t.Fatalf("second retry MXs=%q want %q", got, want)
+	}
+}
+
+func TestRestrictedAddressesDoNotConsumeCandidateBudget(t *testing.T) {
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	cfg := testDeliverCfg()
+	cfg.Delivery.AllowPrivateDestinations = false
+	cfg.Delivery.MaxIPCandidatesPerMX = 1
+	d := New(cfg, q, nopLogger{})
+	d.orderIPs = func([]net.IP) {}
+	d.SetResolver(resolverFuncs{
+		mx: func(context.Context, string) ([]*net.MX, error) {
+			return nil, errors.New("unexpected MX lookup")
+		},
+		ips: func(context.Context, string, string) ([]net.IP, error) {
+			return []net.IP{
+				net.ParseIP("10.0.0.1"),
+				net.ParseIP("100.64.0.1"),
+				net.ParseIP("127.0.0.1"),
+				net.ParseIP("169.254.1.1"),
+				net.ParseIP("172.16.0.1"),
+				net.ParseIP("192.168.0.1"),
+				net.ParseIP("198.18.0.1"),
+				net.ParseIP("224.0.0.1"),
+				net.ParseIP("8.8.8.8"),
+			}, nil
+		},
+	})
+
+	ips, err := d.lookupHostIPs(context.Background(), "mx.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ips) != 1 || !ips[0].Equal(net.ParseIP("8.8.8.8")) {
+		t.Fatalf("eligible candidates=%v", ips)
+	}
+}
+
+func TestIPOrderingRunsBeforeTruncationAndRotatesRetries(t *testing.T) {
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	cfg := testDeliverCfg()
+	cfg.Delivery.MaxIPCandidatesPerMX = 2
+	d := New(cfg, q, nopLogger{})
+	d.SetResolver(resolverFuncs{
+		mx: func(context.Context, string) ([]*net.MX, error) {
+			return nil, errors.New("unexpected MX lookup")
+		},
+		ips: func(context.Context, string, string) ([]net.IP, error) {
+			return []net.IP{
+				net.ParseIP("8.8.8.1"), net.ParseIP("8.8.8.2"),
+				net.ParseIP("8.8.8.3"), net.ParseIP("8.8.8.4"),
+			}, nil
+		},
+	})
+	calls := 0
+	d.orderIPs = func(ips []net.IP) {
+		calls++
+		if len(ips) != 4 {
+			t.Fatalf("orderIPs received %d candidates before truncation", len(ips))
+		}
+		if calls == 1 {
+			for left, right := 0, len(ips)-1; left < right; left, right = left+1, right-1 {
+				ips[left], ips[right] = ips[right], ips[left]
+			}
+		}
+	}
+
+	first, err := d.lookupHostIPs(context.Background(), "mx.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := d.lookupHostIPs(context.Background(), "mx.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 || len(first) != 2 || len(second) != 2 || first[0].Equal(second[0]) {
+		t.Fatalf("retry candidates first=%v second=%v calls=%d", first, second, calls)
+	}
+}
+
+func TestAttemptTimeoutIsNormalFailure(t *testing.T) {
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	cfg := testDeliverCfg()
+	cfg.Delivery.AttemptTimeout = "50ms"
+	cfg.Delivery.DNSTimeout = "5s"
+	d := New(cfg, q, nopLogger{})
+	d.SetResolver(resolverFuncs{
+		mx: func(ctx context.Context, _ string) ([]*net.MX, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+		ips: func(context.Context, string, string) ([]net.IP, error) {
+			return nil, errors.New("unexpected lookup")
+		},
+	})
+	env := hardeningEnvelope("attempt-timeout", time.Now(), queue.Recipient{Address: "r@ex.test", Domain: "ex.test", Status: queue.StatusPending})
+	if err := q.Add(env, []byte("body\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.attempt(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Attempts != 1 || got.Recipients[0].Status != queue.StatusPending || !strings.Contains(got.LastError, errAttemptTimeout.Error()) {
+		t.Fatalf("timed-out attempt=%+v", got)
+	}
+}
+
+func TestBlockedOutboundWorkDoesNotBlockUnrelatedDelivery(t *testing.T) {
+	for _, mode := range []string{"resolver", "dial"} {
+		t.Run(mode, func(t *testing.T) {
+			q, err := queue.Open(t.TempDir(), queue.Limits{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = q.Close() })
+			cfg := testDeliverCfg()
+			cfg.Delivery.DNSTimeout = "60ms"
+			cfg.Delivery.ConnectionTimeout = "60ms"
+			cfg.Delivery.AttemptTimeout = "150ms"
+			cfg.Delivery.GlobalConcurrency = 2
+			d := New(cfg, q, nopLogger{})
+			badIP, goodIP := net.ParseIP("127.0.0.1"), net.ParseIP("127.0.0.2")
+			blockedDone := make(chan struct{}, 1)
+			d.SetResolver(resolverFuncs{
+				mx: func(ctx context.Context, name string) ([]*net.MX, error) {
+					if name == "bad.test" && mode == "resolver" {
+						<-ctx.Done()
+						blockedDone <- struct{}{}
+						return nil, ctx.Err()
+					}
+					return []*net.MX{{Host: "mx." + name + "."}}, nil
+				},
+				ips: func(_ context.Context, _ string, host string) ([]net.IP, error) {
+					if host == "mx.bad.test" {
+						return []net.IP{badIP}, nil
+					}
+					return []net.IP{goodIP}, nil
+				},
+			})
+			goodAccepted := make(chan struct{}, 1)
+			d.SetDialer(dialFn(func(ctx context.Context, _ string, address string) (net.Conn, error) {
+				host, _, _ := net.SplitHostPort(address)
+				if host == badIP.String() {
+					<-ctx.Done()
+					blockedDone <- struct{}{}
+					return nil, ctx.Err()
+				}
+				client, server := net.Pipe()
+				go servePlainSMTP(server, goodAccepted, nil)
+				return client, nil
+			}))
+			now := time.Now()
+			bad := hardeningEnvelope("blocked-"+mode, now, queue.Recipient{Address: "r@bad.test", Domain: "bad.test", Status: queue.StatusPending})
+			bad.Username = "bad-user"
+			good := hardeningEnvelope("unrelated-"+mode, now, queue.Recipient{Address: "r@good.test", Domain: "good.test", Status: queue.StatusPending})
+			good.Username = "good-user"
+			if err := q.Add(bad, []byte("body\r\n")); err != nil {
+				t.Fatal(err)
+			}
+			if err := q.Add(good, []byte("body\r\n")); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- d.Run(ctx) }()
+			select {
+			case <-goodAccepted:
+			case <-time.After(time.Second):
+				cancel()
+				<-done
+				t.Fatal("unrelated delivery was blocked")
+			}
+			select {
+			case <-blockedDone:
+			case <-time.After(time.Second):
+				cancel()
+				<-done
+				t.Fatal("blocked operation ignored its deadline")
+			}
+			cancel()
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestNormalizeDiagnostic(t *testing.T) {
 	in := "bad\r\n\x00\x1f\x7f\u0085\u009b\u200b\u2028\u2029\u202e" + string([]byte{0xff}) + strings.Repeat("é", maxDiagnosticBytes)
 	got := normalizeDiagnostic(in)
@@ -934,6 +1455,7 @@ func TestRestrictedDestinationTable(t *testing.T) {
 		"100.64.0.1": true, "192.0.0.9": true, "198.19.255.255": true,
 		"64:ff9b::0808:0808": true, "64:ff9b:1::1": true,
 		"::ffff:10.0.0.1": true, "100:0:0:1::1": true, "3fff::1": true,
+		"fec0::1": true, "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff": true,
 		"8.8.8.8": false, "1.1.1.1": false,
 		"2606:4700:4700::1111": false, "2001:4860:4860::8888": false,
 	}

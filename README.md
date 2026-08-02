@@ -2,6 +2,8 @@
 
 Outbound-only mail submission and delivery daemon. Clients submit over authenticated SMTP (ports 587/465); outboxd DKIM-signs and delivers outbound on port 25. It is **not** an inbound MX and does not accept public mail on port 25.
 
+Filesystem free-space enforcement is implemented on Linux, macOS, FreeBSD, and Windows. Other operating systems are not supported.
+
 ## What it is / is not
 
 | Does | Does not |

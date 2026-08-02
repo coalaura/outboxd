@@ -7,12 +7,15 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,6 +31,29 @@ type submissionMessageSizeCase struct {
 	name string
 	size int64
 	code int
+}
+
+type captureLog struct {
+	mu   sync.Mutex
+	text strings.Builder
+}
+
+func (l *captureLog) Printf(format string, values ...any) {
+	l.mu.Lock()
+	fmt.Fprintf(&l.text, format, values...)
+	l.mu.Unlock()
+}
+
+func (l *captureLog) Println(values ...any) {
+	l.mu.Lock()
+	fmt.Fprintln(&l.text, values...)
+	l.mu.Unlock()
+}
+
+func (l *captureLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.text.String()
 }
 
 // testServerWithUser builds a submission stack with one Argon2id user and DKIM.
@@ -631,18 +657,27 @@ func TestOriginatorAuthorization(t *testing.T) {
 	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
 	defer cl.close()
 	cl.authPlain(t, "alice", password)
+	cl.cmd(t, "MAIL FROM:<alice.sender@test.example>", 550)
+	cl.cmd(t, "MAIL FROM:<Alice.Sender@TEST.EXAMPLE>", 250)
+	cl.cmd(t, "RSET", 250)
 
 	for _, tt := range []struct {
 		name   string
 		header string
 	}{
+		{"case-mismatched From", "From: alice.sender@test.example\r\n"},
 		{"unauthorized Sender", "Sender: attacker@test.example\r\n"},
+		{"case-mismatched Sender", "Sender: ALICE@test.example\r\n"},
 		{"unsupported Resent-From", "Resent-From: Alice.Sender@test.example\r\n"},
 		{"unsupported Resent-Sender", "Resent-Sender: Alice.Sender@test.example\r\n"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			beginMessage(t, cl, "")
-			_, _ = io.WriteString(cl.conn, "From: Alice.Sender@test.example\r\n"+tt.header+"To: dest@example.com\r\n\r\nbody\r\n.\r\n")
+			from := "From: Alice.Sender@test.example\r\n"
+			if strings.HasPrefix(tt.header, "From:") {
+				from = ""
+			}
+			_, _ = io.WriteString(cl.conn, from+tt.header+"To: dest@example.com\r\n\r\nbody\r\n.\r\n")
 			cl.readCode(t, 550)
 		})
 	}
@@ -650,4 +685,175 @@ func TestOriginatorAuthorization(t *testing.T) {
 	beginMessage(t, cl, "")
 	_, _ = io.WriteString(cl.conn, "From: Alice.Sender@test.example\r\nSender: alice@test.example\r\nTo: dest@example.com\r\n\r\nbody\r\n.\r\n")
 	cl.readCode(t, 250)
+}
+
+func TestPreAuthAbsoluteLifetimeAndAuthClearsDeadline(t *testing.T) {
+	const password = "absolute-auth-password"
+
+	t.Run("NOOP cannot extend", func(t *testing.T) {
+		srv, cfg, _, _, _ := testServerWithUser(t, password)
+		cfg.Server.ReadTimeout = "150ms"
+		runTestSubmission(t, srv)
+
+		conn, err := net.DialTimeout("tcp", srv.starttls.Addr, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		if _, err := reader.ReadString('\n'); err != nil {
+			t.Fatal(err)
+		}
+
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			time.Sleep(35 * time.Millisecond)
+			_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			if _, err := io.WriteString(conn, "NOOP\r\n"); err != nil {
+				return
+			}
+			if _, err := reader.ReadString('\n'); err != nil {
+				return
+			}
+		}
+		t.Fatal("periodic NOOP extended the pre-auth lifetime")
+	})
+
+	t.Run("successful auth clears", func(t *testing.T) {
+		srv, cfg, _, _, pool := testServerWithUser(t, password)
+		cfg.Server.ReadTimeout = "1s"
+		const username = "ali\t\"ce"
+		alice, ok := cfg.User("alice")
+		if !ok {
+			t.Fatal("test user missing")
+		}
+		if err := cfg.AddUser(config.User{
+			Username:       username,
+			PasswordHash:   alice.PasswordHash,
+			AllowedSenders: []string{"alice@test.example"},
+			Enabled:        true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		logs := new(captureLog)
+		srv.log = logs
+		srv.starttls.ErrorLog = logs
+		runTestSubmission(t, srv)
+		cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
+		defer cl.close()
+		cl.authPlain(t, username, password)
+		time.Sleep(1100 * time.Millisecond)
+		cl.cmd(t, "NOOP", 250)
+
+		if !strings.Contains(logs.String(), `authenticated user "ali\t\"ce" from "127.0.0.1"`) {
+			t.Fatalf("missing safely quoted acceptance log: %q", logs.String())
+		}
+	})
+}
+
+func TestDataDeadlineQueueAddOutcomes(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		err      error
+		accepted bool
+	}{
+		{"durably accepted before deadline return", nil, true},
+		{"precommit error after deadline", errors.New("injected queue failure"), false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			const password = "data-context-password"
+			srv, cfg, spool, _, pool := testServerWithUser(t, password)
+			cfg.Server.ReadTimeout = "100ms"
+			srv.dataWork = make(chan struct{}, 1)
+			logs := new(captureLog)
+			srv.log = logs
+			srv.starttls.ErrorLog = logs
+			entered := make(chan struct{})
+			expired := make(chan struct{})
+			release := make(chan struct{})
+			var called atomic.Int32
+			add := srv.queueAdd
+			srv.queueAdd = func(ctx context.Context, envelope *queue.Envelope, data []byte) error {
+				called.Add(1)
+				if tt.accepted {
+					if err := add(ctx, envelope, data); err != nil {
+						return err
+					}
+				}
+				close(entered)
+				<-ctx.Done()
+				close(expired)
+				<-release
+				return tt.err
+			}
+			runTestSubmission(t, srv)
+
+			cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
+			cl.authPlain(t, "alice", password)
+			beginMessage(t, cl, "")
+			writeMessage(cl, "queue operation outlives DATA deadline")
+			awaitCh(t, entered, time.Second, "queue add")
+			awaitCh(t, expired, time.Second, "DATA deadline")
+			close(release)
+			cl.expectClosed(t)
+			cl.close()
+
+			deadline := time.Now().Add(time.Second)
+			for len(srv.dataWork) != 0 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if len(srv.dataWork) != 0 {
+				t.Fatal("DATA worker remained held after queue add returned")
+			}
+			if called.Load() != 1 {
+				t.Fatalf("queue seam calls=%d want 1", called.Load())
+			}
+			if got := spool.Len(); got != map[bool]int{true: 1, false: 0}[tt.accepted] {
+				t.Fatalf("queue length=%d accepted=%v", got, tt.accepted)
+			}
+			queued := strings.Contains(logs.String(), "queued ")
+			if queued != tt.accepted {
+				t.Fatalf("queued log=%v accepted=%v logs=%q", queued, tt.accepted, logs.String())
+			}
+		})
+	}
+}
+
+func TestDataDeadlineDuringSigningPreventsQueueAdd(t *testing.T) {
+	const password = "data-sign-context-password"
+	srv, cfg, spool, _, pool := testServerWithUser(t, password)
+	cfg.Server.ReadTimeout = "100ms"
+	srv.dataWork = make(chan struct{}, 1)
+	var signed, added atomic.Int32
+	srv.signMessage = func(ctx context.Context, data []byte) (string, error) {
+		signed.Add(1)
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	srv.queueAdd = func(ctx context.Context, envelope *queue.Envelope, data []byte) error {
+		added.Add(1)
+		return errors.New("queue add must not run")
+	}
+	runTestSubmission(t, srv)
+
+	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
+	cl.authPlain(t, "alice", password)
+	beginMessage(t, cl, "")
+	writeMessage(cl, "signing waits for cancellation")
+	cl.expectClosed(t)
+	cl.close()
+
+	if signed.Load() != 1 || added.Load() != 0 {
+		t.Fatalf("sign calls=%d queue calls=%d", signed.Load(), added.Load())
+	}
+	if spool.Len() != 0 {
+		t.Fatalf("timed-out signing committed %d messages", spool.Len())
+	}
+	deadline := time.Now().Add(time.Second)
+	for len(srv.dataWork) != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(srv.dataWork) != 0 {
+		t.Fatal("DATA worker remained held after signing timeout")
+	}
 }

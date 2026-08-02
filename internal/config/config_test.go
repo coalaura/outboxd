@@ -160,6 +160,12 @@ users:
 	if cfg.Server.MaxQueueMessages != 10000 {
 		t.Fatalf("MaxQueueMessages %d", cfg.Server.MaxQueueMessages)
 	}
+	if cfg.Server.MaxQueueMessagesPerUser != 1000 || cfg.Server.MaxQueueBytesPerUser != 1<<30 {
+		t.Fatalf("per-user queue defaults: messages=%d bytes=%d", cfg.Server.MaxQueueMessagesPerUser, cfg.Server.MaxQueueBytesPerUser)
+	}
+	if cfg.Delivery.UserConcurrency != 2 || cfg.Delivery.DNSTimeout != "30s" || cfg.Delivery.AttemptTimeout != "30m" || cfg.Delivery.MaxMXCandidates != 10 || cfg.Delivery.MaxIPCandidatesPerMX != 8 {
+		t.Fatalf("delivery work defaults: %+v", cfg.Delivery)
+	}
 }
 
 func TestInvalidDurationRelationships(t *testing.T) {
@@ -266,7 +272,7 @@ func TestSelfSignedServingRequiresExplicitOptIn(t *testing.T) {
 }
 
 func TestResourceBoundaries(t *testing.T) {
-	if MaxMessageBytes != 100<<20 || Default().Server.MaxMessageBytes != 25<<20 {
+	if MaxMessageBytes != (DataMemoryBudget-DataMemoryOverhead)/DataMemoryCopies || Default().Server.MaxMessageBytes != 25<<20 {
 		t.Fatalf("message limits: maximum=%d default=%d", MaxMessageBytes, Default().Server.MaxMessageBytes)
 	}
 
@@ -276,6 +282,9 @@ func TestResourceBoundaries(t *testing.T) {
 		{"attempts", func(c *Config) { c.Delivery.MaxAttempts = MaxDeliveryAttempts + 1 }},
 		{"domain concurrency", func(c *Config) { c.Delivery.DomainConcurrency = MaxDomainConcurrency + 1 }},
 		{"global concurrency", func(c *Config) { c.Delivery.GlobalConcurrency = MaxGlobalConcurrency + 1 }},
+		{"user concurrency", func(c *Config) { c.Delivery.UserConcurrency = MaxUserConcurrency + 1 }},
+		{"MX candidates", func(c *Config) { c.Delivery.MaxMXCandidates = MaxMXCandidates + 1 }},
+		{"IP candidates", func(c *Config) { c.Delivery.MaxIPCandidatesPerMX = MaxIPCandidatesPerMX + 1 }},
 		{"connections", func(c *Config) { c.Server.MaxConnections = MaxConnections + 1 }},
 		{"connections per IP", func(c *Config) { c.Server.MaxConnectionsPerIP = MaxConnectionsPerIP + 1 }},
 		{"auth workers", func(c *Config) { c.Server.AuthWorkers = MaxAuthWorkers + 1 }},
@@ -315,6 +324,9 @@ func TestResourceBoundaries(t *testing.T) {
 	max.Delivery.MaxAttempts = MaxDeliveryAttempts
 	max.Delivery.DomainConcurrency = MaxDomainConcurrency
 	max.Delivery.GlobalConcurrency = MaxGlobalConcurrency
+	max.Delivery.UserConcurrency = MaxUserConcurrency
+	max.Delivery.MaxMXCandidates = MaxMXCandidates
+	max.Delivery.MaxIPCandidatesPerMX = MaxIPCandidatesPerMX
 	err = max.Validate()
 	if err != nil {
 		t.Fatalf("inclusive maximum boundaries invalid: %v", err)
@@ -409,9 +421,16 @@ func TestDurationBoundaries(t *testing.T) {
 			c.Delivery.MaximumRetryDelay = value
 			c.Delivery.MaximumLifetime = MaxRetryDelay.String()
 		}},
+		{"delivery DNS", MaxDeliveryDNSTimeout, func(c *Config, value string) { c.Delivery.DNSTimeout = value }},
+		{"delivery attempt", MaxDeliveryAttemptTimeout, func(c *Config, value string) {
+			c.Delivery.AttemptTimeout = value
+		}},
 		{"delivery connection", MaxDeliveryConnectionTimeout, func(c *Config, value string) { c.Delivery.ConnectionTimeout = value }},
 		{"delivery command", MaxDeliveryCommandTimeout, func(c *Config, value string) { c.Delivery.CommandTimeout = value }},
-		{"delivery submission", MaxDeliverySubmissionTimeout, func(c *Config, value string) { c.Delivery.SubmissionTimeout = value }},
+		{"delivery submission", MaxDeliverySubmissionTimeout, func(c *Config, value string) {
+			c.Delivery.SubmissionTimeout = value
+			c.Delivery.AttemptTimeout = MaxDeliverySubmissionTimeout.String()
+		}},
 	}
 
 	for _, tt := range tests {
@@ -452,6 +471,14 @@ func TestResourceRelationships(t *testing.T) {
 		{"submission shorter than command", func(c *Config) {
 			c.Delivery.CommandTimeout = "2m"
 			c.Delivery.SubmissionTimeout = "1m"
+		}},
+		{"DNS exceeds attempt", func(c *Config) {
+			c.Delivery.DNSTimeout = "2m"
+			c.Delivery.AttemptTimeout = "1m"
+		}},
+		{"submission exceeds attempt", func(c *Config) {
+			c.Delivery.SubmissionTimeout = "10m"
+			c.Delivery.AttemptTimeout = "5m"
 		}},
 		{"connection longer than command", func(c *Config) {
 			c.Delivery.ConnectionTimeout = "2m"
@@ -523,13 +550,30 @@ func TestConfigReadLimit(t *testing.T) {
 }
 
 func TestAuthWorkerMemoryBound(t *testing.T) {
-	if MaxAuthWorkers != 16 {
-		t.Fatalf("MaxAuthWorkers=%d want 16", MaxAuthWorkers)
+	if MaxAuthWorkers != 8 {
+		t.Fatalf("MaxAuthWorkers=%d want 8", MaxAuthWorkers)
 	}
 
 	got := int64(MaxAuthWorkers) * 19 << 20
-	if got > 304<<20 {
+	if got > 152<<20 {
 		t.Fatalf("maximum Argon2 worker memory=%d", got)
+	}
+}
+
+func TestSupportedMaximaAggregateBound(t *testing.T) {
+	data := MaxMessageBytes*DataMemoryCopies + DataMemoryOverhead
+	if data > DataMemoryBudget {
+		t.Fatalf("single DATA worker memory=%d exceeds %d", data, DataMemoryBudget)
+	}
+
+	// Connections dominate descriptors/goroutines; delivery may run four attempt
+	// goroutines per global MX slot.
+	concurrent := MaxConnections + MaxGlobalConcurrency*4 + MaxAuthWorkers + MaxDataWorkers
+	if concurrent > 5000 {
+		t.Fatalf("aggregate concurrent maximum=%d", concurrent)
+	}
+	if MaxDeliveryAttempts > 100 {
+		t.Fatalf("delivery attempts maximum=%d", MaxDeliveryAttempts)
 	}
 }
 

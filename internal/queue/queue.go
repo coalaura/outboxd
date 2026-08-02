@@ -28,7 +28,6 @@ package queue
 
 import (
 	"bytes"
-	"container/heap"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -136,6 +135,7 @@ type Envelope struct {
 	// and allowing recovery to verify the reciprocal source identity.
 	DSNSourceID          string `json:"dsn_source_id,omitempty"`
 	DSNSourceIncarnation string `json:"dsn_source_incarnation,omitempty"`
+	DSNSourceRevision    uint64 `json:"dsn_source_revision,omitempty"`
 	DSNGeneration        uint64 `json:"dsn_generation,omitempty"`
 
 	// EnqueuedAt is used by quota accounting for in-progress adds.
@@ -151,6 +151,8 @@ type Envelope struct {
 type Limits struct {
 	MaxMessages         int
 	MaxBytes            int64
+	MaxMessagesPerUser  int
+	MaxBytesPerUser     int64
 	MaxSpoolBytes       int64
 	SpoolEmergencyBytes int64
 	MinFreeDisk         int64
@@ -172,8 +174,16 @@ type PhysicalStats struct {
 
 type accountedEntry struct {
 	size        int64
+	owner       string
 	incarnation string
 	revision    uint64
+}
+
+type userUsage struct {
+	messages int
+	bytes    int64
+	reserved int
+	resBytes int64
 }
 
 // Queue is a durable, crash-safe spool of messages awaiting delivery.
@@ -199,11 +209,12 @@ type Queue struct {
 	count         int
 	bytes         int64
 	accounted     map[string]accountedEntry
-	scheduled     map[string]struct{}
+	scheduled     map[string]*Envelope
 	transitioning map[string]struct{}
 	requeues      map[string][]*Envelope
 	reserved      int   // in-flight Add reservations (count)
 	resBytes      int64 // in-flight Add reservations (bytes)
+	users         map[string]userUsage
 	spoolBytes    int64 // conservative admission estimate across all namespaces
 	spoolReserved int64 // in-flight spool admission reservations
 	lastSpoolScan time.Time
@@ -332,7 +343,7 @@ func (q *Queue) SpoolStats() PhysicalStats {
 // reserveLocked checks logical and conservative spool admission quotas.
 // Emergency operations may consume the configured reserve but never the hard
 // admission limit or free-space floor.
-func (q *Queue) reserveLocked(size, physical int64, exempt, emergency bool) error {
+func (q *Queue) reserveLocked(size, physical int64, exempt, emergency bool, owner string) error {
 	if size < 0 {
 		return errors.New("negative reservation size")
 	}
@@ -369,6 +380,20 @@ func (q *Queue) reserveLocked(size, physical int64, exempt, emergency bool) erro
 		if q.limits.MaxBytes > 0 && totalBytes > q.limits.MaxBytes {
 			return ErrQueueFull
 		}
+
+		usage := q.users[owner]
+		userMessages, ok := checkedAddInt(usage.messages, usage.reserved)
+		if !ok || (q.limits.MaxMessagesPerUser > 0 && userMessages >= q.limits.MaxMessagesPerUser) {
+			return ErrQueueFull
+		}
+		userBytes, ok := checkedAddInt64(usage.bytes, usage.resBytes)
+		if !ok {
+			return ErrQueueFull
+		}
+		userBytes, ok = checkedAddInt64(userBytes, size)
+		if !ok || (q.limits.MaxBytesPerUser > 0 && userBytes > q.limits.MaxBytesPerUser) {
+			return ErrQueueFull
+		}
 	}
 
 	err := q.reservePhysicalLocked(physical, emergency, false)
@@ -378,10 +403,16 @@ func (q *Queue) reserveLocked(size, physical int64, exempt, emergency bool) erro
 
 	q.reserved++
 	q.resBytes = reservedBytes
+	if !exempt {
+		usage := q.users[owner]
+		usage.reserved++
+		usage.resBytes += size
+		q.users[owner] = usage
+	}
 	return nil
 }
 
-func (q *Queue) releaseReserveLocked(size, physical int64) {
+func (q *Queue) releaseReserveLocked(size, physical int64, owner string) {
 	if size < 0 {
 		return
 	}
@@ -401,11 +432,23 @@ func (q *Queue) releaseReserveLocked(size, physical int64) {
 	} else {
 		q.spoolReserved -= physical
 	}
+	if owner != "" {
+		usage := q.users[owner]
+		if usage.reserved > 0 {
+			usage.reserved--
+		}
+		if size >= usage.resBytes {
+			usage.resBytes = 0
+		} else {
+			usage.resBytes -= size
+		}
+		q.users[owner] = usage
+	}
 }
 
-func (q *Queue) releaseReserve(size, physical int64) {
+func (q *Queue) releaseReserve(size, physical int64, owner string) {
 	q.mu.Lock()
-	q.releaseReserveLocked(size, physical)
+	q.releaseReserveLocked(size, physical, owner)
 	q.mu.Unlock()
 }
 
@@ -435,8 +478,6 @@ func estimatePersistentEntryAllocation(bodySize int64, metadataSize int) int64 {
 		disk.AllocationSize(bodySize),
 		disk.AllocationSize(int64(metadataSize)),
 		disk.AllocationSize(int64(len(addAccepted))),
-		// The destination namespace may cross an allocation boundary.
-		disk.AllocationSize(0),
 	}
 	var total int64
 
@@ -511,6 +552,21 @@ func (q *Queue) removePhysical(bytes int64) {
 	}
 
 	q.mu.Unlock()
+}
+
+func (q *Queue) adjustPhysicalDelta(before, after int64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if after >= before {
+		q.addPhysicalLocked(after - before)
+		return
+	}
+	delta := before - after
+	if delta >= q.spoolBytes {
+		q.spoolBytes = 0
+	} else {
+		q.spoolBytes -= delta
+	}
 }
 
 func (q *Queue) reservePhysicalLocked(physical int64, emergency, terminal bool) error {
@@ -623,7 +679,45 @@ var (
 
 	// ErrCleanup reports that terminal state committed but garbage cleanup did not.
 	ErrCleanup = errors.New("queue cleanup incomplete")
+
+	// ErrCorrupt identifies deterministic durable-integrity violations. Transient
+	// filesystem errors are deliberately not wrapped with this sentinel.
+	ErrCorrupt = errors.New("queue entry corrupt")
+
+	// ErrAcceptanceUnknown means Add could not prove whether an accepted entry
+	// can survive recovery. Callers must not blindly resubmit the message.
+	ErrAcceptanceUnknown = errors.New("queue acceptance outcome unknown")
 )
+
+// IsCorruption reports whether err proves a durable queue integrity violation.
+func IsCorruption(err error) bool { return errors.Is(err, ErrCorrupt) }
+
+// IsAcceptanceUnknown reports an indeterminate Add acceptance outcome.
+func IsAcceptanceUnknown(err error) bool { return errors.Is(err, ErrAcceptanceUnknown) }
+
+type acceptanceUnknownError struct{ cause error }
+
+func (e *acceptanceUnknownError) Error() string {
+	return fmt.Sprintf("%v: %v", ErrAcceptanceUnknown, e.cause)
+}
+
+func (e *acceptanceUnknownError) Unwrap() []error {
+	return []error{ErrAcceptanceUnknown, e.cause}
+}
+
+func acceptanceUnknown(cause error) error { return &acceptanceUnknownError{cause: cause} }
+
+func definiteAcceptanceCause(err error) error {
+	var unknown *acceptanceUnknownError
+	if errors.As(err, &unknown) {
+		return unknown.cause
+	}
+	return err
+}
+
+func corruptionf(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", ErrCorrupt, fmt.Sprintf(format, args...))
+}
 
 // IsStoragePressure reports errors that are recoverable by freeing spool or
 // filesystem capacity.
@@ -758,6 +852,19 @@ func newIncarnation() (string, error) {
 // The accepted marker is the commit point: before it is synced, neither tmp/
 // nor a pending ready/ entry is recoverable as an accepted message.
 func (q *Queue) Add(envelope *Envelope, data []byte) error {
+	return q.AddContext(context.Background(), envelope, data)
+}
+
+// AddContext is Add with precommit cancellation. Once the accepted marker has
+// synced, acceptance wins over cancellation and the message is published.
+func (q *Queue) AddContext(ctx context.Context, envelope *Envelope, data []byte) error {
+	if ctx == nil {
+		return errors.New("nil Add context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	err := q.beginOperation()
 	if err != nil {
 		return err
@@ -813,6 +920,9 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 			q.finishMutation()
 		}
 	}()
+	if err = ctx.Err(); err != nil {
+		return err
+	}
 	q.mu.Lock()
 	_, blocked := q.blocked[envelope.ID]
 	_, exists := q.accounted[envelope.ID]
@@ -867,13 +977,16 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 	if err != nil {
 		return err
 	}
+	if err = ctx.Err(); err != nil {
+		return err
+	}
 
 	physical := estimateEntryAllocation(envelope.Size, len(meta))
 
 	// Capacity check accounts for concurrent in-progress connections via reserved.
 	q.mu.Lock()
 
-	err = q.reserveLocked(envelope.Size, physical, false, false)
+	err = q.reserveLocked(envelope.Size, physical, false, false, envelope.Username)
 	if err != nil {
 		q.mu.Unlock()
 		return err
@@ -895,9 +1008,12 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 	}
 	defer func() {
 		if held {
-			q.releaseReserve(envelope.Size, physicalHeld)
+			q.releaseReserve(envelope.Size, physicalHeld, envelope.Username)
 		}
 	}()
+	if err = ctx.Err(); err != nil {
+		return err
+	}
 
 	tmpDir := filepath.Join(q.tmp, envelope.ID)
 	err = os.RemoveAll(tmpDir)
@@ -925,44 +1041,93 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 	}()
 
 	statePath := filepath.Join(tmpDir, addStateName)
+	if err = ctx.Err(); err != nil {
+		return err
+	}
 	err = disk.Write(statePath, []byte(addPending), 0600)
 	if err != nil {
 		return err
 	}
-
 	bodyPath := filepath.Join(tmpDir, bodyName)
+	if err = ctx.Err(); err != nil {
+		return err
+	}
 	err = disk.Write(bodyPath, data, 0600)
 	if err != nil {
 		return err
 	}
 
 	metaPath := filepath.Join(tmpDir, metaName)
+	if err = ctx.Err(); err != nil {
+		return err
+	}
 	err = disk.Write(metaPath, meta, 0600)
 	if err != nil {
 		return err
 	}
 
+	if err = ctx.Err(); err != nil {
+		return err
+	}
 	err = disk.Sync(tmpDir)
 	if err != nil {
 		return err
 	}
 
+	if err = ctx.Err(); err != nil {
+		return err
+	}
 	err = disk.Rename(tmpDir, readyDir)
 	if err != nil {
 		return err
 	}
 
-	err = q.acceptAdd(filepath.Join(readyDir, addStateName))
-	if err != nil {
+	abortReady := func(cause error) error {
+		persistent := estimatePersistentEntryAllocation(envelope.Size, len(meta))
+		if measured, measureErr := disk.AllocatedBytes(readyDir); measureErr == nil {
+			persistent = measured
+		}
 		abortErr := q.quarantineDir(readyDir, envelope.ID+"-uncommitted")
 		// Quarantine intentionally retains the failed entry. If quarantine itself
 		// failed, the entry may remain in either namespace and must still be charged.
-		commitPhysical()
+		commitPhysicalBytes := persistent
+		if commitPhysicalBytes > physicalHeld {
+			commitPhysicalBytes = physicalHeld
+		}
+		q.mu.Lock()
+		q.commitPhysicalLocked(commitPhysicalBytes)
+		q.mu.Unlock()
+		physicalHeld -= commitPhysicalBytes
+		success = true
 		if abortErr == nil {
-			return err
+			return definiteAcceptanceCause(cause)
 		}
 
-		return errors.Join(err, fmt.Errorf("quarantine failed add: %w", abortErr))
+		// A relocation can report a post-rename sync error. A fresh successful
+		// ready-directory sync proving the source absent resolves that ambiguity.
+		syncErr := disk.Sync(q.ready)
+		_, statErr := os.Stat(readyDir)
+		if syncErr == nil && errors.Is(statErr, os.ErrNotExist) {
+			return errors.Join(definiteAcceptanceCause(cause), fmt.Errorf("quarantine reported an error after removing ready entry: %w", abortErr))
+		}
+		cleanupErr := errors.Join(abortErr, syncErr)
+		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			cleanupErr = errors.Join(cleanupErr, statErr)
+		}
+		if IsAcceptanceUnknown(cause) {
+			q.mu.Lock()
+			q.blocked[envelope.ID] = struct{}{}
+			q.mu.Unlock()
+			return acceptanceUnknown(errors.Join(definiteAcceptanceCause(cause), fmt.Errorf("quarantine failed add: %w", cleanupErr)))
+		}
+		return errors.Join(cause, fmt.Errorf("quarantine failed add: %w", cleanupErr))
+	}
+	if err = ctx.Err(); err != nil {
+		return abortReady(err)
+	}
+	err = q.acceptAdd(readyDir)
+	if err != nil {
+		return abortReady(err)
 	}
 
 	success = true
@@ -971,9 +1136,11 @@ func (q *Queue) Add(envelope *Envelope, data []byte) error {
 	mutationHeld = false
 
 	q.mu.Lock()
-	q.commitPhysicalLocked(physicalHeld)
+	persistentPhysical := estimatePersistentEntryAllocation(envelope.Size, len(meta))
+	q.commitPhysicalLocked(persistentPhysical)
+	physicalHeld -= persistentPhysical
+	q.releaseReserveLocked(envelope.Size, physicalHeld, envelope.Username)
 	physicalHeld = 0
-	q.releaseReserveLocked(envelope.Size, 0)
 	q.noteAddedLocked(envelope)
 	delete(q.transitioning, envelope.ID)
 	delete(q.requeues, envelope.ID)
@@ -1034,11 +1201,6 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 	dsn.Revision = 1
 	dsn.Size = int64(len(data))
 	dsn.BodyDigest = bodyDigest(data)
-	err = validateEnvelope(dsn)
-	if err != nil {
-		return err
-	}
-
 	err = q.beginTransitions(source.ID, dsn.ID)
 	if err != nil {
 		return err
@@ -1072,7 +1234,7 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 	}
 
 	sourceDir := filepath.Join(q.ready, source.ID)
-	durableSource, err := q.loadDir(sourceDir, source.ID)
+	durableSource, err := q.loadAcceptedDir(sourceDir, source.ID)
 	if err != nil {
 		return err
 	}
@@ -1090,7 +1252,7 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 			return fmt.Errorf("%w: source links %s", ErrIDConflict, durableSource.DSNID)
 		}
 
-		staged, published, publishErr := q.publishStagedDSN(dsn)
+		staged, published, publishErr := q.publishStagedDSN(durableSource, dsn)
 		if published {
 			q.finishMutation()
 			mutationHeld = false
@@ -1123,12 +1285,21 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 		return fmt.Errorf("%w: source metadata changed", ErrIDConflict)
 	}
 
+	expectedSourceRevision, err := incrementRevision(durableSource.Revision)
+	if err != nil {
+		return err
+	}
+	dsn.DSNSourceRevision = expectedSourceRevision
+	err = validateEnvelope(dsn)
+	if err != nil {
+		return err
+	}
 	meta, err := marshalEnvelope(dsn)
 	if err != nil {
 		return err
 	}
 
-	linked := *source
+	linked := *durableSource
 	linked.DSNID = dsn.ID
 	err = validateEnvelope(&linked)
 	if err != nil {
@@ -1185,7 +1356,7 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 
 	q.mu.Lock()
 
-	err = q.reserveLocked(dsn.Size, physical, true, true)
+	err = q.reserveLocked(dsn.Size, physical, true, true, "")
 	if err != nil {
 		q.mu.Unlock()
 		return err
@@ -1209,7 +1380,7 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 	}
 	defer func() {
 		if held {
-			q.releaseReserve(dsn.Size, physicalHeld)
+			q.releaseReserve(dsn.Size, physicalHeld, "")
 		}
 	}()
 
@@ -1238,7 +1409,6 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 	if err != nil {
 		return err
 	}
-
 	err = disk.Write(filepath.Join(stageDir, bodyName), data, 0600)
 	if err != nil {
 		return err
@@ -1254,7 +1424,7 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 		return err
 	}
 
-	err = q.acceptAdd(filepath.Join(stageDir, addStateName))
+	err = q.acceptAdd(stageDir)
 	if err != nil {
 		return err
 	}
@@ -1267,9 +1437,9 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 	if retainedSourceTemp {
 		commitPhysical(sourceTempPhysical)
 	}
-	if storeErr != nil && linked.Revision == source.Revision {
-		// Preserve the complete stage. Startup decides whether the source update
-		// committed and either publishes or quarantines it.
+	if storeErr != nil {
+		// Visibility after a failed source-directory sync is not a durability
+		// barrier. Preserve the accepted stage for a retry or startup recovery.
 		cleanup = false
 		commitPhysical(stagingPhysical)
 		q.mu.Lock()
@@ -1279,8 +1449,7 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 	}
 
 	cleanup = false
-
-	moved, err := moveState(stageDir, filepath.Join(q.ready, dsn.ID))
+	staged, moved, err := q.publishStagedDSN(&linked, dsn)
 	if err != nil && !moved {
 		commitPhysical(stagingPhysical)
 		return err
@@ -1289,8 +1458,8 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 	q.finishMutation()
 	mutationHeld = false
 	q.mu.Lock()
-	q.releaseReserveLocked(dsn.Size, physicalHeld)
-	q.noteAddedLocked(dsn)
+	q.releaseReserveLocked(dsn.Size, physicalHeld, "")
+	q.noteAddedLocked(staged)
 	delete(q.transitioning, source.ID)
 	delete(q.transitioning, dsn.ID)
 	delete(q.requeues, source.ID)
@@ -1310,23 +1479,51 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 	return errors.Join(storeErr, err)
 }
 
-func (q *Queue) publishStagedDSN(dsn *Envelope) (*Envelope, bool, error) {
+func (q *Queue) publishStagedDSN(expectedSource, dsn *Envelope) (*Envelope, bool, error) {
+	sourceDir := filepath.Join(q.ready, dsn.DSNSourceID)
+	// This barrier is deliberately separate from metadata replacement. It is
+	// required even on same-process retries after an ambiguous sync failure.
+	if err := disk.Sync(sourceDir); err != nil {
+		return nil, false, err
+	}
+	durableSource, err := q.loadAcceptedDir(sourceDir, dsn.DSNSourceID)
+	if err != nil {
+		return nil, false, err
+	}
+	if durableSource.Incarnation != dsn.DSNSourceIncarnation || durableSource.DSNGeneration != dsn.DSNGeneration || durableSource.DSNID != dsn.ID {
+		return nil, false, fmt.Errorf("%w: source DSN link changed", ErrIDConflict)
+	}
+	if expectedSource != nil && (durableSource.Incarnation != expectedSource.Incarnation || durableSource.Revision != expectedSource.Revision) {
+		return nil, false, fmt.Errorf("%w: source metadata changed before DSN publication", ErrIDConflict)
+	}
+
 	stageDir := filepath.Join(q.dsn, dsn.ID)
-	_, err := os.Stat(stageDir)
+	_, err = os.Stat(stageDir)
 	if errors.Is(err, os.ErrNotExist) {
-		// No stage means the linked DSN was already published and may have
-		// completed. The durable source link is sufficient evidence.
+		readyDir := filepath.Join(q.ready, dsn.ID)
+		existing, readyErr := q.loadAcceptedDir(readyDir, dsn.ID)
+		if readyErr == nil {
+			if !sameDSNIdentity(existing, dsn) || existing.DSNSourceRevision != durableSource.Revision {
+				return nil, false, fmt.Errorf("%w: published DSN identity changed", ErrIDConflict)
+			}
+			return existing, false, nil
+		}
+		if !errors.Is(readyErr, os.ErrNotExist) {
+			return nil, false, readyErr
+		}
+		// A missing stage and ready entry means an exactly linked DSN already
+		// completed. The accepted source identity above is still authoritative.
 		return nil, false, nil
 	} else if err != nil {
 		return nil, false, err
 	}
 
-	staged, err := q.loadDir(stageDir, dsn.ID)
+	staged, err := q.loadAcceptedDir(stageDir, dsn.ID)
 	if err != nil {
 		return nil, false, err
 	}
 
-	if staged.DSNSourceID != dsn.DSNSourceID || staged.DSNSourceIncarnation != dsn.DSNSourceIncarnation || staged.DSNGeneration != dsn.DSNGeneration {
+	if !sameDSNIdentity(staged, dsn) || staged.DSNSourceRevision != durableSource.Revision {
 		return nil, false, fmt.Errorf("%w: staged DSN identity mismatch", ErrIDConflict)
 	}
 
@@ -1338,15 +1535,19 @@ func (q *Queue) publishStagedDSN(dsn *Envelope) (*Envelope, bool, error) {
 	return staged, true, err
 }
 
+func sameDSNIdentity(a, b *Envelope) bool {
+	return a.ID == b.ID && a.Incarnation == b.Incarnation && a.DSNSourceID == b.DSNSourceID && a.DSNSourceIncarnation == b.DSNSourceIncarnation && a.DSNGeneration == b.DSNGeneration
+}
+
 // acceptAdd performs the sole Add acceptance transition. The marker already
 // has a durable directory entry, so only its fixed-size contents need syncing.
 // No fallible operation is reported after the successful Sync commit point.
-func (q *Queue) acceptAdd(path string) error {
+func (q *Queue) acceptAdd(dir string) error {
 	if len(addPending) != len(addAccepted) {
 		panic("queue Add states must have equal length")
 	}
 
-	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	file, err := os.OpenFile(filepath.Join(dir, addStateName), os.O_WRONLY, 0)
 	if err != nil {
 		return err
 	}
@@ -1355,39 +1556,46 @@ func (q *Queue) acceptAdd(path string) error {
 
 	err = writeAddState(file, addAccepted)
 	if err != nil {
-		return q.rollbackAdd(file, err)
+		rolledBack, result := q.rollbackAdd(file, err)
+		if !rolledBack {
+			return acceptanceUnknown(result)
+		}
+		return result
 	}
 
 	err = disk.SyncFile(file)
 	if err != nil {
-		return q.rollbackAdd(file, err)
+		rolledBack, result := q.rollbackAdd(file, err)
+		if !rolledBack {
+			return acceptanceUnknown(result)
+		}
+		return result
 	}
 
-	_ = file.Close()
 	return nil
 }
 
-func (q *Queue) rollbackAdd(file *os.File, cause error) error {
+func (q *Queue) rollbackAdd(file *os.File, cause error) (bool, error) {
 	// A failed commit must not leave accepted bytes recoverable after Add
 	// reports failure. A successful rollback sync restores that invariant.
 	if q.beforeAddRollback != nil {
 		err := q.beforeAddRollback()
 		if err != nil {
-			return errors.Join(cause, fmt.Errorf("rollback add state: %w", err))
+			return false, errors.Join(cause, fmt.Errorf("rollback add state: %w", err))
 		}
 	}
 
 	err := writeAddState(file, addPending)
 	if err != nil {
-		return errors.Join(cause, fmt.Errorf("rollback add state: %w", err))
+		return false, errors.Join(cause, fmt.Errorf("rollback add state: %w", err))
 	}
 
 	err = disk.SyncFile(file)
 	if err != nil {
-		return errors.Join(cause, fmt.Errorf("sync rolled-back add state: %w", err))
+		return false, errors.Join(cause, fmt.Errorf("sync rolled-back add state: %w", err))
 	}
 
-	return cause
+	return true, cause
 }
 
 func writeAddState(file *os.File, state string) error {
@@ -1425,17 +1633,13 @@ func (q *Queue) Next(ctx context.Context) (*Envelope, error) {
 		}
 
 		wait := time.Hour
-		if q.pending.Len() > 0 {
-			envelope := q.pending[0]
-			delay := time.Until(envelope.NextAttempt)
-			if delay <= 0 {
-				heap.Pop(&q.pending)
+		if next, ok := q.pending.NextAttempt(); ok {
+			if envelope := q.pending.PopDue(time.Now()); envelope != nil {
 				delete(q.scheduled, envelope.ID)
 				q.mu.Unlock()
 				return envelope, nil
 			}
-
-			wait = delay
+			wait = time.Until(next)
 		}
 
 		q.mu.Unlock()
@@ -1506,14 +1710,9 @@ func (q *Queue) RequeueAfter(envelope *Envelope, delay time.Duration) {
 
 	// Checked-out envelopes are absent from scheduled, which is the common
 	// delivery-admission path. Only scan when replacing an existing schedule.
-	if _, scheduled := q.scheduled[envelope.ID]; scheduled {
-		for i, queued := range q.pending {
-			if queued.ID == envelope.ID {
-				heap.Remove(&q.pending, i)
-				delete(q.scheduled, envelope.ID)
-				break
-			}
-		}
+	if queued, scheduled := q.scheduled[envelope.ID]; scheduled {
+		q.pending.Remove(queued)
+		delete(q.scheduled, envelope.ID)
 	}
 
 	added := q.scheduleLocked(deferred)
@@ -1522,6 +1721,84 @@ func (q *Queue) RequeueAfter(envelope *Envelope, delay time.Duration) {
 	if added {
 		q.signal()
 	}
+}
+
+// QuarantineCheckedOut removes only the exact checked-out ready incarnation
+// whose deterministic integrity failure is supplied in cause. A failed move
+// blocks that ID in memory so unrelated entries remain deliverable.
+func (q *Queue) QuarantineCheckedOut(envelope *Envelope, cause error) error {
+	if envelope == nil || !IsCorruption(cause) {
+		return errors.New("checked-out quarantine requires a corruption error")
+	}
+	if err := q.beginOperation(); err != nil {
+		return err
+	}
+	defer q.endOperation()
+	if err := q.rejectReadOnly(); err != nil {
+		return err
+	}
+	if err := ValidateID(envelope.ID); err != nil {
+		return err
+	}
+	if err := q.beginTransition(envelope.ID); err != nil {
+		return err
+	}
+	defer q.endTransition(envelope.ID)
+	if err := q.startMutation(); err != nil {
+		return err
+	}
+	defer q.finishMutation()
+
+	q.mu.Lock()
+	entry, accounted := q.accounted[envelope.ID]
+	_, scheduled := q.scheduled[envelope.ID]
+	q.mu.Unlock()
+	if !accounted || scheduled || entry.incarnation != envelope.Incarnation || entry.revision != envelope.Revision {
+		return fmt.Errorf("%w: checked-out queue identity changed", ErrIDConflict)
+	}
+	current, err := loadAcceptedMetadata(filepath.Join(q.ready, envelope.ID), envelope.ID)
+	if err != nil {
+		q.blockCheckedOut(envelope.ID, cause, fmt.Errorf("verify checked-out identity: %w", err))
+		return err
+	}
+	if current.Incarnation != envelope.Incarnation || current.Revision != envelope.Revision || current.Size != envelope.Size || current.BodyDigest != envelope.BodyDigest {
+		err := fmt.Errorf("%w: checked-out queue identity changed", ErrIDConflict)
+		q.blockCheckedOut(envelope.ID, cause, err)
+		return err
+	}
+
+	src := filepath.Join(q.ready, envelope.ID)
+	dst := filepath.Join(q.corr, envelope.ID+"-runtime."+strconv.FormatInt(time.Now().UnixNano(), 10))
+	if err := ensureDurableDir(q.corr); err != nil {
+		q.blockCheckedOut(envelope.ID, cause, err)
+		return err
+	}
+	moved, moveErr := moveState(src, dst)
+	if !moved {
+		q.blockCheckedOut(envelope.ID, cause, moveErr)
+		return moveErr
+	}
+	q.noteRemoved(envelope.ID)
+	q.mu.Lock()
+	if moveErr != nil {
+		q.blocked[envelope.ID] = struct{}{}
+		q.Corrupt = append(q.Corrupt, fmt.Errorf("QUARANTINE DURABILITY FAILED; BLOCKED %s: %v (relocation: %w)", envelope.ID, cause, moveErr))
+	} else {
+		q.Corrupt = append(q.Corrupt, fmt.Errorf("ready %s: %w", envelope.ID, cause))
+	}
+	q.mu.Unlock()
+	return moveErr
+}
+
+func (q *Queue) blockCheckedOut(id string, cause, relocation error) {
+	q.mu.Lock()
+	q.blocked[id] = struct{}{}
+	if queued := q.scheduled[id]; queued != nil {
+		q.pending.Remove(queued)
+		delete(q.scheduled, id)
+	}
+	q.Corrupt = append(q.Corrupt, fmt.Errorf("QUARANTINE FAILED; BLOCKED %s: %v (relocation: %w)", id, cause, relocation))
+	q.mu.Unlock()
 }
 
 // Retry persists the updated envelope and reschedules it.
@@ -1914,6 +2191,10 @@ func (q *Queue) ReviveDead(id string) (*Envelope, error) {
 	if err != nil {
 		return nil, err
 	}
+	oldEntryBytes, err := disk.AllocatedBytes(src)
+	if err != nil {
+		return nil, err
+	}
 
 	nextRevision, err := incrementRevision(env.Revision)
 	if err != nil {
@@ -1939,7 +2220,12 @@ func (q *Queue) ReviveDead(id string) (*Envelope, error) {
 	}
 
 	physical := 2*disk.AllocationSize(int64(len(meta))+disk.AllocationSize(0)) + disk.AllocationSize(0)
-	err = q.reserveLocked(env.Size, physical, false, true)
+	exempt := env.DSNSourceID != ""
+	owner := env.Username
+	if exempt {
+		owner = ""
+	}
+	err = q.reserveLocked(env.Size, physical, exempt, true, owner)
 	if err != nil {
 		q.mu.Unlock()
 		return nil, err
@@ -1963,7 +2249,7 @@ func (q *Queue) ReviveDead(id string) (*Envelope, error) {
 	}
 	defer func() {
 		if held {
-			q.releaseReserve(env.Size, physicalHeld)
+			q.releaseReserve(env.Size, physicalHeld, owner)
 		}
 	}()
 
@@ -2042,11 +2328,18 @@ func (q *Queue) ReviveDead(id string) (*Envelope, error) {
 	if activateErr != nil {
 		moveErr = errors.Join(moveErr, activateErr)
 	}
+	newEntryBytes, measureErr := disk.AllocatedBytes(dst)
+	if measureErr != nil {
+		commitPhysical(disk.AllocationSize(int64(len(meta))) + disk.AllocationSize(0))
+		moveErr = errors.Join(moveErr, fmt.Errorf("measure revived entry: %w", measureErr))
+	} else {
+		q.adjustPhysicalDelta(oldEntryBytes, newEntryBytes)
+	}
 
 	q.finishMutation()
 	mutationHeld = false
 	q.mu.Lock()
-	q.releaseReserveLocked(env.Size, physicalHeld)
+	q.releaseReserveLocked(env.Size, physicalHeld, owner)
 	q.noteAddedLocked(env)
 	delete(q.transitioning, id)
 	delete(q.requeues, id)
@@ -2214,6 +2507,7 @@ func (q *Queue) Prune(now time.Time) (dead, corrupt int, err error) {
 	}
 
 	defer q.finishMutation()
+	q.validateDead()
 	dead, deadErr := q.pruneNamespace(q.dead, q.limits.DeadRetention, now, "")
 	corrupt, corruptErr := q.pruneNamespace(q.corr, q.limits.CorruptRetention, now, "corrupt-")
 	return dead, corrupt, errors.Join(deadErr, corruptErr)
@@ -2259,9 +2553,10 @@ func (q *Queue) pruneNamespace(namespace string, retention time.Duration, now ti
 		if namespace == q.dead {
 			q.mu.Lock()
 			_, busy := q.transitioning[entry.Name()]
+			_, blocked := q.blocked[entry.Name()]
 			q.mu.Unlock()
 
-			if busy || ValidateID(entry.Name()) != nil {
+			if busy || blocked || ValidateID(entry.Name()) != nil {
 				continue
 			}
 		}
@@ -2416,6 +2711,9 @@ func (q *Queue) signal() {
 }
 
 func (q *Queue) scheduleLocked(envelope *Envelope) bool {
+	if _, blocked := q.blocked[envelope.ID]; blocked {
+		return false
+	}
 	accounted, exists := q.accounted[envelope.ID]
 	if !exists || accounted.incarnation != envelope.Incarnation || accounted.revision != envelope.Revision {
 		return false
@@ -2426,8 +2724,9 @@ func (q *Queue) scheduleLocked(envelope *Envelope) bool {
 		return false
 	}
 
-	heap.Push(&q.pending, cloneEnvelope(envelope))
-	q.scheduled[envelope.ID] = struct{}{}
+	queued := cloneEnvelope(envelope)
+	q.pending.Push(queued)
+	q.scheduled[envelope.ID] = queued
 	return true
 }
 
@@ -2451,12 +2750,26 @@ func (q *Queue) noteAddedLocked(envelope *Envelope) bool {
 
 	q.accounted[envelope.ID] = accountedEntry{
 		size:        envelope.Size,
+		owner:       quotaOwner(envelope),
 		incarnation: envelope.Incarnation,
 		revision:    envelope.Revision,
 	}
 	q.count++
 	q.bytes = bytes
+	if owner := quotaOwner(envelope); owner != "" {
+		usage := q.users[owner]
+		usage.messages++
+		usage.bytes += envelope.Size
+		q.users[owner] = usage
+	}
 	return true
+}
+
+func quotaOwner(envelope *Envelope) string {
+	if envelope.DSNSourceID != "" {
+		return ""
+	}
+	return envelope.Username
 }
 
 func (q *Queue) beginTransition(id string) error {
@@ -2515,6 +2828,16 @@ func (q *Queue) noteRemoved(id string) {
 		delete(q.requeues, id)
 		q.count--
 		q.bytes -= entry.size
+		if entry.owner != "" {
+			usage := q.users[entry.owner]
+			usage.messages--
+			usage.bytes -= entry.size
+			if usage.messages == 0 && usage.reserved == 0 {
+				delete(q.users, entry.owner)
+			} else {
+				q.users[entry.owner] = usage
+			}
+		}
 	}
 
 	q.mu.Unlock()
@@ -2532,6 +2855,10 @@ func (q *Queue) storeReady(envelope *Envelope) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	before, err := disk.AllocatedBytes(dir)
+	if err != nil {
+		return false, err
+	}
 
 	path := filepath.Join(dir, metaName)
 	updated := *envelope
@@ -2540,8 +2867,23 @@ func (q *Queue) storeReady(envelope *Envelope) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	metadata, err := marshalEnvelope(&updated)
+	if err != nil {
+		return false, err
+	}
 
 	committed, retainedTemp, err := q.writeMetaReconciled(path, &updated)
+	after, measureErr := disk.AllocatedBytes(dir)
+	if measureErr == nil {
+		q.adjustPhysicalDelta(before, after)
+		retainedTemp = false // The complete entry measurement includes any temp.
+	} else if committed || retainedTemp {
+		q.mu.Lock()
+		q.addPhysicalLocked(disk.AllocationSize(int64(len(metadata))) + disk.AllocationSize(0))
+		q.mu.Unlock()
+		retainedTemp = false
+		err = errors.Join(err, fmt.Errorf("measure updated queue entry: %w", measureErr))
+	}
 	if !committed {
 		return retainedTemp, err
 	}
@@ -2593,7 +2935,7 @@ func acceptedDir(dir string) error {
 	}
 
 	if string(state) != addAccepted {
-		return errors.New("queue entry is not accepted")
+		return corruptionf("queue entry is not accepted")
 	}
 
 	return nil
@@ -2661,12 +3003,15 @@ func (q *Queue) loadDir(dir, expectID string) (*Envelope, error) {
 
 	file, info, err := openRegular(filepath.Join(dir, bodyName))
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, corruptionf("missing body: %v", err)
+		}
 		return nil, fmt.Errorf("missing body: %w", err)
 	}
 	defer file.Close()
 
 	if info.Size() != env.Size {
-		return nil, fmt.Errorf("body size mismatch: metadata=%d actual=%d", env.Size, info.Size())
+		return nil, corruptionf("body size mismatch: metadata=%d actual=%d", env.Size, info.Size())
 	}
 
 	err = verifyBodyHandle(file, env.Size, env.BodyDigest)
@@ -2682,27 +3027,30 @@ func loadEnvelopeMetadata(dir, expectID string) (*Envelope, error) {
 
 	raw, err := readBoundedRegular(metaPath, maxEnvelopeMetadata)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, corruptionf("missing metadata: %v", err)
+		}
 		return nil, err
 	}
 
 	env := new(Envelope)
 	err = json.Unmarshal(raw, env)
 	if err != nil {
-		return nil, fmt.Errorf("invalid json: %w", err)
+		return nil, corruptionf("invalid json: %v", err)
 	}
 
 	if env.ID != expectID {
-		return nil, fmt.Errorf("%w: id %q != directory %q", ErrInvalidID, env.ID, expectID)
+		return nil, corruptionf("id %q != directory %q", env.ID, expectID)
 	}
 
 	err = ValidateID(env.ID)
 	if err != nil {
-		return nil, err
+		return nil, corruptionf("invalid stored id: %v", err)
 	}
 
 	err = validateEnvelope(env)
 	if err != nil {
-		return nil, err
+		return nil, corruptionf("invalid envelope: %v", err)
 	}
 
 	return env, nil
@@ -2722,17 +3070,20 @@ func marshalEnvelope(envelope *Envelope) ([]byte, error) {
 }
 
 func readBoundedRegular(path string, max int64) ([]byte, error) {
+	if err := disk.CheckRead(path); err != nil {
+		return nil, err
+	}
 	before, err := os.Lstat(path)
 	if err != nil {
 		return nil, err
 	}
 
 	if !before.Mode().IsRegular() {
-		return nil, errors.New("queue metadata is not a regular file")
+		return nil, corruptionf("queue metadata is not a regular file")
 	}
 
 	if before.Size() > max {
-		return nil, fmt.Errorf("queue metadata exceeds %d bytes", max)
+		return nil, corruptionf("queue metadata exceeds %d bytes", max)
 	}
 
 	file, _, err := openRegularFromInfo(path, before)
@@ -2747,13 +3098,16 @@ func readBoundedRegular(path string, max int64) ([]byte, error) {
 	}
 
 	if int64(len(raw)) > max {
-		return nil, fmt.Errorf("queue metadata exceeds %d bytes", max)
+		return nil, corruptionf("queue metadata exceeds %d bytes", max)
 	}
 
 	return raw, nil
 }
 
 func openRegular(path string) (*os.File, os.FileInfo, error) {
+	if err := disk.CheckRead(path); err != nil {
+		return nil, nil, err
+	}
 	before, err := os.Lstat(path)
 	if err != nil {
 		return nil, nil, err
@@ -2764,7 +3118,7 @@ func openRegular(path string) (*os.File, os.FileInfo, error) {
 
 func openRegularFromInfo(path string, before os.FileInfo) (*os.File, os.FileInfo, error) {
 	if !before.Mode().IsRegular() {
-		return nil, nil, errors.New("queue file is not a regular file")
+		return nil, nil, corruptionf("queue file is not a regular file")
 	}
 
 	file, err := os.Open(path)
@@ -2780,7 +3134,7 @@ func openRegularFromInfo(path string, before os.FileInfo) (*os.File, os.FileInfo
 
 	if !after.Mode().IsRegular() || !os.SameFile(before, after) {
 		file.Close()
-		return nil, nil, errors.New("queue file changed while opening")
+		return nil, nil, corruptionf("queue file changed while opening")
 	}
 
 	return file, after, nil
@@ -2806,7 +3160,7 @@ func (r *trackedReader) Read(p []byte) (int, error) {
 		var extra [1]byte
 		n, err := r.file.Read(extra[:])
 		if n != 0 {
-			return 0, errors.New("body size mismatch while reading: body grew")
+			return 0, corruptionf("body size mismatch while reading: body grew")
 		}
 
 		if err != nil && !errors.Is(err, io.EOF) {
@@ -2815,7 +3169,7 @@ func (r *trackedReader) Read(p []byte) (int, error) {
 
 		actual := bodyDigestPrefix + hex.EncodeToString(r.hash.Sum(nil))
 		if actual != r.digest {
-			return 0, fmt.Errorf("body digest mismatch: metadata=%s actual=%s", r.digest, actual)
+			return 0, corruptionf("body digest mismatch: metadata=%s actual=%s", r.digest, actual)
 		}
 
 		r.verified = true
@@ -2833,7 +3187,7 @@ func (r *trackedReader) Read(p []byte) (int, error) {
 	}
 
 	if errors.Is(err, io.EOF) && r.remaining != 0 {
-		return n, fmt.Errorf("body size mismatch while reading: %d bytes missing", r.remaining)
+		return n, corruptionf("body size mismatch while reading: %d bytes missing", r.remaining)
 	}
 
 	return n, err
@@ -2855,7 +3209,7 @@ func (q *Queue) openBody(path string, expected int64, digest string) (*os.File, 
 
 	if info.Size() != expected {
 		file.Close()
-		return nil, fmt.Errorf("body size mismatch: metadata=%d actual=%d", expected, info.Size())
+		return nil, corruptionf("body size mismatch: metadata=%d actual=%d", expected, info.Size())
 	}
 
 	if q.afterBodyOpen != nil {
@@ -2870,7 +3224,7 @@ func (q *Queue) openBody(path string, expected int64, digest string) (*os.File, 
 
 	if !info.Mode().IsRegular() || info.Size() != expected {
 		file.Close()
-		return nil, fmt.Errorf("body size mismatch: metadata=%d actual=%d", expected, info.Size())
+		return nil, corruptionf("body size mismatch: metadata=%d actual=%d", expected, info.Size())
 	}
 
 	err = verifyBodyHandle(file, expected, digest)
@@ -2892,7 +3246,7 @@ func readBodyFromFile(file *os.File, expected int64, digest string) ([]byte, err
 	}
 	actual := bodyDigestPrefix + hex.EncodeToString(hash.Sum(nil))
 	if actual != digest {
-		return nil, fmt.Errorf("body digest mismatch: metadata=%s actual=%s", digest, actual)
+		return nil, corruptionf("body digest mismatch: metadata=%s actual=%s", digest, actual)
 	}
 
 	return body.Bytes(), nil
@@ -2910,7 +3264,7 @@ func copyExactBody(dst io.Writer, file *os.File, expected int64) error {
 	}
 
 	if written != expected {
-		return fmt.Errorf("body size mismatch while reading: metadata=%d actual=%d", expected, written)
+		return corruptionf("body size mismatch while reading: metadata=%d actual=%d", expected, written)
 	}
 
 	info, err := file.Stat()
@@ -2919,7 +3273,7 @@ func copyExactBody(dst io.Writer, file *os.File, expected int64) error {
 	}
 
 	if !info.Mode().IsRegular() || info.Size() != expected {
-		return fmt.Errorf("body size mismatch while reading: metadata=%d actual=%d", expected, info.Size())
+		return corruptionf("body size mismatch while reading: metadata=%d actual=%d", expected, info.Size())
 	}
 
 	return nil
@@ -2944,11 +3298,16 @@ func verifyBodyHandle(file *os.File, expected int64, digest string) error {
 
 	actual := bodyDigestPrefix + hex.EncodeToString(hash.Sum(nil))
 	if actual != digest {
-		return fmt.Errorf("body digest mismatch: metadata=%s actual=%s", digest, actual)
+		return corruptionf("body digest mismatch: metadata=%s actual=%s", digest, actual)
 	}
 
 	_, err = file.Seek(0, io.SeekStart)
 	return err
+}
+
+// OpenOptions controls startup maintenance without changing queue semantics.
+type OpenOptions struct {
+	DisableStartupPrune bool
 }
 
 // Open loads an existing spool directory, creating it when needed.
@@ -2956,7 +3315,17 @@ func verifyBodyHandle(file *os.File, expected int64, digest string) error {
 // scheduling. Call Close to release it.
 // Corrupt entries are relocated to corrupt/ and returned via Queue.Corrupt.
 func Open(directory string, limits Limits) (*Queue, error) {
-	if limits.MaxSpoolBytes < 0 || limits.SpoolEmergencyBytes < 0 || limits.MinFreeDisk < 0 || limits.DeadRetention < 0 || limits.CorruptRetention < 0 {
+	return OpenWithOptions(directory, limits, OpenOptions{})
+}
+
+// OpenForMaintenance opens a writable queue without retention pruning.
+func OpenForMaintenance(directory string, limits Limits) (*Queue, error) {
+	return OpenWithOptions(directory, limits, OpenOptions{DisableStartupPrune: true})
+}
+
+// OpenWithOptions opens a writable queue with explicit startup behavior.
+func OpenWithOptions(directory string, limits Limits, options OpenOptions) (*Queue, error) {
+	if limits.MaxMessages < 0 || limits.MaxBytes < 0 || limits.MaxMessagesPerUser < 0 || limits.MaxBytesPerUser < 0 || limits.MaxSpoolBytes < 0 || limits.SpoolEmergencyBytes < 0 || limits.MinFreeDisk < 0 || limits.DeadRetention < 0 || limits.CorruptRetention < 0 {
 		return nil, errors.New("queue limits must not be negative")
 	}
 
@@ -2976,10 +3345,11 @@ func Open(directory string, limits Limits) (*Queue, error) {
 		notify:        make(chan struct{}, 1),
 		closeSignal:   make(chan struct{}),
 		accounted:     make(map[string]accountedEntry),
-		scheduled:     make(map[string]struct{}),
+		scheduled:     make(map[string]*Envelope),
 		transitioning: make(map[string]struct{}),
 		requeues:      make(map[string][]*Envelope),
 		blocked:       make(map[string]struct{}),
+		users:         make(map[string]userUsage),
 		closeDone:     make(chan struct{}),
 	}
 	q.closeCond = sync.NewCond(&q.mu)
@@ -3051,13 +3421,15 @@ func Open(directory string, limits Limits) (*Queue, error) {
 		return nil, err
 	}
 
+	q.validateDead()
+
 	err = q.loadReady()
 	if err != nil {
 		_ = q.Close()
 		return nil, err
 	}
 
-	if limits.DeadRetention > 0 || limits.CorruptRetention > 0 {
+	if !options.DisableStartupPrune && (limits.DeadRetention > 0 || limits.CorruptRetention > 0) {
 		dead, corrupt, pruneErr := q.Prune(time.Now())
 		if pruneErr != nil {
 			q.Warnings = append(q.Warnings, fmt.Errorf("startup prune: %w", pruneErr))
@@ -3102,10 +3474,11 @@ func OpenReadOnly(directory string) (*Queue, error) {
 		notify:        make(chan struct{}, 1),
 		closeSignal:   make(chan struct{}),
 		accounted:     make(map[string]accountedEntry),
-		scheduled:     make(map[string]struct{}),
+		scheduled:     make(map[string]*Envelope),
 		transitioning: make(map[string]struct{}),
 		requeues:      make(map[string][]*Envelope),
 		blocked:       make(map[string]struct{}),
+		users:         make(map[string]userUsage),
 		closeDone:     make(chan struct{}),
 		readOnly:      true,
 	}
@@ -3245,7 +3618,7 @@ func (q *Queue) recoverDSN() error {
 		if !entry.IsDir() {
 			err = q.quarantineFile(path, entry.Name()+"-dsn-stray")
 			if err != nil {
-				q.recordQuarantineFailure(entry.Name(), path, errors.New("stray file in dsn"), err)
+				q.recordQuarantineFailure(entry.Name(), path, corruptionf("stray file in dsn"), err)
 				continue
 			}
 
@@ -3254,18 +3627,13 @@ func (q *Queue) recoverDSN() error {
 		}
 
 		id := entry.Name()
-		err = acceptedDir(path)
+		dsn, err := q.loadAcceptedDir(path, id)
 		if err != nil {
-			qerr := q.quarantineDSNStage(path, id, "uncommitted", err)
-			if qerr != nil {
-				q.recordQuarantineFailure(id, path, err, qerr)
+			if !IsCorruption(err) {
+				q.recordTransientBlocked(id, path, fmt.Errorf("read staged DSN: %w", err))
+				q.blockLinkedSource(id, err)
+				continue
 			}
-
-			continue
-		}
-
-		dsn, err := q.loadDir(path, id)
-		if err != nil {
 			qerr := q.quarantineDSNStage(path, id, "invalid", err)
 			if qerr != nil {
 				q.recordQuarantineFailure(id, path, err, qerr)
@@ -3274,9 +3642,21 @@ func (q *Queue) recoverDSN() error {
 			continue
 		}
 
-		source, err := q.loadDir(filepath.Join(q.ready, dsn.DSNSourceID), dsn.DSNSourceID)
-		if err != nil || source.Incarnation != dsn.DSNSourceIncarnation || source.DSNID != dsn.ID || source.DSNGeneration != dsn.DSNGeneration {
-			cause := errors.New("source link missing or invalid")
+		sourceDir := filepath.Join(q.ready, dsn.DSNSourceID)
+		err = disk.Sync(sourceDir)
+		if err != nil {
+			q.recordTransientBlocked(id, path, fmt.Errorf("establish source durability barrier: %w", err))
+			q.recordTransientBlocked(dsn.DSNSourceID, sourceDir, fmt.Errorf("linked DSN %s source barrier failed", id))
+			continue
+		}
+		source, err := q.loadAcceptedDir(sourceDir, dsn.DSNSourceID)
+		if err != nil {
+			if !IsCorruption(err) && !errors.Is(err, os.ErrNotExist) {
+				q.recordTransientBlocked(id, path, fmt.Errorf("read linked DSN source: %w", err))
+				q.recordTransientBlocked(dsn.DSNSourceID, sourceDir, fmt.Errorf("linked DSN %s source read failed", id))
+				continue
+			}
+			cause := corruptionf("source link missing or invalid: %v", err)
 			qerr := q.quarantineDSNStage(path, id, "orphan", cause)
 			if qerr != nil {
 				q.recordQuarantineFailure(id, path, cause, qerr)
@@ -3284,23 +3664,36 @@ func (q *Queue) recoverDSN() error {
 
 			continue
 		}
+		if source.Incarnation != dsn.DSNSourceIncarnation || source.Revision != dsn.DSNSourceRevision || source.DSNID != dsn.ID || source.DSNGeneration != dsn.DSNGeneration {
+			cause := corruptionf("source reciprocal DSN identity is invalid")
+			qerr := q.quarantineDSNStage(path, id, "orphan", cause)
+			if qerr != nil {
+				q.recordQuarantineFailure(id, path, cause, qerr)
+			}
+			continue
+		}
 
 		readyDir := filepath.Join(q.ready, id)
 		_, err = os.Stat(readyDir)
 		if err == nil {
-			existing, loadErr := q.loadDir(readyDir, id)
-			if loadErr == nil && existing.Incarnation == dsn.Incarnation && existing.DSNSourceID == dsn.DSNSourceID && existing.DSNSourceIncarnation == dsn.DSNSourceIncarnation && existing.DSNGeneration == dsn.DSNGeneration {
+			existing, loadErr := q.loadAcceptedDir(readyDir, id)
+			if loadErr == nil && sameDSNIdentity(existing, dsn) && existing.DSNSourceRevision == source.Revision {
 				err = q.quarantineDir(path, id+"-dsn-duplicate")
 				if err != nil {
-					q.recordQuarantineFailure(id, path, errors.New("duplicate ready DSN"), err)
+					q.recordQuarantineFailure(id, path, corruptionf("duplicate ready DSN"), err)
 					continue
 				}
 
 				q.Corrupt = append(q.Corrupt, fmt.Errorf("staged DSN %s: duplicate ready entry", id))
 				continue
 			}
+			if loadErr != nil && !IsCorruption(loadErr) {
+				q.recordTransientBlocked(id, path, fmt.Errorf("read existing ready DSN: %w", loadErr))
+				q.recordTransientBlocked(source.ID, sourceDir, fmt.Errorf("linked DSN %s ready read failed", id))
+				continue
+			}
 
-			cause := fmt.Errorf("%w: ready DSN collision", ErrIDConflict)
+			cause := corruptionf("ready DSN collision: %v", ErrIDConflict)
 			err = q.quarantineDSNStage(path, id, "collision", cause)
 			if err != nil {
 				q.recordQuarantineFailure(id, path, cause, err)
@@ -3308,15 +3701,15 @@ func (q *Queue) recoverDSN() error {
 
 			continue
 		} else if !errors.Is(err, os.ErrNotExist) {
-			q.recordBlocked(id, path, fmt.Errorf("inspect ready DSN: %w", err))
-			q.recordBlocked(source.ID, filepath.Join(q.ready, source.ID), fmt.Errorf("linked DSN %s could not be inspected", id))
+			q.recordTransientBlocked(id, path, fmt.Errorf("inspect ready DSN: %w", err))
+			q.recordTransientBlocked(source.ID, filepath.Join(q.ready, source.ID), fmt.Errorf("linked DSN %s could not be inspected", id))
 			continue
 		}
 
 		moved, err := moveState(path, readyDir)
 		if err != nil {
-			q.recordBlocked(id, path, fmt.Errorf("publish recovered DSN (moved=%t): %w", moved, err))
-			q.recordBlocked(source.ID, filepath.Join(q.ready, source.ID), fmt.Errorf("linked DSN %s publication is unresolved", id))
+			q.recordTransientBlocked(id, path, fmt.Errorf("publish recovered DSN (moved=%t): %w", moved, err))
+			q.recordTransientBlocked(source.ID, filepath.Join(q.ready, source.ID), fmt.Errorf("linked DSN %s publication is unresolved", id))
 			continue
 		}
 	}
@@ -3324,7 +3717,29 @@ func (q *Queue) recoverDSN() error {
 	return nil
 }
 
+func (q *Queue) blockLinkedSource(dsnID string, cause error) {
+	entries, err := os.ReadDir(q.ready)
+	if err != nil {
+		q.Warnings = append(q.Warnings, fmt.Errorf("inspect source for staged DSN %s: %w", dsnID, err))
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		sourceDir := filepath.Join(q.ready, entry.Name())
+		source, err := q.loadAcceptedDir(sourceDir, entry.Name())
+		if err != nil || source.DSNID != dsnID {
+			continue
+		}
+		q.recordTransientBlocked(source.ID, sourceDir, fmt.Errorf("linked staged DSN %s could not be read: %w", dsnID, cause))
+	}
+}
+
 func (q *Queue) quarantineDSNStage(stage, id, suffix string, cause error) error {
+	if !IsCorruption(cause) {
+		return errors.New("refusing to quarantine DSN stage without typed corruption")
+	}
 	entries, err := os.ReadDir(q.ready)
 	if err != nil {
 		return err
@@ -3336,14 +3751,11 @@ func (q *Queue) quarantineDSNStage(stage, id, suffix string, cause error) error 
 		}
 
 		sourceDir := filepath.Join(q.ready, entry.Name())
-		raw, err := readBoundedRegular(filepath.Join(sourceDir, metaName), maxEnvelopeMetadata)
+		source, err := q.loadAcceptedDir(sourceDir, entry.Name())
 		if err != nil {
 			continue
 		}
-
-		var source Envelope
-
-		if json.Unmarshal(raw, &source) != nil || source.DSNID != id {
+		if source.DSNID != id {
 			continue
 		}
 
@@ -3365,6 +3777,45 @@ func (q *Queue) quarantineDSNStage(stage, id, suffix string, cause error) error 
 	return nil
 }
 
+func (q *Queue) validateDead() {
+	entries, err := os.ReadDir(q.dead)
+	if err != nil {
+		q.Warnings = append(q.Warnings, fmt.Errorf("validate dead: %w", err))
+		return
+	}
+	for _, entry := range entries {
+		path := filepath.Join(q.dead, entry.Name())
+		var cause error
+		if !entry.IsDir() {
+			cause = corruptionf("stray file in dead")
+			if err := q.quarantineFile(path, entry.Name()+"-dead-stray"); err != nil {
+				q.recordQuarantineFailure(entry.Name(), path, cause, err)
+			} else {
+				q.Corrupt = append(q.Corrupt, fmt.Errorf("dead %s: %w", entry.Name(), cause))
+			}
+			continue
+		}
+		id := entry.Name()
+		if err := ValidateID(id); err != nil {
+			cause = corruptionf("invalid dead id %q", id)
+		} else {
+			_, cause = q.loadAcceptedDir(path, id)
+		}
+		if cause == nil {
+			continue
+		}
+		if !IsCorruption(cause) {
+			q.recordTransientBlocked(id, path, fmt.Errorf("validate dead: %w", cause))
+			continue
+		}
+		if err := q.quarantineDir(path, id+"-invalid-dead"); err != nil {
+			q.recordQuarantineFailure(id, path, cause, err)
+			continue
+		}
+		q.Corrupt = append(q.Corrupt, fmt.Errorf("dead %s: %w", id, cause))
+	}
+}
+
 func (q *Queue) loadReady() error {
 	entries, err := os.ReadDir(q.ready)
 	if err != nil {
@@ -3381,7 +3832,7 @@ func (q *Queue) loadReady() error {
 			// stray file
 			err = q.quarantineFile(filepath.Join(q.ready, e.Name()), e.Name()+"-stray")
 			if err != nil {
-				q.recordQuarantineFailure(e.Name(), filepath.Join(q.ready, e.Name()), errors.New("stray file in ready"), err)
+				q.recordQuarantineFailure(e.Name(), filepath.Join(q.ready, e.Name()), corruptionf("stray file in ready"), err)
 				continue
 			}
 
@@ -3393,6 +3844,7 @@ func (q *Queue) loadReady() error {
 		dir := filepath.Join(q.ready, id)
 		err = ValidateID(id)
 		if err != nil {
+			err = corruptionf("invalid ready id: %v", err)
 			qerr := q.quarantineDir(dir, "badid-"+sanitize(id))
 			if qerr != nil {
 				q.recordQuarantineFailure(id, dir, err, qerr)
@@ -3403,8 +3855,15 @@ func (q *Queue) loadReady() error {
 			continue
 		}
 
-		state, err := readBoundedRegular(filepath.Join(dir, addStateName), maxAddStateBytes)
+		err = acceptedDir(dir)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				err = corruptionf("queue entry is missing acceptance state")
+			}
+			if !IsCorruption(err) {
+				q.recordTransientBlocked(id, dir, fmt.Errorf("read acceptance state: %w", err))
+				continue
+			}
 			qerr := q.quarantineDir(dir, id)
 			if qerr != nil {
 				q.recordQuarantineFailure(id, dir, fmt.Errorf("read add state: %w", err), qerr)
@@ -3415,32 +3874,25 @@ func (q *Queue) loadReady() error {
 			continue
 		}
 
-		if string(state) != addAccepted {
-			qerr := q.quarantineDir(dir, id+"-uncommitted")
-			if qerr != nil {
-				q.recordQuarantineFailure(id, dir, errors.New("uncommitted or invalid add state"), qerr)
-				continue
-			}
-
-			q.Corrupt = append(q.Corrupt, fmt.Errorf("ready %s: uncommitted or invalid add state", id))
-			continue
-		}
-
 		stagedMeta := filepath.Join(dir, reviveMetaName)
 		_, err = os.Stat(stagedMeta)
 		if err == nil {
 			moved, moveErr := moveState(stagedMeta, filepath.Join(dir, metaName))
 			if moveErr != nil && !moved {
-				q.recordBlocked(id, dir, fmt.Errorf("complete revive: %w", moveErr))
+				q.recordTransientBlocked(id, dir, fmt.Errorf("complete revive: %w", moveErr))
 				continue
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
-			q.recordBlocked(id, dir, fmt.Errorf("inspect revive: %w", err))
+			q.recordTransientBlocked(id, dir, fmt.Errorf("inspect revive: %w", err))
 			continue
 		}
 
 		env, err := q.loadDir(dir, id)
 		if err != nil {
+			if !IsCorruption(err) {
+				q.recordTransientBlocked(id, dir, fmt.Errorf("read ready entry: %w", err))
+				continue
+			}
 			qerr := q.quarantineDir(dir, id)
 			if qerr != nil {
 				q.recordQuarantineFailure(id, dir, err, qerr)
@@ -3461,7 +3913,7 @@ func (q *Queue) loadReady() error {
 
 			qerr := q.quarantineDir(dir, id+"-dead-duplicate")
 			if qerr != nil {
-				q.recordQuarantineFailure(id, dir, errors.New("duplicate dead-letter entry"), qerr)
+				q.recordQuarantineFailure(id, dir, corruptionf("duplicate dead-letter entry"), qerr)
 				continue
 			}
 
@@ -3470,6 +3922,10 @@ func (q *Queue) loadReady() error {
 		}
 
 		if !errors.Is(deadErr, os.ErrNotExist) {
+			if !IsCorruption(deadErr) {
+				q.recordTransientBlocked(id, deadDir, fmt.Errorf("read colliding dead entry: %w", deadErr))
+				continue
+			}
 			qerr := q.quarantineDir(deadDir, id+"-invalid-dead")
 			if qerr != nil {
 				q.recordQuarantineFailure(id, deadDir, deadErr, qerr)
@@ -3480,9 +3936,10 @@ func (q *Queue) loadReady() error {
 		}
 
 		if !q.noteAddedLocked(env) {
+			cause := corruptionf("queue accounting overflow")
 			qerr := q.quarantineDir(dir, id+"-accounting-overflow")
 			if qerr != nil {
-				q.recordQuarantineFailure(id, dir, errors.New("queue accounting overflow"), qerr)
+				q.recordQuarantineFailure(id, dir, cause, qerr)
 				continue
 			}
 
@@ -3506,6 +3963,11 @@ func (q *Queue) recordBlocked(id, path string, cause error) {
 	q.Corrupt = append(q.Corrupt, fmt.Errorf("BLOCKED %s at %s: %w", id, path, cause))
 }
 
+func (q *Queue) recordTransientBlocked(id, path string, cause error) {
+	q.blocked[id] = struct{}{}
+	q.Warnings = append(q.Warnings, fmt.Errorf("TRANSIENTLY BLOCKED %s at %s: %w", id, path, cause))
+}
+
 func (q *Queue) loadAcceptedDir(dir, expectID string) (*Envelope, error) {
 	env, err := loadAcceptedMetadata(dir, expectID)
 	if err != nil {
@@ -3514,13 +3976,16 @@ func (q *Queue) loadAcceptedDir(dir, expectID string) (*Envelope, error) {
 
 	file, info, err := openRegular(filepath.Join(dir, bodyName))
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, corruptionf("missing body: %v", err)
+		}
 		return nil, fmt.Errorf("missing body: %w", err)
 	}
 
 	defer file.Close()
 
 	if info.Size() != env.Size {
-		return nil, fmt.Errorf("body size mismatch: metadata=%d actual=%d", env.Size, info.Size())
+		return nil, corruptionf("body size mismatch: metadata=%d actual=%d", env.Size, info.Size())
 	}
 
 	err = verifyBodyHandle(file, env.Size, env.BodyDigest)
@@ -3537,7 +4002,7 @@ func loadAcceptedMetadata(dir, expectID string) (*Envelope, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			_, statErr := os.Stat(dir)
 			if statErr == nil {
-				return nil, errors.New("queue entry is missing accepted state")
+				return nil, corruptionf("queue entry is missing accepted state")
 			} else {
 				return nil, statErr
 			}
@@ -3692,6 +4157,9 @@ func validateEnvelope(e *Envelope) error {
 		if e.ID != DSNID(e.DSNSourceID, e.DSNSourceIncarnation, e.DSNGeneration) {
 			return fmt.Errorf("%w: derived DSN ID mismatch", ErrIDConflict)
 		}
+		if e.DSNSourceRevision == 0 || e.DSNSourceRevision > maxEnvelopeRevision {
+			return errors.New("invalid DSN source revision")
+		}
 
 		if e.DSNID != "" {
 			return errors.New("DSN cannot link another DSN")
@@ -3701,6 +4169,9 @@ func validateEnvelope(e *Envelope) error {
 			return errors.New("DSN sender must be empty")
 		}
 	} else if e.Sender != "" {
+		if e.DSNSourceRevision != 0 {
+			return errors.New("DSN source revision without source ID")
+		}
 		if e.DSNSourceIncarnation != "" {
 			return errors.New("DSN source incarnation without source ID")
 		}
