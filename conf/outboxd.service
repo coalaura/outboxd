@@ -1,0 +1,84 @@
+[Unit]
+Description=outboxd outbound mail server
+After=network-online.target
+Requires=network-online.target
+StartLimitBurst=10
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+User=outboxd
+Group=outboxd
+
+WorkingDirectory=/var/lib/outboxd
+ExecStart=/opt/outboxd/outboxd -config /var/lib/outboxd/config.yml serve
+
+StandardOutput=journal
+StandardError=journal
+StandardInput=null
+
+# systemd creates /var/lib/outboxd for the service account. It contains the
+# private config, DKIM key, spool, and any generated development TLS assets.
+StateDirectory=outboxd
+StateDirectoryMode=0700
+
+# Filesystem Sandboxing
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateMounts=yes
+UMask=0077
+
+# Kernel & Hardware Protection
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+SystemCallArchitectures=native
+
+# Process & Identity Isolation
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=yes
+ProtectHostname=yes
+UtmpMode=no
+NoNewPrivileges=yes
+PrivateIPC=yes
+PrivateUsers=no
+RestrictNamespaces=yes
+RemoveIPC=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=true
+KeyringMode=private
+CoredumpFilter=0
+
+# Memory Protection
+MemoryDenyWriteExecute=yes
+
+# Network Restriction
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+PrivateNetwork=no
+
+# Syscall Filtering
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+SystemCallErrorNumber=EPERM
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @reboot @swap @resources @raw-io @privileged @keyring @pkey @memlock
+
+# Restart & Runtime
+Restart=always
+RestartSec=3
+RuntimeMaxSec=5d
+
+# Defaults
+LimitCORE=0
+LimitNOFILE=65536
+LimitNPROC=4096
+TimeoutStartSec=300
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target
