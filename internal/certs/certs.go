@@ -1,39 +1,22 @@
 package certs
 
 import (
-	"crypto"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"errors"
 	"fmt"
-	"math/big"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/coalaura/outboxd/internal/config"
-	"github.com/coalaura/outboxd/internal/disk"
 )
 
-type publicKeyEqualer interface{ Equal(crypto.PublicKey) bool }
-
-type generationTarget struct {
-	path  string
-	stage string
-}
-
 const (
-	reloadInterval       = time.Minute
-	maxCertificateBytes  = 4 << 20
-	maxPrivateKeyBytes   = 1 << 20
-	generationMarkerText = "outboxd self-signed tls generation\n"
+	reloadInterval      = time.Minute
+	maxCertificateBytes = 4 << 20
+	maxPrivateKeyBytes  = 1 << 20
 )
 
 // Keeper serves the submission certificate and picks up renewals without a
@@ -60,107 +43,6 @@ type Status struct {
 	NotAfter  time.Time
 	DNSNames  []string
 	LastError string
-}
-
-type publicKeyer interface {
-	Public() crypto.PublicKey
-}
-
-// Ensure loads the submission certificate, generating a self-signed pair when
-// tls.mode is self_signed and no usable pair exists yet.
-//
-// self_signed is development-only: ordinary SMTP clients will not trust the
-// certificate. Production must use tls.mode=files with a publicly trusted leaf.
-func Ensure(cfg *config.Config) (*Keeper, bool, error) {
-	keeper, err := configuredKeeper(cfg)
-	if err != nil {
-		return nil, false, err
-	}
-
-	created, err := keeper.ensureFiles()
-	if err != nil {
-		return nil, false, err
-	}
-
-	_, err = keeper.load()
-	if err != nil {
-		return nil, false, err
-	}
-
-	return keeper, created, nil
-}
-
-// Load reads and validates the serving certificate without creating or
-// modifying files. Deployment checks use this read-only path.
-func Load(cfg *config.Config) (*Keeper, error) {
-	keeper, err := configuredKeeper(cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	_, err = keeper.load()
-	if err != nil {
-		return nil, err
-	}
-
-	return keeper, nil
-}
-
-// Check validates the configured serving certificate without modifying files.
-func Check(cfg *config.Config) error {
-	return CheckWithRoots(cfg, nil)
-}
-
-// CheckWithRoots verifies the configured serving chain. A nil pool uses the
-// operating system roots; tests can provide a deterministic trust store.
-func CheckWithRoots(cfg *config.Config, roots *x509.CertPool) error {
-	keeper, err := Load(cfg)
-	if err != nil {
-		return err
-	}
-
-	keeper.mu.Lock()
-	certificate := keeper.certificate
-	keeper.mu.Unlock()
-
-	return verifyChain(certificate, keeper.hostname, roots, time.Now())
-}
-
-func configuredKeeper(cfg *config.Config) (*Keeper, error) {
-	certificateFile := cfg.ResolvePath(cfg.TLS.CertificateFile)
-	privateKeyFile := cfg.ResolvePath(cfg.TLS.PrivateKeyFile)
-
-	if cfg.TLS.Mode == "self_signed" {
-		var err error
-
-		certificateFile, err = cfg.ResolveGeneratedPath(cfg.TLS.CertificateFile)
-		if err != nil {
-			return nil, fmt.Errorf("tls certificate file: %w", err)
-		}
-
-		privateKeyFile, err = cfg.ResolveGeneratedPath(cfg.TLS.PrivateKeyFile)
-		if err != nil {
-			return nil, fmt.Errorf("tls private key file: %w", err)
-		}
-
-		err = cfg.CheckGeneratedParents(certificateFile)
-		if err != nil {
-			return nil, fmt.Errorf("tls certificate file: %w", err)
-		}
-
-		err = cfg.CheckGeneratedParents(privateKeyFile)
-		if err != nil {
-			return nil, fmt.Errorf("tls private key file: %w", err)
-		}
-	}
-
-	return &Keeper{
-		certificateFile: certificateFile,
-		privateKeyFile:  privateKeyFile,
-		minimumVersion:  cfg.MinimumTLSVersion(),
-		hostname:        cfg.Server.Hostname,
-		mode:            cfg.TLS.Mode,
-	}, nil
 }
 
 func (k *Keeper) ensureFiles() (bool, error) {
@@ -377,136 +259,6 @@ func (k *Keeper) parsePair(certPEM, keyPEM []byte) (*tls.Certificate, error) {
 	return &certificate, nil
 }
 
-func validateCertificate(certificate *tls.Certificate, hostname string) error {
-	if len(certificate.Certificate) == 0 {
-		return errors.New("tls certificate chain is empty")
-	}
-
-	leaf, err := x509.ParseCertificate(certificate.Certificate[0])
-	if err != nil {
-		return fmt.Errorf("parse leaf certificate: %w", err)
-	}
-
-	// Ensure private key matches the leaf (LoadX509KeyPair already checks, re-assert).
-	if certificate.PrivateKey != nil {
-		err = matchKey(leaf, certificate.PrivateKey)
-		if err != nil {
-			return err
-		}
-	}
-
-	now := time.Now()
-
-	if now.Before(leaf.NotBefore) {
-		return fmt.Errorf("tls certificate not yet valid (NotBefore %s)", leaf.NotBefore.Format(time.RFC3339))
-	}
-
-	if now.After(leaf.NotAfter) {
-		return fmt.Errorf("tls certificate expired (NotAfter %s)", leaf.NotAfter.Format(time.RFC3339))
-	}
-
-	// A pure CA presented as the only cert is not a usable TLS server leaf.
-	// Self-signed leaves must have IsCA=false (see generate). Legacy pairs
-	// with IsCA=true still work if they have ServerAuth and host match.
-	err = leafHasServerAuth(leaf)
-	if err != nil {
-		return err
-	}
-
-	if hostname != "" {
-		err = leaf.VerifyHostname(hostname)
-		if err != nil {
-			return fmt.Errorf("tls certificate does not match hostname %q: %w", hostname, err)
-		}
-	}
-
-	return nil
-}
-
-func verifyChain(certificate *tls.Certificate, hostname string, roots *x509.CertPool, now time.Time) error {
-	if certificate == nil || len(certificate.Certificate) == 0 {
-		return errors.New("tls certificate chain is empty")
-	}
-
-	leaf, err := x509.ParseCertificate(certificate.Certificate[0])
-	if err != nil {
-		return fmt.Errorf("parse leaf certificate: %w", err)
-	}
-
-	intermediates := x509.NewCertPool()
-
-	for _, raw := range certificate.Certificate[1:] {
-		intermediate, err := x509.ParseCertificate(raw)
-		if err != nil {
-			return fmt.Errorf("parse intermediate certificate: %w", err)
-		}
-
-		intermediates.AddCert(intermediate)
-	}
-
-	_, err = leaf.Verify(x509.VerifyOptions{
-		DNSName:       hostname,
-		Roots:         roots,
-		Intermediates: intermediates,
-		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		CurrentTime:   now,
-	})
-
-	if err != nil {
-		return fmt.Errorf("verify tls certificate chain: %w", err)
-	}
-
-	return nil
-}
-
-func matchKey(leaf *x509.Certificate, key any) error {
-	pk, ok := key.(publicKeyer)
-	if !ok {
-		return errors.New("tls private key type is unsupported")
-	}
-
-	pub, ok := pk.Public().(publicKeyEqualer)
-	if !ok {
-		// Fall back: compare raw SPKI encodings.
-		want, err := x509.MarshalPKIXPublicKey(leaf.PublicKey)
-		if err != nil {
-			return err
-		}
-
-		got, err := x509.MarshalPKIXPublicKey(pk.Public())
-		if err != nil {
-			return err
-		}
-
-		if string(want) != string(got) {
-			return errors.New("tls private key does not match certificate")
-		}
-
-		return nil
-	}
-
-	if !pub.Equal(leaf.PublicKey) {
-		return errors.New("tls private key does not match certificate")
-	}
-
-	return nil
-}
-
-func leafHasServerAuth(leaf *x509.Certificate) error {
-	if len(leaf.ExtKeyUsage) == 0 && len(leaf.UnknownExtKeyUsage) == 0 {
-		// Absent EKU means unrestricted; acceptable for many CA-minted leaves.
-		return nil
-	}
-
-	for _, u := range leaf.ExtKeyUsage {
-		if u == x509.ExtKeyUsageServerAuth || u == x509.ExtKeyUsageAny {
-			return nil
-		}
-	}
-
-	return errors.New("tls certificate lacks serverAuth extended key usage")
-}
-
 func (k *Keeper) readPair() ([]byte, []byte, [sha256.Size]byte, error) {
 	var fingerprint [sha256.Size]byte
 
@@ -533,15 +285,6 @@ func (k *Keeper) readPair() ([]byte, []byte, [sha256.Size]byte, error) {
 	return certPEM, keyPEM, fingerprint, nil
 }
 
-func certificateValid(certificate *tls.Certificate, now time.Time) bool {
-	if certificate == nil || len(certificate.Certificate) == 0 {
-		return false
-	}
-
-	leaf, err := x509.ParseCertificate(certificate.Certificate[0])
-	return err == nil && !now.Before(leaf.NotBefore) && now.Before(leaf.NotAfter)
-}
-
 func (k *Keeper) finishReloadError(certificate *tls.Certificate, err error) (*tls.Certificate, error) {
 	k.mu.Lock()
 	k.lastError = err
@@ -559,234 +302,99 @@ func (k *Keeper) finishReloadError(certificate *tls.Certificate, err error) (*tl
 	return nil, err
 }
 
-func (k *Keeper) generate(hostname string) error {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+// Ensure loads the submission certificate, generating a self-signed pair when
+// tls.mode is self_signed and no usable pair exists yet.
+//
+// self_signed is development-only: ordinary SMTP clients will not trust the
+// certificate. Production must use tls.mode=files with a publicly trusted leaf.
+func Ensure(cfg *config.Config) (*Keeper, bool, error) {
+	keeper, err := configuredKeeper(cfg)
 	if err != nil {
-		return err
+		return nil, false, err
 	}
 
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	created, err := keeper.ensureFiles()
 	if err != nil {
-		return err
+		return nil, false, err
 	}
 
-	now := time.Now()
-
-	// Leaf only: not a CA. DigitalSignature for TLS, ServerAuth EKU.
-	template := x509.Certificate{
-		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: hostname},
-		DNSNames:              []string{hostname},
-		NotBefore:             now.Add(-time.Hour),
-		NotAfter:              now.AddDate(10, 0, 0),
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		IsCA:                  false,
-	}
-
-	body, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	_, err = keeper.load()
 	if err != nil {
-		return err
+		return nil, false, err
 	}
 
-	encoded, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		return err
-	}
-
-	keyPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "PRIVATE KEY",
-		Bytes: encoded,
-	})
-
-	certPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "CERTIFICATE",
-		Bytes: body,
-	})
-
-	for _, path := range []string{k.privateKeyStage(), k.certificateStage()} {
-		if _, err = os.Lstat(path); err == nil {
-			return fmt.Errorf("self-signed tls staging file %q already exists", path)
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-
-	err = disk.WriteExclusive(k.generationMarker(), []byte(generationMarkerText), 0600)
-	if err != nil {
-		return err
-	}
-
-	err = disk.WriteExclusive(k.privateKeyStage(), keyPEM, 0600)
-	if err != nil {
-		return err
-	}
-
-	err = disk.WriteExclusive(k.certificateStage(), certPEM, 0644)
-	if err != nil {
-		return err
-	}
-
-	err = disk.Rename(k.privateKeyStage(), k.privateKeyFile)
-	if err != nil {
-		return err
-	}
-
-	err = disk.Rename(k.certificateStage(), k.certificateFile)
-	if err != nil {
-		return err
-	}
-
-	return removeDurable(k.generationMarker())
+	return keeper, created, nil
 }
 
-func (k *Keeper) generationMarker() string {
-	return k.certificateFile + ".outboxd-generation"
-}
-
-func (k *Keeper) certificateStage() string {
-	return k.certificateFile + ".outboxd-stage"
-}
-
-func (k *Keeper) privateKeyStage() string {
-	return k.privateKeyFile + ".outboxd-stage"
-}
-
-func (k *Keeper) recoverGeneration() (bool, error) {
-	targets := []generationTarget{
-		{k.privateKeyFile, k.privateKeyStage()},
-		{k.certificateFile, k.certificateStage()},
-	}
-
-	var (
-		present   int
-		available int
-		finals    int
-	)
-
-	for _, target := range targets {
-		_, targetErr := os.Stat(target.path)
-		_, stageErr := os.Stat(target.stage)
-
-		if targetErr == nil || stageErr == nil {
-			available++
-		}
-
-		if targetErr == nil {
-			finals++
-		}
-
-		if targetErr != nil && !errors.Is(targetErr, os.ErrNotExist) {
-			return false, targetErr
-		}
-
-		if stageErr != nil && !errors.Is(stageErr, os.ErrNotExist) {
-			return false, stageErr
-		}
-	}
-
-	if available != len(targets) {
-		if finals != 0 {
-			return false, errors.New("incomplete marked self-signed tls generation cannot be recovered without replacing a final file")
-		}
-
-		return false, k.discardGenerationStages()
-	}
-
-	certPath := k.certificateFile
-
-	_, err := os.Stat(certPath)
-	if errors.Is(err, os.ErrNotExist) {
-		certPath = k.certificateStage()
-	}
-
-	keyPath := k.privateKeyFile
-
-	_, err = os.Stat(keyPath)
-	if errors.Is(err, os.ErrNotExist) {
-		keyPath = k.privateKeyStage()
-	}
-
-	certPEM, certErr := config.ReadCheckedFile(certPath, false, false, maxCertificateBytes)
-	keyPEM, keyErr := config.ReadCheckedFile(keyPath, true, false, maxPrivateKeyBytes)
-
-	if certErr != nil || keyErr != nil {
-		if finals == 0 {
-			return false, k.discardGenerationStages()
-		}
-
-		return false, fmt.Errorf("validate interrupted self-signed generation: %w", errors.Join(certErr, keyErr))
-	}
-
-	_, err = k.parsePair(certPEM, keyPEM)
+// Load reads and validates the serving certificate without creating or
+// modifying files. Deployment checks use this read-only path.
+func Load(cfg *config.Config) (*Keeper, error) {
+	keeper, err := configuredKeeper(cfg)
 	if err != nil {
-		if finals == 0 {
-			return false, k.discardGenerationStages()
-		}
-
-		return false, fmt.Errorf("validate interrupted self-signed generation: %w", err)
+		return nil, err
 	}
 
-	for _, target := range targets {
-		_, targetErr := os.Stat(target.path)
-		_, stageErr := os.Stat(target.stage)
-
-		if targetErr == nil {
-			present++
-
-			if stageErr == nil {
-				err := removeDurable(target.stage)
-				if err != nil {
-					return false, err
-				}
-			}
-
-			continue
-		}
-
-		if stageErr == nil {
-			err := disk.Rename(target.stage, target.path)
-			if err != nil {
-				return false, err
-			}
-
-			present++
-		}
+	_, err = keeper.load()
+	if err != nil {
+		return nil, err
 	}
 
-	if present == len(targets) {
-		return true, removeDurable(k.generationMarker())
-	}
-
-	return false, errors.New("incomplete marked self-signed tls generation cannot be recovered")
+	return keeper, nil
 }
 
-func (k *Keeper) discardGenerationStages() error {
-	for _, stage := range []string{k.privateKeyStage(), k.certificateStage()} {
-		err := removeIfExistsDurable(stage)
+// Check validates the configured serving certificate without modifying files.
+func Check(cfg *config.Config) error {
+	return CheckWithRoots(cfg, nil)
+}
+
+// CheckWithRoots verifies the configured serving chain. A nil pool uses the
+// operating system roots; tests can provide a deterministic trust store.
+func CheckWithRoots(cfg *config.Config, roots *x509.CertPool) error {
+	keeper, err := Load(cfg)
+	if err != nil {
+		return err
+	}
+
+	keeper.mu.Lock()
+	certificate := keeper.certificate
+	keeper.mu.Unlock()
+
+	return verifyChain(certificate, keeper.hostname, roots, time.Now())
+}
+
+func configuredKeeper(cfg *config.Config) (*Keeper, error) {
+	certificateFile := cfg.ResolvePath(cfg.TLS.CertificateFile)
+	privateKeyFile := cfg.ResolvePath(cfg.TLS.PrivateKeyFile)
+
+	if cfg.TLS.Mode == "self_signed" {
+		var err error
+
+		certificateFile, err = cfg.ResolveGeneratedPath(cfg.TLS.CertificateFile)
 		if err != nil {
-			return err
+			return nil, fmt.Errorf("tls certificate file: %w", err)
+		}
+
+		privateKeyFile, err = cfg.ResolveGeneratedPath(cfg.TLS.PrivateKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("tls private key file: %w", err)
+		}
+
+		err = cfg.CheckGeneratedParents(certificateFile)
+		if err != nil {
+			return nil, fmt.Errorf("tls certificate file: %w", err)
+		}
+
+		err = cfg.CheckGeneratedParents(privateKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("tls private key file: %w", err)
 		}
 	}
 
-	return removeDurable(k.generationMarker())
-}
-
-func removeIfExistsDurable(path string) error {
-	err := removeDurable(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-
-	return err
-}
-
-func removeDurable(path string) error {
-	err := os.Remove(path)
-	if err != nil {
-		return err
-	}
-
-	return disk.Sync(filepath.Dir(path))
+	return &Keeper{
+		certificateFile: certificateFile,
+		privateKeyFile:  privateKeyFile,
+		minimumVersion:  cfg.MinimumTLSVersion(),
+		hostname:        cfg.Server.Hostname,
+		mode:            cfg.TLS.Mode,
+	}, nil
 }

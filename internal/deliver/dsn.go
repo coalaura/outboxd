@@ -15,7 +15,10 @@ import (
 	"github.com/coalaura/outboxd/internal/queue"
 )
 
-const dsnOriginalLimit = 256 << 10
+const (
+	dsnOriginalLimit  = 256 << 10
+	generatedDSNOwner = "\x00generated-dsn"
+)
 
 func (d *Deliverer) ensureDSN(envelope *queue.Envelope) error {
 	if envelope.DSNID != "" || envelope.DSNSourceID != "" || envelope.Sender == "" {

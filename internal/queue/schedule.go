@@ -251,3 +251,34 @@ func (s *schedule) Remove(envelope *Envelope) bool {
 
 	return true
 }
+
+func (q *Queue) signal() {
+	select {
+	case q.notify <- struct{}{}:
+	default:
+	}
+}
+
+func (q *Queue) scheduleLocked(envelope *Envelope) bool {
+	if _, blocked := q.blocked[envelope.ID]; blocked {
+		return false
+	}
+
+	accounted, exists := q.accounted[envelope.ID]
+	if !exists || accounted.incarnation != envelope.Incarnation || accounted.revision != envelope.Revision {
+		return false
+	}
+
+	_, exists = q.scheduled[envelope.ID]
+	if exists {
+		return false
+	}
+
+	queued := cloneEnvelope(envelope)
+
+	q.pending.Push(queued)
+
+	q.scheduled[envelope.ID] = queued
+
+	return true
+}
