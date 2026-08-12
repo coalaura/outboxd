@@ -1165,6 +1165,28 @@ func TestMXEqualPreferenceOrderingBeforeTruncation(t *testing.T) {
 	}
 }
 
+func TestMXMixedWithNullMXFails(t *testing.T) {
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	d := New(testDeliverCfg(), q, nopLogger{})
+	d.SetResolver(resolverFuncs{
+		mx: func(context.Context, string) ([]*net.MX, error) {
+			return []*net.MX{{Host: "."}, {Host: "mx.example."}}, nil
+		},
+		ips: func(context.Context, string, string) ([]net.IP, error) {
+			return nil, errors.New("unexpected address lookup")
+		},
+	})
+
+	_, err = d.hosts(context.Background(), "example")
+	if !errors.Is(err, errNullMX) {
+		t.Fatalf("mixed null MX error=%v, want errNullMX", err)
+	}
+}
+
 func TestMXEqualPreferenceCandidatesCanRotateAcrossRetries(t *testing.T) {
 	q, err := queue.Open(t.TempDir(), queue.Limits{})
 	if err != nil {

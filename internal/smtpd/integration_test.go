@@ -387,6 +387,32 @@ func TestSubmissionMessageSizeBoundary(t *testing.T) {
 	}
 }
 
+func TestSubmissionRecipientLimitCountsUniqueRecipients(t *testing.T) {
+	const password = "unique-recipient-password"
+	srv, cfg, spool, _, pool := testServerWithUser(t, password)
+	cfg.Server.MaxRecipients = 2
+	runTestSubmission(t, srv)
+
+	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
+	defer cl.close()
+	cl.authPlain(t, "alice", password)
+	cl.cmd(t, "MAIL FROM:<Alice.Sender@test.example>", 250)
+	cl.cmd(t, "RCPT TO:<a@example.com>", 250)
+	cl.cmd(t, "RCPT TO:<a@example.com>", 250)
+	cl.cmd(t, "RCPT TO:<b@example.com>", 250)
+	cl.cmd(t, "DATA", 354)
+	writeMessage(cl, "unique recipients")
+	cl.readCode(t, 250)
+
+	env, err := spool.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(env.Recipients) != 2 || env.Recipients[0].Address != "a@example.com" || env.Recipients[1].Address != "b@example.com" {
+		t.Fatalf("recipients=%v, want a@example.com and b@example.com", env.Recipients)
+	}
+}
+
 func TestSubmissionSizeProtocolBoundaries(t *testing.T) {
 	const password = "protocol-size-password"
 	srv, cfg, _, _, pool := testServerWithUser(t, password)

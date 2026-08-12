@@ -135,6 +135,11 @@ func loadOperationalConfig(configPath string) (*config.Config, *disk.FileLock, e
 
 func lockSpool(cfg *config.Config) (*disk.FileLock, error) {
 	queuePath := cfg.ResolvePath("queue")
+	err := disk.ValidatePath(queuePath)
+	if err != nil {
+		return nil, fmt.Errorf("validate spool namespace %s: %w", queuePath, err)
+	}
+
 	info, err := os.Stat(queuePath)
 	if err != nil {
 		return nil, fmt.Errorf("spool is not provisioned at %s: %w", queuePath, err)
@@ -168,6 +173,11 @@ func provision(configPath string) error {
 		return fmt.Errorf("configuration %s: %w", cfg.Path(), err)
 	}
 	defer ownership.Close()
+
+	err = disk.ValidatePath(cfg.ResolvedDataDir())
+	if err != nil {
+		return fmt.Errorf("validate data namespace %s: %w", cfg.ResolvedDataDir(), err)
+	}
 
 	err = disk.Mkdir(cfg.ResolvedDataDir())
 	if err != nil {
@@ -452,6 +462,11 @@ func runCheck(configPath string) error {
 	err = cfg.IsReady()
 	if err != nil {
 		return fmt.Errorf("configuration not ready: %w", err)
+	}
+
+	err = verifyBindAddresses(cfg)
+	if err != nil {
+		return err
 	}
 
 	opts := check.Options{Config: cfg, Resolver: check.DefaultResolver{}}

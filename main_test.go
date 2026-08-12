@@ -112,6 +112,67 @@ func TestRunCheckDoesNotGenerateMissingDKIMKey(t *testing.T) {
 	}
 }
 
+func TestRunCheckRejectsUnassignedDeliveryBindAddress(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	cfg, _, err := config.EnsurePath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, err := passwd.Hash("test-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Server.Hostname = "mail.example.com"
+	cfg.Server.Domain = "example.com"
+	cfg.DNS.PublicIPv4 = "203.0.113.10"
+	cfg.TLS.AllowSelfSignedServing = true
+	cfg.Users = []config.User{{Username: "alice", PasswordHash: hash, AllowedSenders: []string{"alice@example.com"}, Enabled: true}}
+	cfg.Delivery.BindIPv4 = "192.0.2.123"
+	if err = cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	err = runCheck(path)
+	if err == nil || !strings.Contains(err.Error(), "delivery bind address 192.0.2.123 is not configured") {
+		t.Fatalf("runCheck error=%v, want unassigned bind-address error", err)
+	}
+}
+
+func TestOperationsRejectLinkedDataDirectory(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "external")
+	if err := os.Mkdir(target, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.yml")
+	cfg, _, err := config.EnsurePath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Symlink(target, cfg.ResolvedDataDir()); err != nil {
+		t.Skipf("cannot create test data-directory link: %v", err)
+	}
+
+	for name, operation := range map[string]func(string) error{
+		"provision": provision,
+		"dns":       dns,
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := operation(path)
+			if err == nil || !strings.Contains(err.Error(), "symbolic link or reparse point") {
+				t.Fatalf("%s error=%v, want linked data-directory rejection", name, err)
+			}
+		})
+	}
+
+	for _, path := range []string{"queue", cfg.DKIM.PrivateKeyFile, cfg.DNS.OutputFile} {
+		if _, err := os.Lstat(filepath.Join(target, path)); !os.IsNotExist(err) {
+			t.Fatalf("operation created output below linked data directory %s: %v", path, err)
+		}
+	}
+}
+
 func TestProvisionCreatesDKIMKeyOnce(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yml")

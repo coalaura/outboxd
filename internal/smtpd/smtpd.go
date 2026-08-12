@@ -48,6 +48,12 @@ var (
 		Message:      "Queue full, try again later",
 	}
 
+	errTooManyRecipients = &smtp.SMTPError{
+		Code:         452,
+		EnhancedCode: smtp.EnhancedCode{4, 5, 3},
+		Message:      "Too many recipients",
+	}
+
 	errDataBusy = &smtp.SMTPError{
 		Code:         421,
 		EnhancedCode: smtp.EnhancedCode{4, 3, 2},
@@ -211,7 +217,6 @@ func (s *Server) newSMTP(cfg *config.Config, keeper *certs.Keeper) *smtp.Server 
 	server.Domain = cfg.Server.Hostname
 	server.TLSConfig = keeper.Config()
 	server.MaxMessageBytes = cfg.Server.MaxMessageBytes
-	server.MaxRecipients = cfg.Server.MaxRecipients
 	server.ReadTimeout = config.Duration(cfg.Server.ReadTimeout)
 	server.WriteTimeout = config.Duration(cfg.Server.WriteTimeout)
 	server.AllowInsecureAuth = false

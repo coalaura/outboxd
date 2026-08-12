@@ -2741,6 +2741,22 @@ func TestStaleHandleCannotMutateReplacement(t *testing.T) {
 	}
 }
 
+func TestTransitionsRejectNilEnvelope(t *testing.T) {
+	q := mustOpen(t, t.TempDir(), Limits{})
+	for name, operation := range map[string]func(*Envelope) error{
+		"retry":  q.Retry,
+		"finish": q.Finish,
+		"bury":   q.Bury,
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := operation(nil)
+			if !errors.Is(err, errNilEnvelope) {
+				t.Fatalf("%s(nil) error=%v, want errNilEnvelope", name, err)
+			}
+		})
+	}
+}
+
 func TestRequeueIsIdempotentAndRejectsStaleRevision(t *testing.T) {
 	clearHooks(t)
 	q := mustOpen(t, t.TempDir(), Limits{})

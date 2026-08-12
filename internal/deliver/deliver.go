@@ -1285,13 +1285,13 @@ func (d *Deliverer) hosts(ctx context.Context, domain string) ([]string, error) 
 		return []string{domain}, nil
 	}
 
-	if len(records) == 1 && records[0] != nil && records[0].Host == "." {
-		return nil, errNullMX
-	}
-
 	valid := make([]*net.MX, 0, len(records))
 	for _, record := range records {
 		if record != nil {
+			if record.Host == "." {
+				return nil, errNullMX
+			}
+
 			valid = append(valid, record)
 		}
 	}

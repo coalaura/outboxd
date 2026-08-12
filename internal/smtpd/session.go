@@ -161,6 +161,10 @@ func (s *session) Rcpt(to string, opts *smtp.RcptOptions) error {
 		return nil
 	}
 
+	if len(s.recipients) == s.server.cfg.Server.MaxRecipients {
+		return errTooManyRecipients
+	}
+
 	s.recipients = append(s.recipients, address)
 
 	return nil

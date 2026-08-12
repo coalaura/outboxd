@@ -69,6 +69,8 @@ const MinimumSpoolEmergencyBytes int64 = 16 << 20
 
 var terminalSpoolReserve = disk.AllocationSize(maxEnvelopeMetadata+disk.AllocationSize(0)) + disk.AllocationSize(0)
 
+var errNilEnvelope = errors.New("nil envelope")
+
 const (
 	metaName       = "meta.json"
 	bodyName       = "message.eml"
@@ -1806,6 +1808,10 @@ func (q *Queue) blockCheckedOut(id string, cause, relocation error) {
 // it remains under ready/ and is returned to the schedule so a subsequent
 // Open recovers it. The error is returned to the caller.
 func (q *Queue) Retry(envelope *Envelope) error {
+	if envelope == nil {
+		return errNilEnvelope
+	}
+
 	err := q.beginOperation()
 	if err != nil {
 		return err
@@ -1912,6 +1918,10 @@ func (q *Queue) Retry(envelope *Envelope) error {
 // directory is renamed into trash/ then removed. A crash after rename leaves
 // a trash entry cleaned on Open.
 func (q *Queue) Finish(envelope *Envelope) error {
+	if envelope == nil {
+		return errNilEnvelope
+	}
+
 	err := q.beginOperation()
 	if err != nil {
 		return err
@@ -1983,6 +1993,10 @@ func (q *Queue) Finish(envelope *Envelope) error {
 // Bury moves an undeliverable message into the dead-letter directory atomically
 // (single directory rename). Metadata is written first inside ready/.
 func (q *Queue) Bury(envelope *Envelope) error {
+	if envelope == nil {
+		return errNilEnvelope
+	}
+
 	err := q.beginOperation()
 	if err != nil {
 		return err
