@@ -21,17 +21,11 @@ const (
 	maxResponseRead      = 1024
 )
 
-var errSMTPResponseTooLarge = errors.New("SMTP response exceeds size limit")
-
 // SMTPError is a negative SMTP reply.
 type SMTPError struct {
 	Code         int
 	EnhancedCode string
 	Message      string
-}
-
-func (e *SMTPError) Error() string {
-	return fmt.Sprintf("%d %s", e.Code, e.Message)
 }
 
 // MailOpts controls MAIL FROM parameters.
@@ -67,6 +61,12 @@ type boundedResponseConn struct {
 	mu        sync.Mutex
 	remaining int
 	exceeded  bool
+}
+
+var errSMTPResponseTooLarge = errors.New("SMTP response exceeds size limit")
+
+func (e *SMTPError) Error() string {
+	return fmt.Sprintf("%d %s", e.Code, e.Message)
 }
 
 // NewClient wraps an established connection after dial; call Greet next.

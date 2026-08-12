@@ -14,6 +14,42 @@ import (
 // quota admission cannot rely on optimistic apparent sizes.
 const allocationUnit int64 = 64 << 10
 
+// Hooks provide a narrow fault-injection seam for tests. Production code
+// leaves them nil.
+type Hooks struct {
+	// BeforeRead is called before queue recovery opens a durable file.
+	BeforeRead func(path string) error
+
+	// BeforeRemoveAll is called immediately before recursively removing a path.
+	BeforeRemoveAll func(path string) error
+
+	// BeforeSyncFile is called immediately before syncing an open file.
+	BeforeSyncFile func(path string) error
+
+	// AfterSyncFile is called after a successful file sync.
+	AfterSyncFile func(path string) error
+
+	// AfterClose is called after a successful file.Close before rename.
+	AfterClose func(path string) error
+
+	// AfterRename is called after a successful rename.
+	AfterRename func(oldpath, newpath string) error
+
+	// AfterSyncDir is called after a successful directory Sync.
+	AfterSyncDir func(path string) error
+
+	// BeforeSyncDir is called immediately before syncing a directory.
+	BeforeSyncDir func(path string) error
+
+	// BeforeRename is called just before rename.
+	BeforeRename func(oldpath, newpath string) error
+}
+
+var (
+	hookMu sync.RWMutex
+	hooks  Hooks
+)
+
 // AllocationSize returns a conservative application admission estimate for
 // one filesystem object. It is not a measurement of physical disk usage.
 // Directory entries and empty files still cost one allocation unit; sparse
@@ -58,37 +94,6 @@ func AllocatedBytes(root string) (int64, error) {
 	return total, err
 }
 
-// Hooks provide a narrow fault-injection seam for tests. Production code
-// leaves them nil.
-type Hooks struct {
-	// BeforeRead is called before queue recovery opens a durable file.
-	BeforeRead func(path string) error
-
-	// BeforeRemoveAll is called immediately before recursively removing a path.
-	BeforeRemoveAll func(path string) error
-
-	// BeforeSyncFile is called immediately before syncing an open file.
-	BeforeSyncFile func(path string) error
-
-	// AfterSyncFile is called after a successful file sync.
-	AfterSyncFile func(path string) error
-
-	// AfterClose is called after a successful file.Close before rename.
-	AfterClose func(path string) error
-
-	// AfterRename is called after a successful rename.
-	AfterRename func(oldpath, newpath string) error
-
-	// AfterSyncDir is called after a successful directory Sync.
-	AfterSyncDir func(path string) error
-
-	// BeforeSyncDir is called immediately before syncing a directory.
-	BeforeSyncDir func(path string) error
-
-	// BeforeRename is called just before rename.
-	BeforeRename func(oldpath, newpath string) error
-}
-
 // CheckRead runs the recovery read fault seam.
 func CheckRead(path string) error {
 	h := currentHooks()
@@ -99,11 +104,6 @@ func CheckRead(path string) error {
 
 	return nil
 }
-
-var (
-	hookMu sync.RWMutex
-	hooks  Hooks
-)
 
 // SetHooks installs test hooks. Pass a zero Hooks to clear.
 func SetHooks(h Hooks) {

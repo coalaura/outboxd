@@ -15,6 +15,8 @@ import (
 	"github.com/coalaura/outboxd/internal/queue"
 )
 
+const dsnOriginalLimit = 256 << 10
+
 func (d *Deliverer) ensureDSN(envelope *queue.Envelope) error {
 	if envelope.DSNID != "" || envelope.DSNSourceID != "" || envelope.Sender == "" {
 		return nil
@@ -96,8 +98,6 @@ func (d *Deliverer) ensureDSN(envelope *queue.Envelope) error {
 
 	return d.queue.AddDSN(envelope, dsnEnv, msg)
 }
-
-const dsnOriginalLimit = 256 << 10
 
 func readDSNOriginal(r io.ReadCloser) (original []byte, err error) {
 	defer func() {

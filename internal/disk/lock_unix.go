@@ -9,6 +9,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+type unixFileLock struct {
+	f *os.File
+}
+
 // Lock acquires an exclusive, non-blocking flock on path, creating the file if
 // needed. The returned FileLock must stay open for the duration of the lock.
 func Lock(path string) (*FileLock, error) {
@@ -30,11 +34,6 @@ func Lock(path string) (*FileLock, error) {
 
 	return &FileLock{impl: &unixFileLock{f: f}}, nil
 }
-
-type unixFileLock struct {
-	f *os.File
-}
-
 func (l *unixFileLock) close() error {
 	if l.f == nil {
 		return nil

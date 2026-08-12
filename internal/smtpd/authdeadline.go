@@ -11,24 +11,21 @@ type connectionKey struct {
 	remote string
 }
 
-func keyForConn(conn net.Conn) connectionKey {
-	key := connectionKey{}
-
-	if conn.LocalAddr() != nil {
-		key.local = conn.LocalAddr().String()
-	}
-
-	if conn.RemoteAddr() != nil {
-		key.remote = conn.RemoteAddr().String()
-	}
-
-	return key
-}
-
 type authDeadlineListener struct {
 	net.Listener
 	server   *Server
 	lifetime time.Duration
+}
+
+type authDeadlineConn struct {
+	net.Conn
+	server *Server
+	key    connectionKey
+
+	mu       sync.Mutex
+	deadline time.Time
+	active   bool
+	once     sync.Once
 }
 
 func newAuthDeadlineListener(listener net.Listener, server *Server, lifetime time.Duration) net.Listener {
@@ -56,15 +53,18 @@ func (l *authDeadlineListener) Accept() (net.Conn, error) {
 	return bounded, nil
 }
 
-type authDeadlineConn struct {
-	net.Conn
-	server *Server
-	key    connectionKey
+func keyForConn(conn net.Conn) connectionKey {
+	key := connectionKey{}
 
-	mu       sync.Mutex
-	deadline time.Time
-	active   bool
-	once     sync.Once
+	if conn.LocalAddr() != nil {
+		key.local = conn.LocalAddr().String()
+	}
+
+	if conn.RemoteAddr() != nil {
+		key.remote = conn.RemoteAddr().String()
+	}
+
+	return key
 }
 
 func (c *authDeadlineConn) clamp(deadline time.Time) time.Time {

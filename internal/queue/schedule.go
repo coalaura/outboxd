@@ -7,6 +7,24 @@ import (
 
 type envelopeHeap []*Envelope
 
+type userQueue struct {
+	name     string
+	messages envelopeHeap
+	index    int
+	due      bool
+}
+
+type userHeap []*userQueue
+
+// schedule keeps one NextAttempt heap per owner. Due owners rotate through due,
+// so a busy owner contributes at most one message per scheduling quantum.
+type schedule struct {
+	users  map[string]*userQueue
+	future userHeap
+	due    []*userQueue
+	count  int
+}
+
 func (h envelopeHeap) Len() int {
 	return len(h)
 }
@@ -49,15 +67,6 @@ func (h *envelopeHeap) Pop() any {
 
 	return envelope
 }
-
-type userQueue struct {
-	name     string
-	messages envelopeHeap
-	index    int
-	due      bool
-}
-
-type userHeap []*userQueue
 
 func (h userHeap) Len() int {
 	return len(h)
@@ -102,15 +111,6 @@ func (h *userHeap) Pop() any {
 	*h = old[:last]
 
 	return user
-}
-
-// schedule keeps one NextAttempt heap per owner. Due owners rotate through due,
-// so a busy owner contributes at most one message per scheduling quantum.
-type schedule struct {
-	users  map[string]*userQueue
-	future userHeap
-	due    []*userQueue
-	count  int
 }
 
 func (s *schedule) Len() int {

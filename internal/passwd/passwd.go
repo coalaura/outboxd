@@ -19,6 +19,9 @@ const (
 
 	saltLength = 16
 	keyLength  = 32
+
+	// Bound the entire PHC string before field work.
+	maxPHCLength = 512
 )
 
 var (
@@ -74,11 +77,6 @@ func Verify(hash, password string) (bool, error) {
 func Waste() {
 	argon2.IDKey([]byte("outboxd"), make([]byte, saltLength), hashTime, hashMemory, hashThreads, keyLength)
 }
-
-const (
-	// Bound the entire PHC string before field work.
-	maxPHCLength = 512
-)
 
 // maxEncodedLen is the maximum base64.RawStdEncoding length for n decoded bytes.
 func maxEncodedLen(n int) int {

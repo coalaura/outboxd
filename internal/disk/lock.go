@@ -12,6 +12,11 @@ type FileLock struct {
 	impl fileLockImpl
 }
 
+// fileLockImpl is the platform-specific lock state.
+type fileLockImpl interface {
+	close() error
+}
+
 // Close releases the lock and closes the underlying file.
 func (l *FileLock) Close() error {
 	if l == nil || l.impl == nil {
@@ -23,9 +28,4 @@ func (l *FileLock) Close() error {
 	l.impl = nil
 
 	return err
-}
-
-// fileLockImpl is the platform-specific lock state.
-type fileLockImpl interface {
-	close() error
 }

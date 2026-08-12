@@ -28,6 +28,8 @@ import (
 
 const maxConfigFileBytes = 1 << 20
 
+var reportSizeRE = regexp.MustCompile(`(?i)![0-9]+[kmgt]?$`)
+
 type Config struct {
 	dataMu *sync.RWMutex
 	fileMu *sync.Mutex
@@ -1439,8 +1441,6 @@ func validateReportURI(uri string, dmarc bool) error {
 
 	return nil
 }
-
-var reportSizeRE = regexp.MustCompile(`(?i)![0-9]+[kmgt]?$`)
 
 // ExpectedSPF returns the effective policy emitted by DNS generation.
 func (cfg *Config) ExpectedSPF() string {

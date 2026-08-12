@@ -9,6 +9,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+type winFileLock struct {
+	f *os.File
+}
+
 // Lock acquires an exclusive, non-blocking byte-range lock on path, creating
 // the file if needed. The returned FileLock must stay open for the lock's life.
 func Lock(path string) (*FileLock, error) {
@@ -39,11 +43,6 @@ func Lock(path string) (*FileLock, error) {
 
 	return &FileLock{impl: &winFileLock{f: f}}, nil
 }
-
-type winFileLock struct {
-	f *os.File
-}
-
 func (l *winFileLock) close() error {
 	if l.f == nil {
 		return nil

@@ -75,6 +75,11 @@ type field struct {
 	value []byte
 }
 
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
 var parser = mail.AddressParser{WordDecoder: new(mime.WordDecoder)}
 
 func (f field) text() string {
@@ -321,11 +326,6 @@ func PrepareContext(ctx context.Context, r io.Reader, opts Options) (*Message, e
 		NeedsUTF8: needsUTF8,
 		EightBit:  eightBit,
 	}, nil
-}
-
-type contextReader struct {
-	ctx    context.Context
-	reader io.Reader
 }
 
 func (r contextReader) Read(p []byte) (int, error) {
