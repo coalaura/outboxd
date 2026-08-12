@@ -1,10 +1,10 @@
 # outboxd
 
-outboxd is a small outbound mail server. It accepts authenticated SMTP submission from configured users, DKIM-signs messages, queues them durably and delivers them to recipient MX servers.
+outboxd is a small outbound mail server for straightforward, properly signed mail delivery. It accepts authenticated SMTP submission from configured users, DKIM-signs messages, queues them durably and delivers them to recipient MX servers.
 
 It is for sending mail. It is not an inbound MX, mailbox server, IMAP server, spam filter or webmail application.
 
-The intended setup is one configuration file and one private data directory. Set a hostname, sending domain and public IP, provision the key material, add users, publish the generated DNS records, then start the daemon. For a server that already has a hostname, public IP and TLS certificate, this is typically a short setup rather than integrating Postfix, Dovecot and OpenDKIM separately.
+The project was started after I spent way too long configuring Postfix, Dovecot and OpenDKIM to work together for a small sending service. The intended setup is one complete, understandable configuration file and one private data directory: set a hostname, sending domain and public IP, provision key material, add users, publish the generated DNS records, then start the daemon.
 
 ## What You Need
 
