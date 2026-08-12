@@ -31,6 +31,17 @@ const (
 var (
 	errBodyTooShort = errors.New("queued body shorter than envelope size")
 	errBodyTooLong  = errors.New("queued body longer than envelope size")
+
+	errNullMX              = errors.New("domain does not accept mail (null MX)")
+	errNoSuchDomain        = errors.New("recipient domain does not exist")
+	errSMTPUTF8Unsupported = errors.New("destination does not support SMTPUTF8")
+	err8BITMIMEUnsupported = errors.New("destination does not support 8BITMIME")
+	errTLSRequired         = errors.New("TLS required but STARTTLS not available")
+	errTLSFailed           = errors.New("STARTTLS failed; refusing plaintext downgrade")
+	errNoUsableIP          = errors.New("no usable destination address")
+	errPrivateDestination  = errors.New("destination address is not publicly routable")
+	errAttemptTimeout      = errors.New("delivery attempt timeout exceeded")
+	errLifetime            = errors.New("maximum queue lifetime exceeded")
 )
 
 // Logger receives operational messages.
@@ -73,19 +84,6 @@ func (n netResolver) LookupNetIP(ctx context.Context, network, host string) ([]n
 	return out, nil
 }
 
-var (
-	errNullMX              = errors.New("domain does not accept mail (null MX)")
-	errNoSuchDomain        = errors.New("recipient domain does not exist")
-	errSMTPUTF8Unsupported = errors.New("destination does not support SMTPUTF8")
-	err8BITMIMEUnsupported = errors.New("destination does not support 8BITMIME")
-	errTLSRequired         = errors.New("TLS required but STARTTLS not available")
-	errTLSFailed           = errors.New("STARTTLS failed; refusing plaintext downgrade")
-	errNoUsableIP          = errors.New("no usable destination address")
-	errPrivateDestination  = errors.New("destination address is not publicly routable")
-	errAttemptTimeout      = errors.New("delivery attempt timeout exceeded")
-	errLifetime            = errors.New("maximum queue lifetime exceeded")
-)
-
 // outboundTLS is the effective TLS policy for one dial attempt, computed before connect.
 type outboundTLS struct {
 	// requireSTARTTLS rejects destinations that do not advertise STARTTLS.
@@ -103,8 +101,10 @@ type outboundTLS struct {
 
 func (d *Deliverer) effectiveTLS() outboundTLS {
 	mode := d.cfg.Delivery.TLSMode
+
 	insecure := d.cfg.Delivery.InsecureTLSAllowed()
 	allowPlain := d.cfg.Delivery.PlaintextAllowed()
+
 	return outboundTLS{
 		requireSTARTTLS:    mode == "required" || !allowPlain,
 		insecureSkipVerify: insecure,
@@ -177,22 +177,27 @@ func New(cfg *config.Config, spool *queue.Queue, log Logger) *Deliverer {
 // NewWithSigner is New with an optional DKIM signer for failure DSNs.
 func NewWithSigner(cfg *config.Config, spool *queue.Queue, log Logger, signer Signer) *Deliverer {
 	defaults := config.Default().Delivery
+
 	userConcurrency := cfg.Delivery.UserConcurrency
 	if userConcurrency <= 0 {
 		userConcurrency = defaults.UserConcurrency
 	}
+
 	maxMX := cfg.Delivery.MaxMXCandidates
 	if maxMX <= 0 {
 		maxMX = defaults.MaxMXCandidates
 	}
+
 	maxIP := cfg.Delivery.MaxIPCandidatesPerMX
 	if maxIP <= 0 {
 		maxIP = defaults.MaxIPCandidatesPerMX
 	}
+
 	dnsTimeout := config.Duration(cfg.Delivery.DNSTimeout)
 	if dnsTimeout <= 0 {
 		dnsTimeout = config.Duration(defaults.DNSTimeout)
 	}
+
 	attemptTimeout := config.Duration(cfg.Delivery.AttemptTimeout)
 	if attemptTimeout <= 0 {
 		attemptTimeout = config.Duration(defaults.AttemptTimeout)
@@ -283,6 +288,7 @@ func (d *Deliverer) Run(ctx context.Context) error {
 		if err != nil {
 			cancel()
 			wg.Wait()
+
 			return err
 		}
 
@@ -314,14 +320,17 @@ func (d *Deliverer) Run(ctx context.Context) error {
 		admittedOwner := deliveryOwner(envelope)
 		if !d.users.tryAcquire(admittedOwner) {
 			d.queue.RequeueAfter(envelope, d.admission)
+
 			continue
 		}
 
 		admittedDomain := nextPendingDomain(envelope)
 		if !d.domains.tryAcquire(admittedDomain) {
 			d.users.release(admittedOwner)
+
 			// Admission is an in-memory scheduling decision, not a delivery attempt.
 			d.queue.RequeueAfter(envelope, d.admission)
+
 			continue
 		}
 
@@ -331,6 +340,7 @@ func (d *Deliverer) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			d.domains.release(admittedDomain)
 			d.users.release(admittedOwner)
+
 			d.queue.Requeue(envelope)
 
 			ferr := d.fatalErr()
@@ -342,7 +352,9 @@ func (d *Deliverer) Run(ctx context.Context) error {
 		}
 
 		wg.Go(func() {
-			defer func() { <-d.active }()
+			defer func() {
+				<-d.active
+			}()
 
 			err := d.attemptAdmitted(ctx, envelope, admittedOwner, admittedDomain)
 			if err != nil {
@@ -350,22 +362,29 @@ func (d *Deliverer) Run(ctx context.Context) error {
 					quarantineErr := d.queue.QuarantineCheckedOut(envelope, err)
 					if quarantineErr != nil {
 						d.log.Printf("failed to quarantine corrupt queue item %s; item blocked: %s\n", envelope.ID, quarantineErr)
+
 						if errors.Is(quarantineErr, queue.ErrIDConflict) {
 							d.setFatal(fmt.Errorf("quarantine %s after %w failed with ambiguous identity: %w", envelope.ID, err, quarantineErr))
+
 							cancel()
 						}
 					} else {
 						d.log.Printf("quarantined corrupt queue item %s: %s\n", envelope.ID, err)
 					}
+
 					return
 				}
+
 				if queue.IsStoragePressure(err) {
 					d.queue.RequeueAfter(envelope, storageRetryDelay)
+
 					d.log.Printf("storage pressure handling %s; retrying queue state in %s: %s\n", envelope.ID, storageRetryDelay, err)
+
 					return
 				}
 
 				d.setFatal(err)
+
 				cancel()
 			}
 		})
@@ -387,6 +406,7 @@ func deliveryOwner(envelope *queue.Envelope) string {
 	if envelope.DSNSourceID != "" {
 		return generatedDSNOwner
 	}
+
 	return envelope.Username
 }
 
@@ -402,6 +422,7 @@ func (d *Deliverer) setFatal(err error) {
 func (d *Deliverer) fatalErr() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
 	return d.fatal
 }
 
@@ -409,20 +430,28 @@ func (d *Deliverer) attempt(ctx context.Context, envelope *queue.Envelope) error
 	owner := deliveryOwner(envelope)
 	if !d.users.tryAcquire(owner) {
 		envelope.NextAttempt = time.Now().Add(d.admission)
-		if err := d.queue.Retry(envelope); err != nil {
+
+		err := d.queue.Retry(envelope)
+		if err != nil {
 			return fmt.Errorf("reschedule %s for user capacity: %w", envelope.ID, err)
 		}
+
 		return nil
 	}
 
 	domain := nextPendingDomain(envelope)
 	if !d.domains.tryAcquire(domain) {
 		d.users.release(owner)
+
 		envelope.NextAttempt = time.Now().Add(d.admission)
+
 		d.log.Printf("rescheduling %s for domain capacity in %s\n", envelope.ID, d.admission)
-		if err := d.queue.Retry(envelope); err != nil {
+
+		err := d.queue.Retry(envelope)
+		if err != nil {
 			return fmt.Errorf("reschedule %s for domain capacity: %w", envelope.ID, err)
 		}
+
 		return nil
 	}
 
@@ -431,7 +460,9 @@ func (d *Deliverer) attempt(ctx context.Context, envelope *queue.Envelope) error
 
 func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelope, admittedOwner, admittedDomain string) error {
 	defer d.users.release(admittedOwner)
+
 	heldDomain := admittedDomain
+
 	defer func() {
 		if heldDomain != "" {
 			d.domains.release(heldDomain)
@@ -440,6 +471,7 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 
 	if ctx.Err() != nil {
 		d.queue.Requeue(envelope)
+
 		return nil
 	}
 
@@ -456,11 +488,13 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 	lifetimeDeadline := envelope.Created.Add(d.lifetime)
 	deadline := lifetimeDeadline
 	deadlineCause := error(errLifetime)
+
 	attemptDeadline := time.Now().Add(d.attemptTO)
 	if attemptDeadline.Before(deadline) {
 		deadline = attemptDeadline
 		deadlineCause = errAttemptTimeout
 	}
+
 	ctx, cancel := context.WithDeadlineCause(ctx, deadline, deadlineCause)
 	defer cancel()
 
@@ -491,21 +525,29 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 		if ctx.Err() != nil {
 			break
 		}
+
 		if heldDomain != domain {
 			if !d.domains.tryAcquire(domain) {
 				diagnostics = append(diagnostics, normalizeDiagnostic(fmt.Sprintf("%s: delivery concurrency unavailable", domain)))
+
 				break
 			}
+
 			heldDomain = domain
 		}
 
 		previousDetails := make([]string, len(indexes))
+
 		for i, index := range indexes {
 			previousDetails[i] = envelope.Recipients[index].Detail
 		}
+
 		err := d.domain(ctx, envelope, domain, indexes)
+
 		d.domains.release(domain)
+
 		heldDomain = ""
+
 		if queue.IsCorruption(err) {
 			return err
 		}
@@ -517,11 +559,15 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 					recipient.Detail = previousDetails[i]
 				}
 			}
+
 			break
 		}
+
 		if err != nil {
 			detail := normalizeDiagnostic(fmt.Sprintf("%s: %s", domain, err))
+
 			diagnostics = append(diagnostics, detail)
+
 			for _, index := range indexes {
 				recipient := &envelope.Recipients[index]
 				if recipient.Status == queue.StatusPending && recipient.Detail == "" {
@@ -530,10 +576,12 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 			}
 		}
 	}
+
 	outcomeCause := context.Cause(ctx)
 	if outcomeCause == nil && !time.Now().Before(deadline) {
 		outcomeCause = deadlineCause
 	}
+
 	if errors.Is(outcomeCause, errAttemptTimeout) {
 		diagnostics = append(diagnostics, errAttemptTimeout.Error())
 	}
@@ -546,6 +594,7 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 	case parentCtx.Err() != nil:
 		envelope.Attempts--
 		envelope.NextAttempt = time.Now()
+
 		err = d.queue.Retry(envelope)
 		if err != nil {
 			return fmt.Errorf("retry canceled %s: %w", envelope.ID, err)
@@ -555,7 +604,6 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 	case errors.Is(outcomeCause, errLifetime):
 		return d.expirePending(envelope)
 	case envelope.Attempts >= d.cfg.Delivery.MaxAttempts:
-
 		for i := range envelope.Recipients {
 			recipient := &envelope.Recipients[i]
 			if recipient.Status == queue.StatusPending {
@@ -575,9 +623,11 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 		}
 
 		d.log.Printf("giving up on %s after %d attempts: %s\n", envelope.ID, envelope.Attempts, envelope.LastError)
+
 		return d.failTerminal(envelope)
 	default:
 		envelope.NextAttempt = time.Now().Add(d.backoff(envelope.Attempts))
+
 		deadline := envelope.Created.Add(d.lifetime)
 		if deadline.Before(envelope.NextAttempt) {
 			envelope.NextAttempt = deadline
@@ -605,6 +655,7 @@ func (d *Deliverer) expire(envelope *queue.Envelope) (bool, error) {
 func (d *Deliverer) expirePending(envelope *queue.Envelope) error {
 	for i := range envelope.Recipients {
 		recipient := &envelope.Recipients[i]
+
 		if recipient.Status == queue.StatusPending {
 			recipient.Status = queue.StatusFailed
 			recipient.Detail = lifetimeDetail
@@ -614,7 +665,9 @@ func (d *Deliverer) expirePending(envelope *queue.Envelope) error {
 	}
 
 	envelope.LastError = lifetimeDetail
+
 	d.log.Printf("expiring %s after %s\n", envelope.ID, d.lifetime)
+
 	return d.failTerminal(envelope)
 }
 
@@ -646,6 +699,7 @@ func (d *Deliverer) complete(envelope *queue.Envelope) error {
 	if err != nil {
 		if errors.Is(err, queue.ErrCleanup) {
 			d.log.Printf("finished %s with deferred cleanup: %s\n", envelope.ID, err)
+
 			return nil
 		}
 
@@ -674,6 +728,7 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 	if err != nil {
 		if errors.Is(err, errNullMX) || errors.Is(err, errNoSuchDomain) {
 			d.reject(envelope, indexes, err.Error())
+
 			return nil
 		}
 
@@ -701,6 +756,7 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 		}
 
 		done, err := d.send(ctx, envelope, host, indexes)
+
 		d.releaseGlobal()
 
 		if done {
@@ -711,6 +767,7 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 			// send returned without completing or failing recipients permanently.
 			capabilityOnly = false
 			sawRetryable = true
+
 			continue
 		}
 
@@ -751,11 +808,13 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 
 	if sawEligible && capabilityOnly && (sawUTF8CapErr || sawEightBitCapErr) {
 		d.reject(envelope, indexes, capabilityDetail(sawUTF8CapErr, sawEightBitCapErr))
+
 		return nil
 	}
 
 	if last != nil && !sawRetryable && errors.Is(last, errPrivateDestination) {
 		d.reject(envelope, indexes, last.Error())
+
 		return nil
 	}
 
@@ -808,6 +867,7 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 		supported, _ := client.Extension("SMTPUTF8")
 		if !supported {
 			_ = client.Quit()
+
 			return false, errSMTPUTF8Unsupported
 		}
 	}
@@ -816,6 +876,7 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 		supported, _ := client.Extension("8BITMIME")
 		if !supported {
 			_ = client.Quit()
+
 			return false, err8BITMIMEUnsupported
 		}
 	}
@@ -825,14 +886,17 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 		UTF8:     envelope.SMTPUTF8,
 		EightBit: envelope.EightBit,
 	})
+
 	if err != nil {
 		if errors.Is(err, errSMTPUTF8Unsupported) || errors.Is(err, err8BITMIMEUnsupported) {
 			_ = client.Quit()
+
 			return false, err
 		}
 
 		if permanent(err) {
 			d.rejectSMTP(envelope, indexes, err)
+
 			return true, nil
 		}
 
@@ -851,29 +915,36 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 		err = client.Rcpt(recipient.Address)
 		if err == nil {
 			accepted = append(accepted, index)
+
 			continue
 		}
 
 		if permanent(err) {
 			d.rejectSMTP(envelope, []int{index}, err)
+
 			continue
 		}
 
 		recipient.Detail = describe(err)
+
 		temporary = append(temporary, fmt.Sprintf("%s: %s", recipient.Address, recipient.Detail))
 	}
 
 	if len(accepted) == 0 {
 		_ = client.Quit()
+
 		if len(temporary) > 0 {
 			return false, fmt.Errorf("temporary RCPT failures: %s", strings.Join(temporary, "; "))
 		}
+
 		return true, nil
 	}
 
 	openReader := d.reader
 	if openReader == nil {
-		openReader = func(id string) (io.ReadCloser, error) { return d.queue.Reader(id) }
+		openReader = func(id string) (io.ReadCloser, error) {
+			return d.queue.Reader(id)
+		}
 	}
 
 	reader, err := openReader(envelope.ID)
@@ -887,6 +958,7 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 	if err != nil {
 		if permanent(err) {
 			d.rejectSMTP(envelope, accepted, err)
+
 			return true, nil
 		}
 
@@ -897,6 +969,7 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 	if err != nil {
 		// Closing DotWriter emits the DATA terminator. Abort the transport instead.
 		_ = client.Close()
+
 		return false, err
 	}
 
@@ -904,6 +977,7 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 		// Closing DotWriter emits the DATA terminator, so body integrity failures
 		// must abort the transport directly.
 		_ = client.Close()
+
 		if written < envelope.Size {
 			return false, fmt.Errorf("%w: got %d, want %d", errBodyTooShort, written, envelope.Size)
 		}
@@ -915,6 +989,7 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 	if err != nil {
 		if permanent(err) {
 			d.rejectSMTP(envelope, accepted, err)
+
 			return true, nil
 		}
 
@@ -930,9 +1005,11 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 	}
 
 	_ = client.Quit()
+
 	if len(temporary) > 0 {
 		return false, fmt.Errorf("temporary RCPT failures: %s", strings.Join(temporary, "; "))
 	}
+
 	return true, nil
 }
 
@@ -966,8 +1043,11 @@ func (d *Deliverer) connect(ctx context.Context, host string, noExtensions bool)
 
 func (d *Deliverer) lookupHostIPs(ctx context.Context, host string) ([]net.IP, error) {
 	network := d.lookupNetwork()
+
 	lookupCtx, cancel := context.WithTimeout(ctx, d.dnsTO)
+
 	addrs, err := d.resolver.LookupNetIP(lookupCtx, network, host)
+
 	cancel()
 	if err != nil {
 		return nil, err
@@ -975,28 +1055,42 @@ func (d *Deliverer) lookupHostIPs(ctx context.Context, host string) ([]net.IP, e
 
 	unique := make(map[netip.Addr]struct{}, len(addrs))
 	ordered := make([]netip.Addr, 0, len(addrs))
+
 	var disallowed error
+
 	for _, ip := range addrs {
-		if err := d.checkDestination(ip); err != nil {
+		err = d.checkDestination(ip)
+		if err != nil {
 			disallowed = err
+
 			continue
 		}
+
 		addr, ok := netip.AddrFromSlice(ip)
 		if !ok {
 			continue
 		}
+
 		addr = addr.Unmap()
+
 		if _, exists := unique[addr]; exists {
 			continue
 		}
+
 		unique[addr] = struct{}{}
 		ordered = append(ordered, addr)
 	}
+
 	if len(ordered) == 0 && disallowed != nil {
 		return nil, disallowed
 	}
-	slices.SortFunc(ordered, func(a, b netip.Addr) int { return a.Compare(b) })
+
+	slices.SortFunc(ordered, func(a, b netip.Addr) int {
+		return a.Compare(b)
+	})
+
 	addrs = make([]net.IP, len(ordered))
+
 	for i, addr := range ordered {
 		addrs[i] = net.IP(addr.AsSlice())
 	}
@@ -1004,6 +1098,7 @@ func (d *Deliverer) lookupHostIPs(ctx context.Context, host string) ([]net.IP, e
 	if d.orderIPs != nil {
 		d.orderIPs(addrs)
 	}
+
 	if len(addrs) > d.maxIP {
 		addrs = addrs[:d.maxIP]
 	}
@@ -1135,13 +1230,17 @@ func (d *Deliverer) dialAndSession(ctx context.Context, mxHost string, ip net.IP
 	policy := d.effectiveTLS()
 
 	network, local := d.bindFor(ip)
+
 	addr := net.JoinHostPort(ip.String(), "25")
 
 	dialer := d.dialer
+
 	nd, ok := dialer.(*net.Dialer)
 	if ok {
 		cp := *nd
+
 		cp.Timeout = d.connTO
+
 		if local != nil {
 			cp.LocalAddr = local
 		}
@@ -1150,18 +1249,23 @@ func (d *Deliverer) dialAndSession(ctx context.Context, mxHost string, ip net.IP
 	}
 
 	dialCtx, cancel := context.WithTimeout(ctx, d.connTO)
+
 	conn, err := dialer.DialContext(dialCtx, network, addr)
+
 	cancel()
+
 	if err != nil {
 		return nil, err
 	}
 
 	client := NewClient(conn, d.command, d.submission)
+
 	client.bindContext(ctx)
 
 	err = client.Greet()
 	if err != nil {
 		client.Close()
+
 		return nil, err
 	}
 
@@ -1170,12 +1274,14 @@ func (d *Deliverer) dialAndSession(ctx context.Context, mxHost string, ip net.IP
 		code := smtpCode(err)
 		if !policy.allowPlaintext || !noExtensions || (code != 500 && code != 502 && code != 504) {
 			client.Close()
+
 			return nil, err
 		}
 
 		err = client.HELO(d.cfg.Server.Hostname)
 		if err != nil {
 			client.Close()
+
 			return nil, err
 		}
 
@@ -1186,6 +1292,7 @@ func (d *Deliverer) dialAndSession(ctx context.Context, mxHost string, ip net.IP
 	if !hasTLS {
 		if policy.requireSTARTTLS || !policy.allowPlaintext {
 			client.Close()
+
 			return nil, errTLSRequired
 		}
 
@@ -1197,12 +1304,14 @@ func (d *Deliverer) dialAndSession(ctx context.Context, mxHost string, ip net.IP
 	err = d.upgradeTLS(client, mxHost, policy)
 	if err != nil {
 		client.Close()
+
 		return nil, fmt.Errorf("%w: %v", errTLSFailed, err)
 	}
 
 	err = client.EHLO(d.cfg.Server.Hostname)
 	if err != nil {
 		client.Close()
+
 		return nil, err
 	}
 
@@ -1233,6 +1342,7 @@ func (d *Deliverer) bindFor(ip net.IP) (network string, local net.Addr) {
 	ip4 := ip.To4()
 	if ip4 != nil {
 		network = "tcp4"
+
 		b := d.cfg.Delivery.BindIPv4
 		if b != "" {
 			lip := net.ParseIP(b)
@@ -1245,6 +1355,7 @@ func (d *Deliverer) bindFor(ip net.IP) (network string, local net.Addr) {
 	}
 
 	network = "tcp6"
+
 	b := d.cfg.Delivery.BindIPv6
 	if b != "" {
 		lip := net.ParseIP(b)
@@ -1258,8 +1369,11 @@ func (d *Deliverer) bindFor(ip net.IP) (network string, local net.Addr) {
 
 func (d *Deliverer) hosts(ctx context.Context, domain string) ([]string, error) {
 	lookupCtx, cancel := context.WithTimeout(ctx, d.dnsTO)
+
 	records, err := d.resolver.LookupMX(lookupCtx, domain)
+
 	cancel()
+
 	if err != nil {
 		dnsErr, ok := errors.AsType[*net.DNSError](err)
 		if !ok || !dnsErr.IsNotFound {
@@ -1267,8 +1381,11 @@ func (d *Deliverer) hosts(ctx context.Context, domain string) ([]string, error) 
 		}
 
 		lookupCtx, cancel = context.WithTimeout(ctx, d.dnsTO)
+
 		_, err = d.resolver.LookupNetIP(lookupCtx, d.lookupNetwork(), domain)
+
 		cancel()
+
 		if err != nil {
 			dnsErr, ok = errors.AsType[*net.DNSError](err)
 			if ok && dnsErr.IsNotFound {
@@ -1286,6 +1403,7 @@ func (d *Deliverer) hosts(ctx context.Context, domain string) ([]string, error) 
 	}
 
 	valid := make([]*net.MX, 0, len(records))
+
 	for _, record := range records {
 		if record != nil {
 			if record.Host == "." {
@@ -1303,15 +1421,20 @@ func (d *Deliverer) hosts(ctx context.Context, domain string) ([]string, error) 
 		if a.Pref != b.Pref {
 			return int(a.Pref) - int(b.Pref)
 		}
+
 		return strings.Compare(strings.ToLower(a.Host), strings.ToLower(b.Host))
 	})
+
 	if d.orderMX != nil {
 		for start := 0; start < len(valid); {
 			end := start + 1
+
 			for end < len(valid) && valid[end].Pref == valid[start].Pref {
 				end++
 			}
+
 			d.orderMX(valid[start:end])
+
 			start = end
 		}
 	}
@@ -1325,8 +1448,10 @@ func (d *Deliverer) hosts(ctx context.Context, domain string) ([]string, error) 
 			if _, exists := seen[host]; exists {
 				continue
 			}
+
 			seen[host] = struct{}{}
 			hosts = append(hosts, host)
+
 			if len(hosts) == d.maxMX {
 				break
 			}

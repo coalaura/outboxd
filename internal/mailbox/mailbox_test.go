@@ -42,6 +42,7 @@ func TestRoutingDomainExactALabel(t *testing.T) {
 
 func TestDomainOfUnicode(t *testing.T) {
 	addr := "user@exämple.com"
+
 	got, err := mailbox.DomainOf(addr)
 	if err != nil {
 		t.Fatal(err)
@@ -120,7 +121,6 @@ func TestAddressOctetLimits(t *testing.T) {
 		strings.Repeat("a", 64) + "@example.com",
 		strings.Repeat("é", 32) + "@example.com",
 	} {
-
 		_, err := mailbox.Address(addr)
 		if err != nil {
 			t.Fatalf("boundary address %q: %v", addr, err)
@@ -131,7 +131,6 @@ func TestAddressOctetLimits(t *testing.T) {
 		strings.Repeat("a", 65) + "@example.com",
 		strings.Repeat("é", 33) + "@example.com",
 	} {
-
 		_, err := mailbox.Address(addr)
 		if err == nil {
 			t.Fatalf("overlong local part accepted: %q", addr)
@@ -156,12 +155,14 @@ func TestAddressMailboxAndDNSRepresentationLimits(t *testing.T) {
 	}
 
 	mailboxDomain := longDomain[:len(longDomain)-1]
+
 	err = mailbox.ValidateAddress("x@" + mailboxDomain)
 	if err != nil {
 		t.Fatalf("254-octet mailbox rejected: %v", err)
 	}
 
 	overDomain := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 62)
+
 	err = mailbox.ValidateAddress("x@" + overDomain)
 	if err == nil {
 		t.Fatal("DNS representation over 255 octets accepted")

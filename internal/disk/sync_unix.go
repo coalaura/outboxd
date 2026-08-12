@@ -9,6 +9,7 @@ import (
 // Sync flushes a directory entry so renames survive a crash.
 func Sync(path string) error {
 	h := currentHooks()
+
 	if h.BeforeSyncDir != nil {
 		err := h.BeforeSyncDir(path)
 		if err != nil {
@@ -30,6 +31,7 @@ func Sync(path string) error {
 	}
 
 	h = currentHooks()
+
 	if h.AfterSyncDir != nil {
 		return h.AfterSyncDir(path)
 	}

@@ -18,6 +18,7 @@ func Lock(path string) (*FileLock, error) {
 	}
 
 	var ol windows.Overlapped
+
 	err = windows.LockFileEx(
 		windows.Handle(f.Fd()),
 		windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY,
@@ -28,6 +29,7 @@ func Lock(path string) (*FileLock, error) {
 	)
 	if err != nil {
 		_ = f.Close()
+
 		if err == windows.ERROR_LOCK_VIOLATION || err == windows.ERROR_IO_PENDING {
 			return nil, ErrLocked
 		}
@@ -48,8 +50,12 @@ func (l *winFileLock) close() error {
 	}
 
 	var ol windows.Overlapped
+
 	_ = windows.UnlockFileEx(windows.Handle(l.f.Fd()), 0, 1, 0, &ol)
+
 	err := l.f.Close()
+
 	l.f = nil
+
 	return err
 }

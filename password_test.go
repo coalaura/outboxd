@@ -10,7 +10,9 @@ import (
 
 type errReader struct{ err error }
 
-func (e errReader) Read([]byte) (int, error) { return 0, e.err }
+func (e errReader) Read([]byte) (int, error) {
+	return 0, e.err
+}
 
 func TestReadPasswordEmpty(t *testing.T) {
 	_, err := readPassword(strings.NewReader(""), 1024)
@@ -68,7 +70,9 @@ func TestReadPasswordCRLF(t *testing.T) {
 
 func TestReadPasswordExactMax(t *testing.T) {
 	const max = 16
+
 	pw := strings.Repeat("a", max)
+
 	got, err := readPassword(strings.NewReader(pw), max)
 	if err != nil {
 		t.Fatal(err)
@@ -81,7 +85,9 @@ func TestReadPasswordExactMax(t *testing.T) {
 
 func TestReadPasswordExactMaxLF(t *testing.T) {
 	const max = 16
+
 	pw := strings.Repeat("a", max)
+
 	got, err := readPassword(strings.NewReader(pw+"\n"), max)
 	if err != nil {
 		t.Fatal(err)
@@ -94,7 +100,9 @@ func TestReadPasswordExactMaxLF(t *testing.T) {
 
 func TestReadPasswordExactMaxCRLF(t *testing.T) {
 	const max = 16
+
 	pw := strings.Repeat("a", max)
+
 	got, err := readPassword(strings.NewReader(pw+"\r\n"), max)
 	if err != nil {
 		t.Fatal(err)
@@ -107,7 +115,9 @@ func TestReadPasswordExactMaxCRLF(t *testing.T) {
 
 func TestReadPasswordMaxPlusOne(t *testing.T) {
 	const max = 16
+
 	pw := strings.Repeat("a", max+1)
+
 	_, err := readPassword(strings.NewReader(pw), max)
 	if err == nil || !strings.Contains(err.Error(), "maximum") {
 		t.Fatalf("err=%v", err)
@@ -134,16 +144,20 @@ func TestReadPasswordTrailingCRPreserved(t *testing.T) {
 }
 
 func TestReadPasswordMinimum(t *testing.T) {
-	if _, err := readPassword(strings.NewReader(strings.Repeat("x", minPasswordBytes-1)), 1024); err == nil || !strings.Contains(err.Error(), "at least") {
+	_, err := readPassword(strings.NewReader(strings.Repeat("x", minPasswordBytes-1)), 1024)
+	if err == nil || !strings.Contains(err.Error(), "at least") {
 		t.Fatalf("short password err=%v", err)
 	}
-	if _, err := readPassword(strings.NewReader(strings.Repeat("x", minPasswordBytes)), 1024); err != nil {
+
+	_, err = readPassword(strings.NewReader(strings.Repeat("x", minPasswordBytes)), 1024)
+	if err != nil {
 		t.Fatalf("minimum password rejected: %v", err)
 	}
 }
 
 func TestReadPasswordReadError(t *testing.T) {
 	want := errors.New("boom")
+
 	_, err := readPassword(errReader{want}, 1024)
 	if !errors.Is(err, want) {
 		t.Fatalf("err=%v", err)
@@ -159,10 +173,12 @@ func TestReadPasswordNULRejected(t *testing.T) {
 
 func TestPasswordIntegrationOverflow(t *testing.T) {
 	r, w := io.Pipe()
+
 	go func() {
 		_, _ = w.Write(bytes.Repeat([]byte("x"), 1025))
 		_ = w.Close()
 	}()
+
 	_, err := readPassword(r, 1024)
 	if err == nil || !strings.Contains(err.Error(), "maximum") {
 		t.Fatalf("err=%v", err)

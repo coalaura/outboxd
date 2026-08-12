@@ -48,8 +48,12 @@ func Hash(password string) (string, error) {
 
 	return fmt.Sprintf(
 		"$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
-		argon2.Version, hashMemory, hashTime, hashThreads,
-		encoding.EncodeToString(salt), encoding.EncodeToString(key),
+		argon2.Version,
+		hashMemory,
+		hashTime,
+		hashThreads,
+		encoding.EncodeToString(salt),
+		encoding.EncodeToString(key),
 	), nil
 }
 
@@ -72,7 +76,6 @@ func Waste() {
 }
 
 const (
-
 	// Bound the entire PHC string before field work.
 	maxPHCLength = 512
 )

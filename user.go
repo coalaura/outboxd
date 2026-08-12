@@ -67,6 +67,7 @@ func user(configPath string, arguments []string) error {
 
 	var out strings.Builder
 	out.Grow(256)
+
 	fmt.Fprintf(&out, "Added user %q to %q. Restart outboxd for this change to take effect.\n", escapeControl(entry.Username), cfg.Path())
 
 	if generated {
@@ -128,6 +129,7 @@ func readPassword(r io.Reader, maxBytes int) (string, error) {
 	if len(pass) == 0 {
 		return "", errors.New("empty password on stdin")
 	}
+
 	if len(pass) < minPasswordBytes {
 		return "", fmt.Errorf("password must be at least %d bytes", minPasswordBytes)
 	}

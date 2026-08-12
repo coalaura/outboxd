@@ -30,7 +30,8 @@ import (
 type memLog struct{}
 
 func (memLog) Printf(string, ...any) {}
-func (memLog) Println(...any)        {}
+
+func (memLog) Println(...any) {}
 
 type recordingLog struct {
 	mu    sync.Mutex
@@ -52,6 +53,7 @@ func (l *recordingLog) Println(values ...any) {
 func (l *recordingLog) contains(value string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
 	return strings.Contains(strings.Join(l.lines, ""), value)
 }
 
@@ -65,6 +67,7 @@ func (f *fakeResolver) LookupMX(ctx context.Context, name string) ([]*net.MX, er
 	if ok {
 		out := make([]*net.MX, len(mx))
 		copy(out, mx)
+
 		return out, nil
 	}
 
@@ -102,6 +105,7 @@ func (f dialFunc) DialContext(ctx context.Context, network, address string) (net
 
 func testConfig() *config.Config {
 	allow := true
+
 	return &config.Config{
 		Server: config.Server{
 			Hostname: "outboxd.test",
@@ -127,18 +131,24 @@ func testConfig() *config.Config {
 
 func openQueue(t *testing.T) *queue.Queue {
 	t.Helper()
+
 	q, err := queue.Open(t.TempDir(), queue.Limits{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = q.Close() })
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	return q
 }
 
 func addMsg(t *testing.T, q *queue.Queue, id, domain, rcpt string) {
 	t.Helper()
+
 	now := time.Now()
+
 	env := &queue.Envelope{
 		ID:       id,
 		Username: "user",
@@ -151,7 +161,9 @@ func addMsg(t *testing.T, q *queue.Queue, id, domain, rcpt string) {
 		Created:     now,
 		NextAttempt: now,
 	}
+
 	body := []byte("From: sender@example.com\r\nTo: " + rcpt + "\r\nSubject: t\r\n\r\nHi\r\n")
+
 	err := q.Add(env, body)
 	if err != nil {
 		t.Fatal(err)
@@ -160,18 +172,26 @@ func addMsg(t *testing.T, q *queue.Queue, id, domain, rcpt string) {
 
 func TestStoragePressureIsNonfatalAndBackedOff(t *testing.T) {
 	root := t.TempDir()
+
 	q, err := queue.Open(root, queue.Limits{MinFreeDisk: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = q.Close() })
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	addMsg(t, q, "storage-pressure", "missing.invalid", "user@missing.invalid")
+
 	q.FreeDisk = func(string) (int64, error) { return 0, nil }
 
 	logger := new(recordingLog)
+
 	d := deliver.New(testConfig(), q, logger)
+
 	d.SetResolver(&fakeResolver{mx: map[string][]*net.MX{}, ips: map[string][]net.IP{}})
+
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
@@ -191,6 +211,7 @@ func TestStoragePressureIsNonfatalAndBackedOff(t *testing.T) {
 
 func selfSigned(t *testing.T, cn string) tls.Certificate {
 	t.Helper()
+
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -205,18 +226,21 @@ func selfSigned(t *testing.T, cn string) tls.Certificate {
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		DNSNames:     []string{cn},
 	}
+
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		t.Fatal(err)
@@ -234,6 +258,7 @@ type legacyListener struct {
 
 func smtpListener(t *testing.T, startTLS bool, cert tls.Certificate) *legacyListener {
 	t.Helper()
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -243,6 +268,7 @@ func smtpListener(t *testing.T, startTLS bool, cert tls.Certificate) *legacyList
 		addr:     ln.Addr().String(),
 		accepted: make(chan struct{}),
 	}
+
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -253,15 +279,25 @@ func smtpListener(t *testing.T, startTLS bool, cert tls.Certificate) *legacyList
 			go serveSMTP(c, startTLS, cert, l)
 		}
 	}()
-	t.Cleanup(func() { _ = ln.Close() })
+
+	t.Cleanup(func() {
+		_ = ln.Close()
+	})
+
 	return l
 }
 
 func serveSMTP(c net.Conn, startTLS bool, cert tls.Certificate, l *legacyListener) {
 	defer c.Close()
+
 	rw := c
-	write := func(s string) { _, _ = io.WriteString(rw, s) }
+
+	write := func(s string) {
+		_, _ = io.WriteString(rw, s)
+	}
+
 	buf := make([]byte, 1)
+
 	readLine := func() string {
 		var b strings.Builder
 
@@ -282,8 +318,10 @@ func serveSMTP(c net.Conn, startTLS bool, cert tls.Certificate, l *legacyListene
 
 		return b.String()
 	}
+
 	write("220 test ESMTP\r\n")
-	secured := false
+
+	var secured bool
 
 	for {
 		line := readLine()
@@ -306,11 +344,14 @@ func serveSMTP(c net.Conn, startTLS bool, cert tls.Certificate, l *legacyListene
 		case strings.HasPrefix(upper, "STARTTLS"):
 			if !startTLS || secured {
 				write("503 bad\r\n")
+
 				continue
 			}
 
 			write("220 ready\r\n")
+
 			tlsConn := tls.Server(rw, &tls.Config{Certificates: []tls.Certificate{cert}})
+
 			err := tlsConn.Handshake()
 			if err != nil {
 				return
@@ -333,9 +374,13 @@ func serveSMTP(c net.Conn, startTLS bool, cert tls.Certificate, l *legacyListene
 			}
 
 			write("250 queued\r\n")
-			l.once.Do(func() { close(l.accepted) })
+
+			l.once.Do(func() {
+				close(l.accepted)
+			})
 		case strings.HasPrefix(upper, "QUIT"):
 			write("221 bye\r\n")
+
 			return
 		default:
 			write("250 OK\r\n")
@@ -355,18 +400,25 @@ func awaitAccepted(t *testing.T, l *legacyListener, timeout time.Duration) {
 
 func TestDeliveryOpportunisticTLS(t *testing.T) {
 	cert := selfSigned(t, "mx.example.com")
+
 	ln := smtpListener(t, true, cert)
 
 	q := openQueue(t)
+
 	cfg := testConfig()
+
 	cfg.Delivery.TLSMode = "opportunistic"
+
 	d := deliver.New(cfg, q, memLog{})
+
 	d.SetResolver(&fakeResolver{
 		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.example.com.", Pref: 10}}},
 		ips: map[string][]net.IP{"mx.example.com": {net.ParseIP("127.0.0.1")}},
 	})
+
 	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
 		var nd net.Dialer
+
 		return nd.DialContext(ctx, "tcp", ln.addr)
 	}))
 
@@ -374,31 +426,44 @@ func TestDeliveryOpportunisticTLS(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
 	done := make(chan error, 1)
-	go func() { done <- d.Run(ctx) }()
+	go func() {
+		done <- d.Run(ctx)
+	}()
 
 	awaitAccepted(t, ln, 3*time.Second)
+
 	cancel()
 	<-done
 }
 
 func TestDeliveryRequiredRejectsPlain(t *testing.T) {
 	cert := selfSigned(t, "mx.example.com")
+
 	ln := smtpListener(t, false, cert)
 
 	q := openQueue(t)
+
 	cfg := testConfig()
+
 	cfg.Delivery.TLSMode = "required"
 	cfg.Delivery.MaxAttempts = 1
-	allow := false
+
+	var allow bool
+
 	cfg.Delivery.AllowPlaintext = &allow
+
 	d := deliver.New(cfg, q, memLog{})
+
 	d.SetResolver(&fakeResolver{
 		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.example.com.", Pref: 10}}},
 		ips: map[string][]net.IP{"mx.example.com": {net.ParseIP("127.0.0.1")}},
 	})
+
 	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
 		var nd net.Dialer
+
 		return nd.DialContext(ctx, "tcp", ln.addr)
 	}))
 
@@ -406,6 +471,7 @@ func TestDeliveryRequiredRejectsPlain(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+
 	_ = d.Run(ctx)
 
 	select {
@@ -426,18 +492,25 @@ func TestDeliveryRequiredRejectsPlain(t *testing.T) {
 
 func TestDeliveryPlaintextOpportunistic(t *testing.T) {
 	cert := selfSigned(t, "mx.example.com")
+
 	ln := smtpListener(t, false, cert)
 
 	q := openQueue(t)
+
 	cfg := testConfig()
+
 	cfg.Delivery.TLSMode = "opportunistic"
+
 	d := deliver.New(cfg, q, memLog{})
+
 	d.SetResolver(&fakeResolver{
 		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.example.com.", Pref: 10}}},
 		ips: map[string][]net.IP{"mx.example.com": {net.ParseIP("127.0.0.1")}},
 	})
+
 	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
 		var nd net.Dialer
+
 		return nd.DialContext(ctx, "tcp", ln.addr)
 	}))
 
@@ -445,24 +518,36 @@ func TestDeliveryPlaintextOpportunistic(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
 	done := make(chan error, 1)
-	go func() { done <- d.Run(ctx) }()
+
+	go func() {
+		done <- d.Run(ctx)
+	}()
+
 	awaitAccepted(t, ln, 3*time.Second)
+
 	cancel()
 	<-done
 }
 
 func TestPrivateIPRejection(t *testing.T) {
 	q := openQueue(t)
+
 	cfg := testConfig()
+
 	cfg.Delivery.AllowPrivateDestinations = false
 	cfg.Delivery.MaxAttempts = 1
+
 	d := deliver.New(cfg, q, memLog{})
+
 	d.SetResolver(&fakeResolver{
 		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.example.com.", Pref: 10}}},
 		ips: map[string][]net.IP{"mx.example.com": {net.ParseIP("10.0.0.5")}},
 	})
+
 	dialed := make(chan struct{}, 1)
+
 	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
 		select {
 		case dialed <- struct{}{}:
@@ -476,6 +561,7 @@ func TestPrivateIPRejection(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+
 	_ = d.Run(ctx)
 
 	select {
@@ -487,19 +573,26 @@ func TestPrivateIPRejection(t *testing.T) {
 
 func TestPrivateAllowlist(t *testing.T) {
 	cert := selfSigned(t, "mx.example.com")
+
 	ln := smtpListener(t, false, cert)
 
 	q := openQueue(t)
+
 	cfg := testConfig()
+
 	cfg.Delivery.AllowPrivateDestinations = false
 	cfg.Delivery.DestinationAllowlist = []string{"127.0.0.1"}
+
 	d := deliver.New(cfg, q, memLog{})
+
 	d.SetResolver(&fakeResolver{
 		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.example.com.", Pref: 10}}},
 		ips: map[string][]net.IP{"mx.example.com": {net.ParseIP("127.0.0.1")}},
 	})
+
 	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
 		var nd net.Dialer
+
 		return nd.DialContext(ctx, "tcp", ln.addr)
 	}))
 
@@ -507,25 +600,36 @@ func TestPrivateAllowlist(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
 	done := make(chan error, 1)
-	go func() { done <- d.Run(ctx) }()
+
+	go func() {
+		done <- d.Run(ctx)
+	}()
+
 	awaitAccepted(t, ln, 3*time.Second)
+
 	cancel()
 	<-done
 }
 
 func TestFairnessBlockedDomain(t *testing.T) {
 	cert := selfSigned(t, "mx.fast.com")
+
 	fast := smtpListener(t, false, cert)
 
 	q := openQueue(t)
+
 	cfg := testConfig()
+
 	cfg.Delivery.DomainConcurrency = 1
 	cfg.Delivery.GlobalConcurrency = 2
+
 	d := deliver.New(cfg, q, memLog{})
 
 	blockedIP := net.ParseIP("10.255.0.1")
 	fastIP := net.ParseIP("10.255.0.2")
+
 	blockedDialing := make(chan struct{}, 1)
 	releaseBlocked := make(chan struct{})
 
@@ -541,6 +645,7 @@ func TestFairnessBlockedDomain(t *testing.T) {
 	})
 	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
 		host, _, _ := net.SplitHostPort(address)
+
 		ip := net.ParseIP(host)
 		if ip != nil && ip.Equal(blockedIP) {
 			select {
@@ -557,6 +662,7 @@ func TestFairnessBlockedDomain(t *testing.T) {
 		}
 
 		var nd net.Dialer
+
 		return nd.DialContext(ctx, "tcp", fast.addr)
 	}))
 
@@ -566,18 +672,23 @@ func TestFairnessBlockedDomain(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
 	done := make(chan error, 1)
-	go func() { done <- d.Run(ctx) }()
+	go func() {
+		done <- d.Run(ctx)
+	}()
 
 	select {
 	case <-blockedDialing:
 	case <-time.After(3 * time.Second):
 		cancel()
 		<-done
+
 		t.Fatal("blocked domain never dialed")
 	}
 
 	awaitAccepted(t, fast, 3*time.Second)
+
 	close(releaseBlocked)
 	cancel()
 	<-done
@@ -586,33 +697,50 @@ func TestFairnessBlockedDomain(t *testing.T) {
 func TestRunCancelUnblocksBlockedDial(t *testing.T) {
 	// Regression: defer wg.Wait before cancel hung Run until attempt timeouts.
 	q := openQueue(t)
+
 	cfg := testConfig()
+
 	cfg.Delivery.MaxAttempts = 5
 	cfg.Delivery.SubmissionTimeout = "30s"
 	cfg.Delivery.ConnectionTimeout = "30s"
+
 	d := deliver.New(cfg, q, memLog{})
+
 	started := make(chan struct{})
+
 	var once sync.Once
+
 	d.SetResolver(&fakeResolver{
 		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com.", Pref: 10}}},
 		ips: map[string][]net.IP{"mx.ex.com": {net.ParseIP("127.0.0.1")}},
 	})
+
 	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
-		once.Do(func() { close(started) })
+		once.Do(func() {
+			close(started)
+		})
+
 		<-ctx.Done()
+
 		return nil, ctx.Err()
 	}))
+
 	addMsg(t, q, "hang1", "ex.com", "r@ex.com")
 
 	ctx, cancel := context.WithCancel(context.Background())
+
 	done := make(chan error, 1)
-	go func() { done <- d.Run(ctx) }()
+
+	go func() {
+		done <- d.Run(ctx)
+	}()
 
 	select {
 	case <-started:
 	case <-time.After(2 * time.Second):
 		cancel()
 		<-done
+
 		t.Fatal("dial never started")
 	}
 
@@ -631,6 +759,7 @@ func TestRunCancelUnblocksBlockedDial(t *testing.T) {
 func TestRunDSNAtFullQueueNotFatal(t *testing.T) {
 	// A DSN enqueued while the origin still occupies MaxMessages must not kill Run.
 	root := t.TempDir()
+
 	q, err := queue.Open(root, queue.Limits{MaxMessages: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -639,15 +768,21 @@ func TestRunDSNAtFullQueueNotFatal(t *testing.T) {
 	t.Cleanup(func() { _ = q.Close() })
 
 	cfg := testConfig()
+
 	cfg.Delivery.MaxAttempts = 1
 	cfg.Delivery.AllowPrivateDestinations = false
 	cfg.Delivery.InitialRetryDelay = "1ms"
 	cfg.Delivery.MaximumRetryDelay = "1ms"
+
 	d := deliver.New(cfg, q, memLog{})
 
 	// Hang the DSN recipient domain so Run cannot Finish the DSN before we assert.
 	dsnHold := make(chan struct{})
-	t.Cleanup(func() { close(dsnHold) })
+
+	t.Cleanup(func() {
+		close(dsnHold)
+	})
+
 	d.SetResolver(&hangResolver{
 		fakeResolver: fakeResolver{
 			mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com.", Pref: 10}}},
@@ -656,11 +791,13 @@ func TestRunDSNAtFullQueueNotFatal(t *testing.T) {
 		hangDomain: "example.com",
 		hold:       dsnHold,
 	})
+
 	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
 		return nil, &net.OpError{Op: "dial", Net: network, Err: errors.New("should not dial private")}
 	}))
 
 	now := time.Now()
+
 	env := &queue.Envelope{
 		ID: "full1", Username: "user", Sender: "sender@example.com",
 		Recipients: []queue.Recipient{{
@@ -668,15 +805,21 @@ func TestRunDSNAtFullQueueNotFatal(t *testing.T) {
 		}},
 		Created: now, NextAttempt: now,
 	}
+
 	body := []byte("From: sender@example.com\r\nTo: r@ex.com\r\nSubject: t\r\n\r\nHi\r\n")
+
 	err = q.Add(env, body)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+
 	done := make(chan error, 1)
-	go func() { done <- d.Run(ctx) }()
+
+	go func() {
+		done <- d.Run(ctx)
+	}()
 
 	deadline := time.After(3 * time.Second)
 
@@ -696,8 +839,9 @@ func TestRunDSNAtFullQueueNotFatal(t *testing.T) {
 		default:
 			_, deadErr := os.Stat(filepath.Join(root, "dead", "full1"))
 			_, dsnErr := os.Stat(filepath.Join(root, "ready", queue.DSNID("full1", env.Incarnation, 0)))
+
 			if deadErr == nil && dsnErr == nil {
-				goto buried
+				goto buried // goto bad :(
 			}
 
 			runtime.Gosched()

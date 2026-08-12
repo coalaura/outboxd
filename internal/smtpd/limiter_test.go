@@ -15,6 +15,7 @@ type authLimiterEvictionCase struct {
 
 func checkAgg(t *testing.T, l *authLimiter) {
 	t.Helper()
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -26,8 +27,11 @@ func checkAgg(t *testing.T, l *authLimiter) {
 
 func TestAuthLimiterConcurrentReserveBudget(t *testing.T) {
 	l := newAuthLimiter()
+
 	const n = 50
+
 	start := make(chan struct{})
+
 	var (
 		wg      sync.WaitGroup
 		okCount atomic.Int32
@@ -56,8 +60,11 @@ func TestAuthLimiterConcurrentReserveBudget(t *testing.T) {
 
 func TestAuthLimiterConcurrentFailuresLockout(t *testing.T) {
 	l := newAuthLimiter()
+
 	var wg sync.WaitGroup
+
 	start := make(chan struct{})
+
 	const n = 20
 
 	for range n {
@@ -137,17 +144,21 @@ func TestAuthLimiterSuccessClearsOnlyIdentityContribution(t *testing.T) {
 	}
 
 	l.succeeded("9.9.9.9", "alice")
+
 	checkAgg(t, l)
 
 	l.mu.Lock()
 	ipFail := 0
+
 	st := l.byIP["9.9.9.9"]
 	if st != nil {
 		ipFail = st.failures
 	}
 
 	_, aliceKey := l.byKey["9.9.9.9\x00alice"]
+
 	bobFail := 0
+
 	st = l.byKey["9.9.9.9\x00bob"]
 	if st != nil {
 		bobFail = st.failures
@@ -173,7 +184,9 @@ func TestAuthLimiterSuccessClearsOnlyIdentityContribution(t *testing.T) {
 	}
 
 	l.failed("9.9.9.9", "alice")
+
 	checkAgg(t, l)
+
 	l.mu.Lock()
 	ipFail = l.byIP["9.9.9.9"].failures
 	aliceFail := l.byKey["9.9.9.9\x00alice"].failures
@@ -200,11 +213,14 @@ func TestAuthLimiterSuccessClearsIdentityFailuresFromIP(t *testing.T) {
 	}
 
 	l.succeeded("8.8.8.8", "bob")
+
 	checkAgg(t, l)
 
 	l.mu.Lock()
 	_, hasKey := l.byKey["8.8.8.8\x00bob"]
+
 	ipFail := 0
+
 	st := l.byIP["8.8.8.8"]
 	if st != nil {
 		ipFail = st.failures
@@ -237,6 +253,7 @@ func TestAuthLimiterUsernameCasing(t *testing.T) {
 
 	for i := range freeAttempts {
 		user := "Alice"
+
 		if i%2 == 0 {
 			user = "ALICE"
 		}
@@ -257,8 +274,12 @@ func TestAuthLimiterUsernameCasing(t *testing.T) {
 
 func TestAuthLimiterActiveReservationsBlockPrune(t *testing.T) {
 	l := newAuthLimiter()
+
 	now := time.Now()
-	l.clock = func() time.Time { return now }
+
+	l.clock = func() time.Time {
+		return now
+	}
 
 	if !l.reserve("5.5.5.5", "hold") {
 		t.Fatal("reserve")
@@ -267,6 +288,7 @@ func TestAuthLimiterActiveReservationsBlockPrune(t *testing.T) {
 	l.mu.Lock()
 	l.byIP["5.5.5.5"].seen = now.Add(-entryExpiry - time.Minute)
 	l.byKey["5.5.5.5\x00hold"].seen = now.Add(-entryExpiry - time.Minute)
+
 	l.pruned = now.Add(-entryExpiry - time.Minute)
 	l.mu.Unlock()
 
@@ -283,13 +305,18 @@ func TestAuthLimiterActiveReservationsBlockPrune(t *testing.T) {
 	}
 
 	l.canceled("5.5.5.5", "hold")
+
 	checkAgg(t, l)
 }
 
 func TestAuthLimiterActiveLockoutNotEvicted(t *testing.T) {
 	l := newAuthLimiter()
+
 	now := time.Unix(1_700_000_000, 0)
-	l.clock = func() time.Time { return now }
+
+	l.clock = func() time.Time {
+		return now
+	}
 
 	for range freeAttempts {
 		if !l.reserve("4.4.4.4", "locked") {
@@ -303,11 +330,13 @@ func TestAuthLimiterActiveLockoutNotEvicted(t *testing.T) {
 	l.mu.Lock()
 	l.byIP["4.4.4.4"].seen = now.Add(-entryExpiry - time.Minute)
 	l.byKey["4.4.4.4\x00locked"].seen = now.Add(-entryExpiry - time.Minute)
+
 	l.pruned = time.Time{}
 	l.mu.Unlock()
 
 	// Force prune path via new reserve elsewhere.
 	now = now.Add(time.Second)
+
 	if !l.reserve("4.4.4.5", "other") {
 		t.Fatal("other")
 	}
@@ -328,8 +357,12 @@ func TestAuthLimiterActiveLockoutNotEvicted(t *testing.T) {
 
 func TestAuthLimiterExpiredIdleRemoved(t *testing.T) {
 	l := newAuthLimiter()
+
 	now := time.Now()
-	l.clock = func() time.Time { return now }
+
+	l.clock = func() time.Time {
+		return now
+	}
 
 	if !l.reserve("6.6.6.6", "gone") {
 		t.Fatal("reserve")
@@ -340,10 +373,12 @@ func TestAuthLimiterExpiredIdleRemoved(t *testing.T) {
 	l.mu.Lock()
 	l.byIP["6.6.6.6"].seen = now.Add(-entryExpiry - time.Minute)
 	l.byKey["6.6.6.6\x00gone"].seen = now.Add(-entryExpiry - time.Minute)
+
 	l.pruned = time.Time{}
 	l.mu.Unlock()
 
 	now = now.Add(time.Second)
+
 	_ = l.reserve("6.6.6.7", "z")
 
 	l.mu.Lock()
@@ -360,12 +395,15 @@ func TestAuthLimiterExpiredIdleRemoved(t *testing.T) {
 
 func TestAuthLimiterEmptyCanceledCleaned(t *testing.T) {
 	l := newAuthLimiter()
+
 	if !l.reserve("3.3.3.3", "tmp") {
 		t.Fatal("reserve")
 	}
 
 	l.canceled("3.3.3.3", "tmp")
+
 	checkAgg(t, l)
+
 	l.mu.Lock()
 	_, keyOK := l.byKey["3.3.3.3\x00tmp"]
 	_, ipOK := l.byIP["3.3.3.3"]
@@ -378,8 +416,12 @@ func TestAuthLimiterEmptyCanceledCleaned(t *testing.T) {
 
 func TestAuthLimiterLockoutUsesClock(t *testing.T) {
 	l := newAuthLimiter()
+
 	now := time.Unix(1_700_000_000, 0)
-	l.clock = func() time.Time { return now }
+
+	l.clock = func() time.Time {
+		return now
+	}
 
 	for i := range freeAttempts {
 		if !l.reserve("1.1.1.1", "u") {
@@ -394,18 +436,24 @@ func TestAuthLimiterLockoutUsesClock(t *testing.T) {
 	}
 
 	now = now.Add(lockoutMax + time.Second)
+
 	if !l.reserve("1.1.1.1", "u") {
 		t.Fatal("should unlock after lockout expires")
 	}
 
 	l.canceled("1.1.1.1", "u")
+
 	checkAgg(t, l)
 }
 
 func TestAuthLimiterCapacityExistingIdentityContinues(t *testing.T) {
 	l := newAuthLimiter()
+
 	now := time.Now()
-	l.clock = func() time.Time { return now }
+
+	l.clock = func() time.Time {
+		return now
+	}
 
 	// Fill key map to capacity with non-empty, non-expired, non-prunable entries.
 	l.mu.Lock()
@@ -413,14 +461,17 @@ func TestAuthLimiterCapacityExistingIdentityContinues(t *testing.T) {
 	for i := range maxAuthKeyEntries - 1 {
 		ip := fmt.Sprintf("10.%d.%d.1", i/256, i%256)
 		key := ip + "\x00u"
+
 		l.byIP[ip] = &attemptState{failures: 1, seen: now.Add(-time.Minute)}
 		l.byKey[key] = &attemptState{failures: 1, seen: now.Add(-time.Minute)}
 	}
 
 	trackedIP := "192.0.2.50"
 	trackedKey := trackedIP + "\x00tracked"
+
 	l.byIP[trackedIP] = &attemptState{failures: 1, seen: now}
 	l.byKey[trackedKey] = &attemptState{failures: 1, seen: now}
+
 	if len(l.byKey) != maxAuthKeyEntries {
 		t.Fatalf("setup key len=%d", len(l.byKey))
 	}
@@ -438,16 +489,23 @@ func TestAuthLimiterCapacityExistingIdentityContinues(t *testing.T) {
 	}
 
 	l.canceled("198.51.100.1", "newuser")
+
 	checkAgg(t, l)
 
 	// Independent IP-map capacity: consistent IP+identity pairs so aggregates hold.
 	l2 := newAuthLimiter()
-	l2.clock = func() time.Time { return now }
+
+	l2.clock = func() time.Time {
+		return now
+	}
+
 	l2.mu.Lock()
 
 	for i := range maxAuthIPEntries {
 		ip := fmt.Sprintf("11.%d.%d.1", i/256, i%256)
+
 		seen := now.Add(-time.Minute)
+
 		if i == 0 {
 			seen = now
 		}
@@ -477,17 +535,24 @@ func TestAuthLimiterCapacityExistingIdentityContinues(t *testing.T) {
 	}
 
 	l2.mu.Unlock()
+
 	checkAgg(t, l2)
 }
 
 func TestAuthLimiterCapacityNoTemporaryOvershoot(t *testing.T) {
 	l := newAuthLimiter()
+
 	now := time.Now()
-	l.clock = func() time.Time { return now }
+
+	l.clock = func() time.Time {
+		return now
+	}
+
 	l.mu.Lock()
 
 	for i := range maxAuthKeyEntries {
 		ip := fmt.Sprintf("12.%d.%d.1", i/256, i%256)
+
 		l.byIP[ip] = &attemptState{failures: 1, seen: now}
 		l.byKey[ip+"\x00u"] = &attemptState{failures: 1, seen: now}
 	}
@@ -505,21 +570,26 @@ func TestAuthLimiterCapacityNoTemporaryOvershoot(t *testing.T) {
 	}
 
 	l.mu.Unlock()
+
 	l.canceled("203.0.113.50", "overflow")
 }
 
 func TestAuthLimiterFailedDoesNotHalfReserve(t *testing.T) {
 	l := newAuthLimiter()
+
 	if !l.reserve("10.0.0.9", "half") {
 		t.Fatal("reserve")
 	}
 
 	l.failed("10.0.0.9", "half")
+
 	checkAgg(t, l)
 
 	// Mismatched terminal without reservation must not create half state.
 	l.failed("10.0.0.9", "never-reserved")
+
 	checkAgg(t, l)
+
 	l.mu.Lock()
 	_, ghost := l.byKey["10.0.0.9\x00never-reserved"]
 	l.mu.Unlock()
@@ -541,12 +611,11 @@ func TestAuthLimiterConcurrentSuccessFailureNoNegatives(t *testing.T) {
 	}
 
 	start := make(chan struct{})
+
 	var wg sync.WaitGroup
 
 	for i := range 20 {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 
 			if i%2 == 0 {
@@ -558,23 +627,27 @@ func TestAuthLimiterConcurrentSuccessFailureNoNegatives(t *testing.T) {
 					l.failed("15.15.15.15", "alice")
 				}
 			}
-		}(i)
+		})
 	}
 
 	close(start)
 	wg.Wait()
+
 	checkAgg(t, l)
 }
 
 func TestAuthLimiterCanceledNoFailureEffect(t *testing.T) {
 	l := newAuthLimiter()
+
 	if !l.reserve("16.16.16.16", "c") {
 		t.Fatal("reserve")
 	}
 
 	l.canceled("16.16.16.16", "c")
+
 	l.mu.Lock()
 	fail := 0
+
 	st := l.byIP["16.16.16.16"]
 	if st != nil {
 		fail = st.failures
@@ -594,22 +667,22 @@ func TestAuthLimiterConcurrentCapacityBoundary(t *testing.T) {
 
 	// Leave room for N concurrent new identities near empty.
 	const n = 50
+
 	start := make(chan struct{})
+
 	var (
 		wg sync.WaitGroup
 		ok atomic.Int32
 	)
 
 	for i := range n {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 
 			if l.reserve(fmt.Sprintf("20.0.0.%d", i+1), fmt.Sprintf("u%d", i)) {
 				ok.Add(1)
 			}
-		}(i)
+		})
 	}
 
 	close(start)
@@ -628,6 +701,7 @@ func TestAuthLimiterConcurrentCapacityBoundary(t *testing.T) {
 	err := l.assertAggregatesLocked()
 	if err != nil {
 		l.mu.Unlock()
+
 		t.Fatal(err)
 	}
 
@@ -656,6 +730,7 @@ func TestAuthLimiterUsernameGlobalConcurrentBudget(t *testing.T) {
 	}
 
 	l.canceled("198.51.100.1", "distributeduser")
+
 	checkAgg(t, l)
 }
 
@@ -664,6 +739,7 @@ func TestAuthWorkQueueSaturated(t *testing.T) {
 		hashing:   make(chan struct{}, 1),
 		authLimit: newAuthLimiter(),
 	}
+
 	s.hashing <- struct{}{}
 
 	if s.acquireHashSlot() {
@@ -677,11 +753,14 @@ func TestAuthWorkQueueSaturated(t *testing.T) {
 
 func TestAuthLimiterCapacityEvictsOldestSafeState(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
+
 	l := newAuthLimiterSized(2, 2, entryExpiry, entryExpiry)
-	l.clock = func() time.Time { return now }
+
+	l.clock = func() time.Time {
+		return now
+	}
 
 	for _, tc := range []authLimiterEvictionCase{{"192.0.2.1", now.Add(-time.Minute)}, {"192.0.2.2", now}} {
-
 		l.mu.Lock()
 		l.byIP[tc.ip] = &attemptState{failures: 1, seen: tc.seen}
 		l.byKey[tc.ip+"\x00user"] = &attemptState{failures: 1, seen: tc.seen}
@@ -695,6 +774,7 @@ func TestAuthLimiterCapacityEvictsOldestSafeState(t *testing.T) {
 	l.mu.Lock()
 	_, oldestIP := l.byIP["192.0.2.1"]
 	_, oldestKey := l.byKey["192.0.2.1\x00user"]
+
 	_, newerIP := l.byIP["192.0.2.2"]
 	l.mu.Unlock()
 
@@ -703,13 +783,19 @@ func TestAuthLimiterCapacityEvictsOldestSafeState(t *testing.T) {
 	}
 
 	l.canceled("192.0.2.3", "user")
+
 	checkAgg(t, l)
 }
 
 func TestAuthLimiterExistingNoFullSweep(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
+
 	l := newAuthLimiterSized(100, 100, entryExpiry, entryExpiry)
-	l.clock = func() time.Time { return now }
+
+	l.clock = func() time.Time {
+		return now
+	}
+
 	if !l.reserve("1.1.1.1", "alice") {
 		t.Fatal("seed")
 	}
@@ -722,8 +808,10 @@ func TestAuthLimiterExistingNoFullSweep(t *testing.T) {
 	}
 
 	l.failed("1.1.1.1", "alice")
+
 	l.mu.Lock()
 	before := l.fullSweeps
+
 	l.pruned = now // periodic prune not due
 	l.mu.Unlock()
 
@@ -732,6 +820,7 @@ func TestAuthLimiterExistingNoFullSweep(t *testing.T) {
 	}
 
 	l.canceled("1.1.1.1", "alice")
+
 	l.mu.Lock()
 	after := l.fullSweeps
 	l.mu.Unlock()
@@ -745,10 +834,16 @@ func TestAuthLimiterExistingNoFullSweep(t *testing.T) {
 
 func TestAuthLimiterNewBelowCapacityNoFullSweep(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
+
 	l := newAuthLimiterSized(100, 100, entryExpiry, entryExpiry)
-	l.clock = func() time.Time { return now }
+
+	l.clock = func() time.Time {
+		return now
+	}
+
 	l.mu.Lock()
 	l.pruned = now
+
 	before := l.fullSweeps
 	l.mu.Unlock()
 
@@ -757,6 +852,7 @@ func TestAuthLimiterNewBelowCapacityNoFullSweep(t *testing.T) {
 	}
 
 	l.canceled("2.2.2.2", "new")
+
 	l.mu.Lock()
 	after := l.fullSweeps
 	l.mu.Unlock()
@@ -770,9 +866,14 @@ func TestAuthLimiterNewBelowCapacityNoFullSweep(t *testing.T) {
 
 func TestAuthLimiterCapacitySweepOnceThenReject(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
+
 	const capN = 8
+
 	l := newAuthLimiterSized(capN, capN, entryExpiry, entryExpiry)
-	l.clock = func() time.Time { return now }
+
+	l.clock = func() time.Time {
+		return now
+	}
 
 	for i := range capN {
 		ip := fmt.Sprintf("10.0.0.%d", i+1)
@@ -785,6 +886,7 @@ func TestAuthLimiterCapacitySweepOnceThenReject(t *testing.T) {
 
 	l.mu.Lock()
 	before := l.fullSweeps
+
 	l.pruned = now
 
 	for ip, st := range l.byIP {
@@ -807,6 +909,7 @@ func TestAuthLimiterCapacitySweepOnceThenReject(t *testing.T) {
 	}
 
 	l.failed("203.0.113.1", "attacker0")
+
 	l.mu.Lock()
 	mid := l.fullSweeps
 	l.mu.Unlock()
@@ -836,14 +939,20 @@ func TestAuthLimiterCapacitySweepOnceThenReject(t *testing.T) {
 	}
 
 	l.canceled("10.0.0.1", "u")
+
 	checkAgg(t, l)
 }
 
 func TestAuthLimiterCapacityReclaimsExpired(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
+
 	const capN = 4
+
 	l := newAuthLimiterSized(capN, capN, entryExpiry, entryExpiry)
-	l.clock = func() time.Time { return now }
+
+	l.clock = func() time.Time {
+		return now
+	}
 
 	for i := range capN {
 		ip := fmt.Sprintf("10.1.0.%d", i+1)
@@ -867,22 +976,27 @@ func TestAuthLimiterCapacityReclaimsExpired(t *testing.T) {
 
 	l.pruned = now
 	l.mu.Unlock()
+
 	now = now.Add(time.Second)
+
 	if !l.reserve("203.0.113.50", "fresh") {
 		t.Fatal("capacity sweep should reclaim expired idle")
 	}
 
 	l.canceled("203.0.113.50", "fresh")
+
 	checkAgg(t, l)
 }
 
 func TestAuthLimiterCapacityFloodRealClockBoundedSweeps(t *testing.T) {
 	const capN = 16
+
 	l := newAuthLimiterSized(capN, capN, entryExpiry, entryExpiry)
 
 	// Fill both maps with non-prunable (recent failure) entries.
 	for i := range capN {
 		ip := fmt.Sprintf("10.50.0.%d", i+1)
+
 		if !l.reserve(ip, "u") {
 			t.Fatalf("fill %d", i)
 		}
@@ -892,16 +1006,20 @@ func TestAuthLimiterCapacityFloodRealClockBoundedSweeps(t *testing.T) {
 
 	l.mu.Lock()
 	l.pruned = l.nowTime() // prevent periodic prune
+
 	before := l.fullSweeps
 	l.mu.Unlock()
 
 	l.clock = time.Now
+
 	const flood = 2000
+
 	accepted := 0
 
 	for i := range flood {
 		if l.reserve(fmt.Sprintf("198.51.100.%d", i%250+1), fmt.Sprintf("flood%d", i)) {
 			accepted++
+
 			l.failed(fmt.Sprintf("198.51.100.%d", i%250+1), fmt.Sprintf("flood%d", i))
 		}
 	}
@@ -923,6 +1041,7 @@ func TestAuthLimiterCapacityFloodRealClockBoundedSweeps(t *testing.T) {
 
 func TestAuthLimiterExistingDuringCapacityFlood(t *testing.T) {
 	const capN = 16
+
 	l := newAuthLimiterSized(capN, capN, entryExpiry, entryExpiry)
 
 	for i := range capN {
@@ -954,6 +1073,7 @@ func TestAuthLimiterExistingDuringCapacityFlood(t *testing.T) {
 
 	l.pruned = l.nowTime()
 	l.mu.Unlock()
+
 	l.clock = time.Now
 
 	for i := range 500 {
@@ -974,13 +1094,21 @@ func TestAuthLimiterExistingDuringCapacityFlood(t *testing.T) {
 
 func TestAuthLimiterSmallCapacityConcurrentExact(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	const capN = 10
-	const remaining = 3
+
+	const (
+		capN      = 10
+		remaining = 3
+	)
+
 	l := newAuthLimiterSized(capN, capN, entryExpiry, entryExpiry)
-	l.clock = func() time.Time { return now }
+
+	l.clock = func() time.Time {
+		return now
+	}
 
 	for i := range capN - remaining {
 		ip := fmt.Sprintf("10.2.0.%d", i+1)
+
 		if !l.reserve(ip, "u") {
 			t.Fatal("prefill")
 		}
@@ -989,22 +1117,22 @@ func TestAuthLimiterSmallCapacityConcurrentExact(t *testing.T) {
 	}
 
 	const attempts = 20
+
 	start := make(chan struct{})
+
 	var (
 		wg sync.WaitGroup
 		ok atomic.Int32
 	)
 
 	for i := range attempts {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 
 			if l.reserve(fmt.Sprintf("10.9.0.%d", i+1), "n") {
 				ok.Add(1)
 			}
-		}(i)
+		})
 	}
 
 	close(start)
@@ -1024,6 +1152,7 @@ func TestAuthLimiterSmallCapacityConcurrentExact(t *testing.T) {
 	// No half-created: every key IP has matching IP entry packages.
 	for k := range l.byKey {
 		ip := ipFromKey(k)
+
 		_, present := l.byIP[ip]
 		if !present {
 			l.mu.Unlock()
@@ -1034,6 +1163,7 @@ func TestAuthLimiterSmallCapacityConcurrentExact(t *testing.T) {
 	err := l.assertAggregatesLocked()
 	if err != nil {
 		l.mu.Unlock()
+
 		t.Fatal(err)
 	}
 
@@ -1042,11 +1172,13 @@ func TestAuthLimiterSmallCapacityConcurrentExact(t *testing.T) {
 
 func TestAuthLimiterSuccessRemovesEmptyDirectly(t *testing.T) {
 	l := newAuthLimiter()
+
 	if !l.reserve("30.30.30.30", "s") {
 		t.Fatal("reserve")
 	}
 
 	l.succeeded("30.30.30.30", "s")
+
 	l.mu.Lock()
 	_, k := l.byKey["30.30.30.30\x00s"]
 	_, ip := l.byIP["30.30.30.30"]
@@ -1061,17 +1193,25 @@ func TestAuthLimiterSuccessRemovesEmptyDirectly(t *testing.T) {
 
 func TestAuthLimiterPeriodicPruneOnlyWhenDue(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
+
 	l := newAuthLimiterSized(50, 50, entryExpiry, entryExpiry)
-	l.clock = func() time.Time { return now }
+
+	l.clock = func() time.Time {
+		return now
+	}
+
 	if !l.reserve("40.40.40.40", "p") {
 		t.Fatal("reserve")
 	}
 
 	l.failed("40.40.40.40", "p")
+
 	l.mu.Lock()
 	l.byIP["40.40.40.40"].seen = now.Add(-entryExpiry - time.Minute)
 	l.byKey["40.40.40.40\x00p"].seen = now.Add(-entryExpiry - time.Minute)
+
 	l.pruned = now // not due
+
 	before := l.fullSweeps
 	l.mu.Unlock()
 
@@ -1081,8 +1221,10 @@ func TestAuthLimiterPeriodicPruneOnlyWhenDue(t *testing.T) {
 	}
 
 	l.canceled("40.40.40.41", "q")
+
 	l.mu.Lock()
 	_, still := l.byKey["40.40.40.40\x00p"]
+
 	mid := l.fullSweeps
 	l.mu.Unlock()
 
@@ -1101,6 +1243,7 @@ func TestAuthLimiterPeriodicPruneOnlyWhenDue(t *testing.T) {
 	}
 
 	l.canceled("40.40.40.42", "r")
+
 	l.mu.Lock()
 	_, gone := l.byKey["40.40.40.40\x00p"]
 	l.mu.Unlock()

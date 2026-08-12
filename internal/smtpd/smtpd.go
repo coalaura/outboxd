@@ -149,9 +149,11 @@ func New(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signer, spool *q
 		hashing:     make(chan struct{}, authWorkers),
 		dataWork:    make(chan struct{}, dataWorkers),
 	}
+
 	srv.queueAdd = func(ctx context.Context, envelope *queue.Envelope, data []byte) error {
 		return srv.queue.AddContext(ctx, envelope, data)
 	}
+
 	srv.signMessage = func(ctx context.Context, data []byte) (string, error) {
 		if err := ctx.Err(); err != nil {
 			return "", err
@@ -214,6 +216,7 @@ func burstDefault(hourly int) int {
 
 func (s *Server) newSMTP(cfg *config.Config, keeper *certs.Keeper) *smtp.Server {
 	server := smtp.NewServer(smtp.BackendFunc(s.session))
+
 	server.Domain = cfg.Server.Hostname
 	server.TLSConfig = keeper.Config()
 	server.MaxMessageBytes = cfg.Server.MaxMessageBytes
@@ -222,6 +225,7 @@ func (s *Server) newSMTP(cfg *config.Config, keeper *certs.Keeper) *smtp.Server 
 	server.AllowInsecureAuth = false
 	server.EnableSMTPUTF8 = true
 	server.ErrorLog = s.log
+
 	return server
 }
 
@@ -232,6 +236,7 @@ func (s *Server) Listen() error {
 	}
 
 	var opened []net.Listener
+
 	cleanup := func() {
 		for _, l := range opened {
 			_ = l.Close()
@@ -249,7 +254,9 @@ func (s *Server) Listen() error {
 		}
 
 		s.starttlsListener = ln
+
 		opened = append(opened, ln)
+
 		s.starttls.Addr = ln.Addr().String()
 	}
 
@@ -258,11 +265,14 @@ func (s *Server) Listen() error {
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
 			cleanup()
+
 			return fmt.Errorf("listen on %s: %w", addr, err)
 		}
 
 		s.implicitListener = ln
+
 		opened = append(opened, ln)
+
 		s.implicit.Addr = ln.Addr().String()
 	}
 
@@ -271,6 +281,7 @@ func (s *Server) Listen() error {
 	}
 
 	parts := make([]string, 0, 2)
+
 	if s.starttlsListener != nil {
 		parts = append(parts, fmt.Sprintf("%s (STARTTLS)", s.starttls.Addr))
 	}
@@ -280,6 +291,7 @@ func (s *Server) Listen() error {
 	}
 
 	s.log.Printf("Listening for submission on %s\n", strings.Join(parts, " and "))
+
 	return nil
 }
 
@@ -298,11 +310,14 @@ func (s *Server) Run(ctx context.Context) error {
 		wg              sync.WaitGroup
 		once            sync.Once
 		shutdownStarted = make(chan struct{})
+		active          atomic.Int32
+		startup         sync.WaitGroup
 	)
-	active := atomic.Int32{}
-	var startup sync.WaitGroup
+
 	started := make(chan struct{})
+
 	listenerCount := 0
+
 	if s.starttlsListener != nil {
 		listenerCount++
 	}
@@ -312,6 +327,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	startup.Add(listenerCount)
+
 	go func() {
 		startup.Wait()
 		close(started)
@@ -336,12 +352,15 @@ func (s *Server) Run(ctx context.Context) error {
 		// Serve registers its listener before calling Accept. Waiting for every
 		// wrapped listener to enter Accept prevents Shutdown from missing one.
 		<-started
+
 		once.Do(func() {
 			close(shutdownStarted)
+
 			// Stop both accept paths before either server begins draining sessions.
 			if s.starttlsListener != nil {
 				_ = s.starttlsListener.Close()
 			}
+
 			if s.implicitListener != nil {
 				_ = s.implicitListener.Close()
 			}
@@ -384,6 +403,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	serveOne := func(name string, listener net.Listener, srv *smtp.Server) {
 		active.Add(1)
+
 		wg.Go(func() {
 			defer func() {
 				if active.Add(-1) == 0 {
@@ -403,14 +423,19 @@ func (s *Server) Run(ctx context.Context) error {
 
 	if s.starttlsListener != nil {
 		tracked := newTrackListener(newLimitListener(s.starttlsListener, s.connLimit), s.connections)
+
 		ln := newAuthDeadlineListener(tracked, s, config.Duration(s.cfg.Server.ReadTimeout))
+
 		serveOne("starttls", ln, s.starttls)
 	}
 
 	if s.implicitListener != nil {
 		tracked := newTrackListener(newLimitListener(s.implicitListener, s.connLimit), s.connections)
+
 		bounded := newAuthDeadlineListener(tracked, s, config.Duration(s.cfg.Server.ReadTimeout))
+
 		ln := tls.NewListener(bounded, s.implicit.TLSConfig)
+
 		serveOne("implicit", ln, s.implicit)
 	}
 
@@ -428,6 +453,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	mu.Lock()
 	defer mu.Unlock()
+
 	return errors.Join(errs...)
 }
 
@@ -439,6 +465,7 @@ type startListener struct {
 
 func (l *startListener) Accept() (net.Conn, error) {
 	l.once.Do(l.entered)
+
 	return l.Listener.Accept()
 }
 
@@ -536,6 +563,7 @@ func responseText(value string) string {
 
 		return char
 	}, value)
+
 	value = strings.Join(strings.Fields(value), " ")
 	if value == "" {
 		return "Invalid message"

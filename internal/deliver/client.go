@@ -54,6 +54,21 @@ type Client struct {
 	ctxDeadline time.Time
 }
 
+type dataWriter struct {
+	client *Client
+	w      io.WriteCloser
+	closed bool
+	reply  string
+}
+
+// boundedResponseConn limits one SMTP reply and caps buffered read-ahead.
+type boundedResponseConn struct {
+	net.Conn
+	mu        sync.Mutex
+	remaining int
+	exceeded  bool
+}
+
 // NewClient wraps an established connection after dial; call Greet next.
 func NewClient(conn net.Conn, command, submission time.Duration) *Client {
 	if command <= 0 {
@@ -65,6 +80,7 @@ func NewClient(conn net.Conn, command, submission time.Duration) *Client {
 	}
 
 	bounded := &boundedResponseConn{Conn: conn}
+
 	return &Client{
 		conn:       conn,
 		text:       textproto.NewConn(bounded),
@@ -76,10 +92,13 @@ func NewClient(conn net.Conn, command, submission time.Duration) *Client {
 }
 
 func (c *Client) bindContext(ctx context.Context) {
-	c.ctxDeadline, _ = ctx.Deadline()
 	watch, stop := context.WithCancel(context.Background())
+
+	c.ctxDeadline, _ = ctx.Deadline()
 	c.stopWatch = stop
+
 	conn := c.conn
+
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -94,6 +113,7 @@ func (c *Client) setDeadline(timeout time.Duration) {
 	if !c.ctxDeadline.IsZero() && c.ctxDeadline.Before(deadline) {
 		deadline = c.ctxDeadline
 	}
+
 	_ = c.conn.SetDeadline(deadline)
 }
 
@@ -103,6 +123,7 @@ func (c *Client) Greet() error {
 	defer c.conn.SetDeadline(time.Time{})
 
 	c.bounded.reset()
+
 	_, _, err := c.readResponse(220)
 	return err
 }
@@ -121,6 +142,7 @@ func (c *Client) EHLO(hostname string) error {
 	defer c.text.EndResponse(id)
 
 	c.bounded.reset()
+
 	_, lines, err := c.readResponseLines(250)
 	if err != nil {
 		return err
@@ -161,6 +183,7 @@ func (c *Client) StartTLS(cfg *tls.Config) error {
 	}
 
 	tlsConn := tls.Client(c.conn, cfg)
+
 	err = tlsConn.Handshake()
 	if err != nil {
 		return err
@@ -171,6 +194,7 @@ func (c *Client) StartTLS(cfg *tls.Config) error {
 	c.text = textproto.NewConn(c.bounded)
 	c.tls = true
 	c.ext = make(map[string]string)
+
 	return nil
 }
 
@@ -185,6 +209,7 @@ func (c *Client) Mail(from string, opts MailOpts) error {
 	defer c.conn.SetDeadline(time.Time{})
 
 	var b strings.Builder
+
 	fmt.Fprintf(&b, "MAIL FROM:<%s>", from)
 
 	if opts.EightBit {
@@ -231,10 +256,12 @@ func (c *Client) Data() (*dataWriter, error) {
 	err := c.cmd(354, "DATA")
 	if err != nil {
 		c.conn.SetDeadline(time.Time{})
+
 		return nil, err
 	}
 
 	c.setDeadline(c.submission)
+
 	return &dataWriter{client: c, w: c.text.DotWriter()}, nil
 }
 
@@ -242,8 +269,11 @@ func (c *Client) Data() (*dataWriter, error) {
 func (c *Client) Quit() error {
 	c.setDeadline(c.command)
 	defer c.conn.SetDeadline(time.Time{})
+
 	err := c.cmd(221, "QUIT")
+
 	c.Close()
+
 	return err
 }
 
@@ -265,13 +295,6 @@ func (c *Client) Close() error {
 	return nil
 }
 
-type dataWriter struct {
-	client *Client
-	w      io.WriteCloser
-	closed bool
-	reply  string
-}
-
 func (d *dataWriter) Write(p []byte) (int, error) {
 	return d.w.Write(p)
 }
@@ -282,7 +305,9 @@ func (d *dataWriter) Close() error {
 	}
 
 	d.closed = true
+
 	err := d.w.Close()
+
 	defer d.client.conn.SetDeadline(time.Time{})
 
 	if err != nil {
@@ -290,12 +315,14 @@ func (d *dataWriter) Close() error {
 	}
 
 	d.client.bounded.reset()
+
 	code, msg, rerr := d.client.readResponse(250)
 	if rerr != nil {
 		return rerr
 	}
 
 	d.reply = fmt.Sprintf("%d %s", code, msg)
+
 	return nil
 }
 
@@ -312,7 +339,9 @@ func (c *Client) cmd(expect int, format string, args ...any) error {
 
 	c.text.StartResponse(id)
 	defer c.text.EndResponse(id)
+
 	c.bounded.reset()
+
 	_, _, err = c.readResponse(expect)
 	return err
 }
@@ -336,11 +365,13 @@ func (c *Client) readResponseLines(expect int) (int, []string, error) {
 		tpErr, ok := err.(*textproto.Error)
 		if ok {
 			msg := normalizeDiagnostic(tpErr.Msg)
+
 			return tpErr.Code, nil, &SMTPError{Code: tpErr.Code, EnhancedCode: parseEnhancedCode(tpErr.Code, msg), Message: msg}
 		}
 
 		if code != 0 {
 			msg = normalizeDiagnostic(msg)
+
 			return code, nil, &SMTPError{Code: code, EnhancedCode: parseEnhancedCode(code, msg), Message: msg}
 		}
 
@@ -348,6 +379,7 @@ func (c *Client) readResponseLines(expect int) (int, []string, error) {
 	}
 
 	lines := strings.Split(msg, "\n")
+
 	return code, lines, nil
 }
 
@@ -373,9 +405,7 @@ func parseExtensions(lines []string) map[string]string {
 }
 
 func smtpCode(err error) int {
-	var se *SMTPError
-
-	if errors.As(err, &se) {
+	if se, ok := errors.AsType[*SMTPError](err); ok {
 		return se.Code
 	}
 
@@ -394,6 +424,7 @@ func smtpEnhancedCode(err error) string {
 
 func parseEnhancedCode(code int, message string) string {
 	field, _, _ := strings.Cut(strings.TrimSpace(message), " ")
+
 	parts := strings.Split(field, ".")
 	if len(parts) != 3 || len(parts[0]) != 1 || parts[0][0] < '2' || parts[0][0] > '5' || int(parts[0][0]-'0') != code/100 {
 		return ""
@@ -424,21 +455,11 @@ func permanent(err error) bool {
 }
 
 func describe(err error) string {
-	var se *SMTPError
-
-	if errors.As(err, &se) {
+	if se, ok := errors.AsType[*SMTPError](err); ok {
 		return normalizeDiagnostic(fmt.Sprintf("%d %s", se.Code, se.Message))
 	}
 
 	return normalizeDiagnostic(err.Error())
-}
-
-// boundedResponseConn limits one SMTP reply and caps buffered read-ahead.
-type boundedResponseConn struct {
-	net.Conn
-	mu        sync.Mutex
-	remaining int
-	exceeded  bool
 }
 
 func (c *boundedResponseConn) reset() {
@@ -468,8 +489,10 @@ func (c *boundedResponseConn) Read(p []byte) (int, error) {
 	c.mu.Unlock()
 
 	n, err := c.Conn.Read(p[:limit])
+
 	c.mu.Lock()
 	c.remaining -= n
+
 	exhausted := c.remaining == 0
 	if exhausted {
 		c.exceeded = true
@@ -486,13 +509,16 @@ func (c *boundedResponseConn) Read(p []byte) (int, error) {
 
 func normalizeDiagnostic(s string) string {
 	s = strings.ToValidUTF8(s, "�")
+
 	var b strings.Builder
 	b.Grow(min(len(s), maxDiagnosticBytes))
-	space := false
+
+	var space bool
 
 	for _, r := range s {
 		if unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
 			space = true
+
 			continue
 		}
 
@@ -501,6 +527,7 @@ func normalizeDiagnostic(s string) string {
 		}
 
 		space = false
+
 		if b.Len()+utf8.RuneLen(r) > maxDiagnosticBytes {
 			break
 		}

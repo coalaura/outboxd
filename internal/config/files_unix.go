@@ -31,6 +31,7 @@ func ReadCheckedFile(path string, private, allowSymlink bool, maximum int64) ([]
 	}
 
 	defer file.Close()
+
 	body, err := io.ReadAll(io.LimitReader(file, maximum+1))
 	if err != nil {
 		return nil, err
@@ -55,6 +56,7 @@ func openChecked(path string, private, allowSymlink bool) (*os.File, error) {
 	}
 
 	file := os.NewFile(uintptr(fd), path)
+
 	info, err := file.Stat()
 	if err != nil {
 		file.Close()
@@ -63,11 +65,13 @@ func openChecked(path string, private, allowSymlink bool) (*os.File, error) {
 
 	if !info.Mode().IsRegular() {
 		file.Close()
+
 		return nil, fmt.Errorf("%q must open as a regular file", path)
 	}
 
 	if private && info.Mode().Perm()&0077 != 0 {
 		file.Close()
+
 		return nil, fmt.Errorf("%q permissions %04o allow group or other access", path, info.Mode().Perm())
 	}
 

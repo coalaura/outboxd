@@ -254,6 +254,7 @@ func (k *Keeper) Status() Status {
 	defer k.mu.Unlock()
 
 	st := Status{}
+
 	if k.lastError != nil {
 		st.LastError = k.lastError.Error()
 	}
@@ -605,9 +606,7 @@ func (k *Keeper) generate(hostname string) error {
 	})
 
 	for _, path := range []string{k.privateKeyStage(), k.certificateStage()} {
-
-		_, err = os.Lstat(path)
-		if err == nil {
+		if _, err = os.Lstat(path); err == nil {
 			return fmt.Errorf("self-signed tls staging file %q already exists", path)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -659,13 +658,17 @@ func (k *Keeper) recoverGeneration() (bool, error) {
 		{k.privateKeyFile, k.privateKeyStage()},
 		{k.certificateFile, k.certificateStage()},
 	}
-	present := 0
-	available := 0
-	finals := 0
+
+	var (
+		present   int
+		available int
+		finals    int
+	)
 
 	for _, target := range targets {
 		_, targetErr := os.Stat(target.path)
 		_, stageErr := os.Stat(target.stage)
+
 		if targetErr == nil || stageErr == nil {
 			available++
 		}
@@ -692,12 +695,14 @@ func (k *Keeper) recoverGeneration() (bool, error) {
 	}
 
 	certPath := k.certificateFile
+
 	_, err := os.Stat(certPath)
 	if errors.Is(err, os.ErrNotExist) {
 		certPath = k.certificateStage()
 	}
 
 	keyPath := k.privateKeyFile
+
 	_, err = os.Stat(keyPath)
 	if errors.Is(err, os.ErrNotExist) {
 		keyPath = k.privateKeyStage()
@@ -705,6 +710,7 @@ func (k *Keeper) recoverGeneration() (bool, error) {
 
 	certPEM, certErr := config.ReadCheckedFile(certPath, false, false, maxCertificateBytes)
 	keyPEM, keyErr := config.ReadCheckedFile(keyPath, true, false, maxPrivateKeyBytes)
+
 	if certErr != nil || keyErr != nil {
 		if finals == 0 {
 			return false, k.discardGenerationStages()
@@ -725,6 +731,7 @@ func (k *Keeper) recoverGeneration() (bool, error) {
 	for _, target := range targets {
 		_, targetErr := os.Stat(target.path)
 		_, stageErr := os.Stat(target.stage)
+
 		if targetErr == nil {
 			present++
 
@@ -757,7 +764,6 @@ func (k *Keeper) recoverGeneration() (bool, error) {
 
 func (k *Keeper) discardGenerationStages() error {
 	for _, stage := range []string{k.privateKeyStage(), k.certificateStage()} {
-
 		err := removeIfExistsDurable(stage)
 		if err != nil {
 			return err

@@ -26,43 +26,69 @@ import (
 
 func TestEndToEndLocalPath(t *testing.T) {
 	const password = "e2e-password-xyz"
+
 	srv, cfg, spool, signer, roots := testServerWithUser(t, password)
 
 	cert, mxPool := mintOutboundCert(t, "mx.ex.com")
+
 	mx := &e2eMX{startTLS: true, cert: cert, ext8bit: true}
+
 	mxAddr := startE2EMX(t, mx)
 
 	d := deliver.New(cfg, spool, testLog{})
+
 	d.SetTLSRootCAs(mxPool)
+
 	ip := net.ParseIP("10.255.220.1")
+
 	d.SetResolver(&e2eResolver{
 		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com.", Pref: 10}}},
 		ips: map[string][]net.IP{"mx.ex.com": {ip}},
 	})
+
 	d.SetDialer(e2eDial(func(ctx context.Context, network, address string) (net.Conn, error) {
 		var nd net.Dialer
+
 		return nd.DialContext(ctx, "tcp", mxAddr)
 	}))
 
 	entered := waitServeEntered(t, srv)
+
 	ctx, cancel := context.WithCancel(context.Background())
+
 	serveDone := make(chan error, 1)
-	go func() { serveDone <- srv.Run(ctx) }()
+
+	go func() {
+		serveDone <- srv.Run(ctx)
+	}()
+
 	awaitCh(t, entered, 3*time.Second, "serve")
 
 	delivDone := make(chan error, 1)
+
 	dctx, dcancel := context.WithCancel(context.Background())
-	go func() { delivDone <- d.Run(dctx) }()
+
+	go func() {
+		delivDone <- d.Run(dctx)
+	}()
 
 	cl := dialSTARTTLS(t, srv.starttls.Addr, roots)
+
 	cl.authPlain(t, "alice", password)
+
 	cl.cmd(t, "MAIL FROM:<Alice.Sender@test.example>", 250)
 	cl.cmd(t, "RCPT TO:<Dest.User@ex.com>", 250)
+
 	cl.writeLine("DATA")
+
 	cl.readCode(t, 354)
+
 	body := "From: Alice.Sender@test.example\r\nTo: Dest.User@ex.com\r\nSubject: e2e hello\r\n\r\nBody of the ordinary path.\r\n.\r\n"
+
 	_, _ = io.WriteString(cl.conn, body)
+
 	cl.readCode(t, 250)
+
 	cl.close()
 
 	select {
@@ -103,8 +129,10 @@ func TestEndToEndLocalPath(t *testing.T) {
 	}
 
 	var (
-		ehlos                         int
-		sawStartTLS, sawMail, sawRcpt bool
+		ehlos       int
+		sawStartTLS bool
+		sawMail     bool
+		sawRcpt     bool
 	)
 
 	for _, c := range snap.commands {
@@ -121,11 +149,13 @@ func TestEndToEndLocalPath(t *testing.T) {
 			sawStartTLS = true
 		case strings.HasPrefix(u, "MAIL FROM:"):
 			sawMail = true
+
 			if !strings.Contains(c, "Alice.Sender@test.example") {
 				t.Fatalf("MAIL=%s", c)
 			}
 		case strings.HasPrefix(u, "RCPT TO:"):
 			sawRcpt = true
+
 			if !strings.Contains(c, "Dest.User@ex.com") {
 				t.Fatalf("RCPT=%s", c)
 			}
@@ -153,6 +183,7 @@ func TestEndToEndLocalPath(t *testing.T) {
 			return nil, nil
 		},
 	})
+
 	if err != nil {
 		t.Fatalf("dkim verify: %v", err)
 	}
@@ -170,6 +201,7 @@ func TestEndToEndLocalPath(t *testing.T) {
 	}
 }
 
+// gost:preserve-layout
 type e2eSnap struct {
 	commands []string
 	mail     string
@@ -193,6 +225,7 @@ type e2eMX struct {
 	cert        tls.Certificate
 }
 
+// gost:preserve-layout
 type e2eLive struct {
 	mu       sync.Mutex
 	commands []string
@@ -207,6 +240,7 @@ type e2eLive struct {
 func (l *e2eLive) snap() e2eSnap {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
 	return e2eSnap{
 		commands: append([]string(nil), l.commands...),
 		mail:     l.mail,
@@ -220,16 +254,23 @@ func (l *e2eLive) snap() e2eSnap {
 
 func startE2EMX(t *testing.T, mx *e2eMX) string {
 	t.Helper()
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	mx.ln = ln
+
 	mx.dataDone = make(chan struct{})
 	mx.sessionDone = make(chan struct{}, 4)
+
 	go mx.serve()
-	t.Cleanup(func() { _ = ln.Close() })
+
+	t.Cleanup(func() {
+		_ = ln.Close()
+	})
+
 	return ln.Addr().String()
 }
 
@@ -241,12 +282,16 @@ func (mx *e2eMX) serve() {
 		}
 
 		mx.conns.Add(1)
+
 		live := &e2eLive{}
+
 		go func() {
 			mx.handle(c, live)
+
 			mx.mu.Lock()
 			mx.sess = live.snap()
 			mx.mu.Unlock()
+
 			mx.sessionDone <- struct{}{}
 		}()
 	}
@@ -255,16 +300,24 @@ func (mx *e2eMX) serve() {
 func (mx *e2eMX) snapshot() e2eSnap {
 	mx.mu.Lock()
 	defer mx.mu.Unlock()
+
 	return mx.sess
 }
 
 func (mx *e2eMX) handle(c net.Conn, live *e2eLive) {
 	defer c.Close()
+
 	rw := c
+
 	br := bufio.NewReader(rw)
-	write := func(s string) { _, _ = io.WriteString(rw, s) }
+
+	write := func(s string) {
+		_, _ = io.WriteString(rw, s)
+	}
+
 	write("220 mx.ex.com ESMTP\r\n")
-	secured := false
+
+	var secured bool
 
 	for {
 		line, err := br.ReadString('\n')
@@ -273,9 +326,11 @@ func (mx *e2eMX) handle(c net.Conn, live *e2eLive) {
 		}
 
 		raw := strings.TrimRight(line, "\r\n")
+
 		live.mu.Lock()
 		live.commands = append(live.commands, raw)
 		live.mu.Unlock()
+
 		upper := strings.ToUpper(raw)
 
 		switch {
@@ -293,34 +348,43 @@ func (mx *e2eMX) handle(c net.Conn, live *e2eLive) {
 			write("250 OK\r\n")
 		case strings.HasPrefix(upper, "STARTTLS"):
 			write("220 ready\r\n")
+
 			tc := tls.Server(rw, &tls.Config{Certificates: []tls.Certificate{mx.cert}})
+
 			err = tc.Handshake()
 			if err != nil {
 				return
 			}
 
 			cs := tc.ConnectionState()
+
 			live.mu.Lock()
 			live.tls = true
 			live.sni = cs.ServerName
 			live.mu.Unlock()
+
 			rw = tc
+
 			br = bufio.NewReader(rw)
+
 			secured = true
 		case strings.HasPrefix(upper, "MAIL FROM:"):
 			live.mu.Lock()
 			live.mail = raw
 			live.mu.Unlock()
+
 			write("250 OK\r\n")
 		case strings.HasPrefix(upper, "RCPT TO:"):
 			live.mu.Lock()
 			live.rcpt = raw
 			live.mu.Unlock()
+
 			write("250 OK\r\n")
 		case strings.HasPrefix(upper, "DATA"):
 			live.mu.Lock()
 			live.data = true
 			live.mu.Unlock()
+
 			write("354 go\r\n")
 
 			for {
@@ -339,9 +403,13 @@ func (mx *e2eMX) handle(c net.Conn, live *e2eLive) {
 			}
 
 			write("250 queued\r\n")
-			mx.dataOnce.Do(func() { close(mx.dataDone) })
+
+			mx.dataOnce.Do(func() {
+				close(mx.dataDone)
+			})
 		case strings.HasPrefix(upper, "QUIT"):
 			write("221 bye\r\n")
+
 			return
 		default:
 			write("250 OK\r\n")
@@ -359,6 +427,7 @@ func (f *e2eResolver) LookupMX(ctx context.Context, name string) ([]*net.MX, err
 	if ok {
 		out := make([]*net.MX, len(mx))
 		copy(out, mx)
+
 		return out, nil
 	}
 
@@ -373,6 +442,7 @@ func (f *e2eResolver) LookupNetIP(ctx context.Context, network, host string) ([]
 
 	out := make([]net.IP, len(ips))
 	copy(out, ips)
+
 	return out, nil
 }
 
@@ -384,6 +454,7 @@ func (f e2eDial) DialContext(ctx context.Context, network, address string) (net.
 
 func mintOutboundCert(t *testing.T, cn string) (tls.Certificate, *x509.CertPool) {
 	t.Helper()
+
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -398,18 +469,21 @@ func mintOutboundCert(t *testing.T, cn string) (tls.Certificate, *x509.CertPool)
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		DNSNames:     []string{cn},
 	}
+
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
 	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		t.Fatal(err)
@@ -421,6 +495,8 @@ func mintOutboundCert(t *testing.T, cn string) (tls.Certificate, *x509.CertPool)
 	}
 
 	pool := x509.NewCertPool()
+
 	pool.AddCert(parsed)
+
 	return tlsCert, pool
 }

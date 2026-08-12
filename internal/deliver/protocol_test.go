@@ -68,6 +68,7 @@ func (s *sessionLog) add(cmd string) {
 func (s *sessionLog) snapshot() sessionSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	out := sessionSnapshot{
 		MailLine: s.mailLine,
 		Data:     s.data,
@@ -75,8 +76,10 @@ func (s *sessionLog) snapshot() sessionSnapshot {
 		TLS:      s.tls,
 		SNI:      s.sni,
 	}
+
 	out.Commands = append([]string(nil), s.commands...)
 	out.RcptLines = append([]string(nil), s.rcptLines...)
+
 	return out
 }
 
@@ -117,6 +120,7 @@ type fakeMX struct {
 
 func startFakeMX(t *testing.T, mx *fakeMX) string {
 	t.Helper()
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -127,8 +131,11 @@ func startFakeMX(t *testing.T, mx *fakeMX) string {
 	mx.dataDone = make(chan struct{})
 	mx.sessionDone = make(chan struct{}, 256)
 	mx.done = make(chan struct{})
+
 	go mx.serve()
+
 	close(mx.ready)
+
 	t.Cleanup(func() {
 		_ = ln.Close()
 
@@ -137,27 +144,34 @@ func startFakeMX(t *testing.T, mx *fakeMX) string {
 		case <-time.After(5 * time.Second):
 		}
 	})
+
 	return ln.Addr().String()
 }
 
 func (mx *fakeMX) serve() {
 	defer close(mx.done)
+
 	var wg sync.WaitGroup
 
 	for {
 		c, err := mx.ln.Accept()
 		if err != nil {
 			wg.Wait()
+
 			return
 		}
 
 		mx.conns.Add(1)
+
 		log := &sessionLog{}
+
 		mx.mu.Lock()
 		mx.sessions = append(mx.sessions, log)
 		mx.mu.Unlock()
+
 		wg.Go(func() {
 			mx.handle(c, log)
+
 			mx.sessionDone <- struct{}{}
 		})
 	}
@@ -165,16 +179,23 @@ func (mx *fakeMX) serve() {
 
 func (mx *fakeMX) handle(c net.Conn, log *sessionLog) {
 	defer c.Close()
+
 	rw := c
+
 	br := bufio.NewReader(rw)
-	write := func(s string) { _, _ = io.WriteString(rw, s) }
+
+	write := func(s string) {
+		_, _ = io.WriteString(rw, s)
+	}
+
 	readLine := func() (string, error) {
 		line, err := br.ReadString('\n')
 		return line, err
 	}
 
 	write("220 mx.test ESMTP\r\n")
-	secured := false
+
+	var secured bool
 
 	for {
 		line, err := readLine()
@@ -183,7 +204,9 @@ func (mx *fakeMX) handle(c net.Conn, log *sessionLog) {
 		}
 
 		raw := strings.TrimRight(line, "\r\n")
+
 		log.add(raw)
+
 		upper := strings.ToUpper(raw)
 
 		switch {
@@ -195,6 +218,7 @@ func (mx *fakeMX) handle(c net.Conn, log *sessionLog) {
 
 			if code != 0 {
 				write(fmt.Sprintf("%d rejected\r\n", code))
+
 				continue
 			}
 
@@ -216,11 +240,13 @@ func (mx *fakeMX) handle(c net.Conn, log *sessionLog) {
 		case strings.HasPrefix(upper, "STARTTLS"):
 			if !mx.startTLS || secured {
 				write("503 bad\r\n")
+
 				continue
 			}
 
 			if mx.startTLSEr {
 				write("454 TLS not available\r\n")
+
 				continue
 			}
 
@@ -229,28 +255,36 @@ func (mx *fakeMX) handle(c net.Conn, log *sessionLog) {
 			if mx.brokenTLS {
 				// Fail during the handshake, not after a successful one.
 				_, _ = rw.Write([]byte("NOT_TLS_HANDSHAKE"))
+
 				return
 			}
 
 			cfg := &tls.Config{Certificates: []tls.Certificate{mx.cert}}
+
 			tlsConn := tls.Server(rw, cfg)
+
 			err = tlsConn.Handshake()
 			if err != nil {
 				return
 			}
 
 			cs := tlsConn.ConnectionState()
+
 			log.mu.Lock()
 			log.sni = cs.ServerName
 			log.tls = true
 			log.mu.Unlock()
+
 			rw = tlsConn
+
 			br = bufio.NewReader(rw)
+
 			secured = true
 		case strings.HasPrefix(upper, "MAIL FROM:"):
 			log.mu.Lock()
 			log.mailLine = raw
 			log.mu.Unlock()
+
 			write("250 OK\r\n")
 		case strings.HasPrefix(upper, "RCPT TO:"):
 			log.mu.Lock()
@@ -266,6 +300,7 @@ func (mx *fakeMX) handle(c net.Conn, log *sessionLog) {
 			log.mu.Lock()
 			log.data = true
 			log.mu.Unlock()
+
 			write("354 go\r\n")
 
 			for {
@@ -287,7 +322,10 @@ func (mx *fakeMX) handle(c net.Conn, log *sessionLog) {
 			}
 
 			write("250 queued\r\n")
-			mx.dataOnce.Do(func() { close(mx.dataDone) })
+
+			mx.dataOnce.Do(func() {
+				close(mx.dataDone)
+			})
 		case strings.HasPrefix(upper, "QUIT"):
 			write("221 bye\r\n")
 			return
@@ -301,6 +339,7 @@ func (mx *fakeMX) snapshots() []sessionSnapshot {
 	mx.mu.Lock()
 	logs := append([]*sessionLog(nil), mx.sessions...)
 	mx.mu.Unlock()
+
 	out := make([]sessionSnapshot, 0, len(logs))
 
 	for _, s := range logs {
@@ -338,6 +377,7 @@ func (mx *fakeMX) anyMail() bool {
 
 func mintCert(t *testing.T, cn string) (tls.Certificate, *x509.CertPool, *x509.Certificate) {
 	t.Helper()
+
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -352,18 +392,21 @@ func mintCert(t *testing.T, cn string) (tls.Certificate, *x509.CertPool, *x509.C
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		DNSNames:     []string{cn},
 	}
+
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
 	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		t.Fatal(err)
@@ -375,17 +418,18 @@ func mintCert(t *testing.T, cn string) (tls.Certificate, *x509.CertPool, *x509.C
 	}
 
 	pool := x509.NewCertPool()
+
 	pool.AddCert(parsed)
+
 	return tlsCert, pool, parsed
 }
 
 func deliverCfg() *config.Config {
-	allow := true
 	return &config.Config{
 		Server: config.Server{Hostname: "outboxd.test", Domain: "outboxd.test"},
 		Delivery: config.Delivery{
 			TLSMode:                  "opportunistic",
-			AllowPlaintext:           &allow,
+			AllowPlaintext:           new(true),
 			MaxAttempts:              3,
 			MaximumLifetime:          "1h",
 			InitialRetryDelay:        "1ms",
@@ -403,23 +447,34 @@ func deliverCfg() *config.Config {
 
 func wireMX(t *testing.T, d *deliver.Deliverer, domain, mxHost, addr string) {
 	t.Helper()
+
 	host, port, _ := net.SplitHostPort(addr)
+
 	_ = port
+
 	d.SetResolver(&fakeResolver{
 		mx:  map[string][]*net.MX{domain: {{Host: mxHost + ".", Pref: 10}}},
 		ips: map[string][]net.IP{mxHost: {net.ParseIP(host)}},
 	})
+
 	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
 		var nd net.Dialer
+
 		return nd.DialContext(ctx, "tcp", addr)
 	}))
 }
 
 func runDeliverer(t *testing.T, d *deliver.Deliverer) (cancel context.CancelFunc, done <-chan error) {
 	t.Helper()
+
 	ctx, cancel := context.WithCancel(context.Background())
+
 	ch := make(chan error, 1)
-	go func() { ch <- d.Run(ctx) }()
+
+	go func() {
+		ch <- d.Run(ctx)
+	}()
+
 	return cancel, ch
 }
 
@@ -445,7 +500,9 @@ func awaitSession(t *testing.T, mx *fakeMX, timeout time.Duration) {
 
 func addEnvelope(t *testing.T, q *queue.Queue, id, sender, rcpt, domain string, utf8, eight bool, body []byte) {
 	t.Helper()
+
 	now := time.Now()
+
 	env := &queue.Envelope{
 		ID: id, Username: "user", Sender: sender,
 		Recipients:  []queue.Recipient{{Address: rcpt, Domain: domain, Status: queue.StatusPending}},
@@ -454,6 +511,7 @@ func addEnvelope(t *testing.T, q *queue.Queue, id, sender, rcpt, domain string, 
 		SMTPUTF8:    utf8,
 		EightBit:    eight,
 	}
+
 	if body == nil {
 		body = []byte("From: " + sender + "\r\nTo: " + rcpt + "\r\nSubject: t\r\n\r\nHi\r\n")
 	}
@@ -468,16 +526,26 @@ func addEnvelope(t *testing.T, q *queue.Queue, id, sender, rcpt, domain string, 
 
 func TestASCIINoUTF8No8BitParams(t *testing.T) {
 	mx := &fakeMX{startTLS: false, ext8bit: true, extUTF8: true}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	cfg := deliverCfg()
+
 	d := deliver.New(cfg, q, memLog{})
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	addEnvelope(t, q, "a1", "a@ex.com", "b@ex.com", "ex.com", false, false, nil)
+
 	cancel, done := runDeliverer(t, d)
+
 	await(t, mx.dataDone, 3*time.Second, "DATA")
+
 	cancel()
 	<-done
+
 	lines := mx.mailLines()
 	if len(lines) == 0 {
 		t.Fatal("no MAIL")
@@ -490,15 +558,24 @@ func TestASCIINoUTF8No8BitParams(t *testing.T) {
 
 func TestSMTPUTF8Supported(t *testing.T) {
 	mx := &fakeMX{extUTF8: true, ext8bit: true}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	d := deliver.New(deliverCfg(), q, memLog{})
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	addEnvelope(t, q, "u1", "björn@ex.com", "b@ex.com", "ex.com", true, false, nil)
+
 	cancel, done := runDeliverer(t, d)
+
 	await(t, mx.dataDone, 3*time.Second, "DATA")
+
 	cancel()
 	<-done
+
 	lines := mx.mailLines()
 	if len(lines) == 0 || !strings.Contains(lines[0], "SMTPUTF8") {
 		t.Fatalf("MAIL=%v", lines)
@@ -507,15 +584,25 @@ func TestSMTPUTF8Supported(t *testing.T) {
 
 func TestSMTPUTF8MissingPermanent(t *testing.T) {
 	mx := &fakeMX{extUTF8: false, ext8bit: true}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	cfg := deliverCfg()
+
 	cfg.Delivery.MaxAttempts = 1
+
 	d := deliver.New(cfg, q, memLog{})
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	addEnvelope(t, q, "u2", "björn@ex.com", "b@ex.com", "ex.com", true, false, nil)
+
 	cancel, done := runDeliverer(t, d)
+
 	awaitSession(t, mx, 3*time.Second)
+
 	cancel()
 	<-done
 
@@ -540,16 +627,26 @@ func TestSMTPUTF8MissingPermanent(t *testing.T) {
 
 func Test8BitMIMESupported(t *testing.T) {
 	mx := &fakeMX{ext8bit: true}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	d := deliver.New(deliverCfg(), q, memLog{})
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	body := []byte("From: a@ex.com\r\nTo: b@ex.com\r\nSubject: t\r\n\r\n" + "caf\xc3\xa9\r\n")
+
 	addEnvelope(t, q, "e1", "a@ex.com", "b@ex.com", "ex.com", false, true, body)
+
 	cancel, done := runDeliverer(t, d)
+
 	await(t, mx.dataDone, 3*time.Second, "DATA")
+
 	cancel()
 	<-done
+
 	lines := mx.mailLines()
 	if len(lines) == 0 || !strings.Contains(lines[0], "BODY=8BITMIME") {
 		t.Fatalf("MAIL=%v", lines)
@@ -558,16 +655,27 @@ func Test8BitMIMESupported(t *testing.T) {
 
 func Test8BitMIMEMissingPermanent(t *testing.T) {
 	mx := &fakeMX{ext8bit: false, extUTF8: true}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	cfg := deliverCfg()
+
 	cfg.Delivery.MaxAttempts = 1
+
 	d := deliver.New(cfg, q, memLog{})
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	body := []byte("From: a@ex.com\r\nTo: b@ex.com\r\nSubject: t\r\n\r\n" + "caf\xc3\xa9\r\n")
+
 	addEnvelope(t, q, "e2", "a@ex.com", "b@ex.com", "ex.com", false, true, body)
+
 	cancel, done := runDeliverer(t, d)
+
 	awaitSession(t, mx, 3*time.Second)
+
 	cancel()
 	<-done
 
@@ -588,16 +696,27 @@ func Test8BitMIMEMissingPermanent(t *testing.T) {
 
 func TestBothCapabilitiesRequired(t *testing.T) {
 	mx := &fakeMX{extUTF8: true, ext8bit: false}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	cfg := deliverCfg()
+
 	cfg.Delivery.MaxAttempts = 1
+
 	d := deliver.New(cfg, q, memLog{})
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	body := []byte("From: björn@ex.com\r\nTo: b@ex.com\r\nSubject: t\r\n\r\n" + "caf\xc3\xa9\r\n")
+
 	addEnvelope(t, q, "b1", "björn@ex.com", "b@ex.com", "ex.com", true, true, body)
+
 	cancel, done := runDeliverer(t, d)
+
 	awaitSession(t, mx, 3*time.Second)
+
 	cancel()
 	<-done
 
@@ -608,30 +727,48 @@ func TestBothCapabilitiesRequired(t *testing.T) {
 
 func TestClientUTF8OptInASCIINotRequired(t *testing.T) {
 	mx := &fakeMX{extUTF8: false, ext8bit: true}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	d := deliver.New(deliverCfg(), q, memLog{})
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	addEnvelope(t, q, "opt1", "a@ex.com", "b@ex.com", "ex.com", false, false, nil)
+
 	cancel, done := runDeliverer(t, d)
+
 	await(t, mx.dataDone, 3*time.Second, "DATA")
+
 	cancel()
 	<-done
 }
 
 func TestUTF8LocalPartCasingPreserved(t *testing.T) {
 	mx := &fakeMX{extUTF8: true, ext8bit: true}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	d := deliver.New(deliverCfg(), q, memLog{})
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	sender := "Jörg.User@ex.com"
 	rcpt := "Åke@ex.com"
+
 	addEnvelope(t, q, "case1", sender, rcpt, "ex.com", true, false, nil)
+
 	cancel, done := runDeliverer(t, d)
+
 	await(t, mx.dataDone, 3*time.Second, "DATA")
+
 	cancel()
 	<-done
+
 	lines := mx.mailLines()
 	if len(lines) == 0 || !strings.Contains(lines[0], "Jörg.User@ex.com") {
 		t.Fatalf("MAIL casing: %v", lines)
@@ -642,14 +779,23 @@ func TestUTF8LocalPartCasingPreserved(t *testing.T) {
 
 func TestTLSAbsentPlainAllowed(t *testing.T) {
 	cert, _, _ := mintCert(t, "mx.ex.com")
+
 	mx := &fakeMX{startTLS: false, cert: cert, ext8bit: true}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	d := deliver.New(deliverCfg(), q, memLog{})
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	addEnvelope(t, q, "tls1", "a@ex.com", "b@ex.com", "ex.com", false, false, nil)
+
 	cancel, done := runDeliverer(t, d)
+
 	await(t, mx.dataDone, 3*time.Second, "DATA")
+
 	cancel()
 	<-done
 
@@ -660,18 +806,26 @@ func TestTLSAbsentPlainAllowed(t *testing.T) {
 
 func TestInitialEHLOFallbackToHELO(t *testing.T) {
 	for _, code := range []int{500, 502, 504} {
-
 		t.Run(fmt.Sprint(code), func(t *testing.T) {
 			mx := &fakeMX{initialEHLOCode: code}
+
 			addr := startFakeMX(t, mx)
+
 			q := openQueue(t)
+
 			d := deliver.New(deliverCfg(), q, memLog{})
+
 			wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 			addEnvelope(t, q, fmt.Sprintf("helo-%d", code), "a@ex.com", "b@ex.com", "ex.com", false, false, nil)
+
 			cancel, done := runDeliverer(t, d)
+
 			await(t, mx.dataDone, 3*time.Second, "DATA")
+
 			cancel()
 			<-done
+
 			commands := mx.snapshots()[0].Commands
 			if len(commands) < 2 || !strings.HasPrefix(strings.ToUpper(commands[1]), "HELO ") {
 				t.Fatalf("commands=%v", commands)
@@ -692,21 +846,30 @@ func TestInitialEHLODoesNotFallbackWhenUnsafe(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mx := &fakeMX{initialEHLOCode: tt.code}
+
 			addr := startFakeMX(t, mx)
+
 			q := openQueue(t)
+
 			cfg := deliverCfg()
+
 			if tt.required {
-				allow := false
 				cfg.Delivery.TLSMode = "required"
-				cfg.Delivery.AllowPlaintext = &allow
+				cfg.Delivery.AllowPlaintext = new(false)
 			}
 
 			cfg.Delivery.MaxAttempts = 1
+
 			d := deliver.New(cfg, q, memLog{})
+
 			wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 			addEnvelope(t, q, "no-helo", "a@ex.com", "b@ex.com", "ex.com", tt.utf8, tt.eightBit, nil)
+
 			cancel, done := runDeliverer(t, d)
+
 			awaitSession(t, mx, 3*time.Second)
+
 			cancel()
 			<-done
 
@@ -721,17 +884,29 @@ func TestInitialEHLODoesNotFallbackWhenUnsafe(t *testing.T) {
 
 func TestPostSTARTTLSEHLODoesNotFallback(t *testing.T) {
 	cert, pool, _ := mintCert(t, "mx.ex.com")
+
 	mx := &fakeMX{startTLS: true, cert: cert, postTLSEHLOCode: 500}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	cfg := deliverCfg()
+
 	cfg.Delivery.MaxAttempts = 1
+
 	d := deliver.New(cfg, q, memLog{})
+
 	d.SetTLSRootCAs(pool)
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	addEnvelope(t, q, "post-tls-no-helo", "a@ex.com", "b@ex.com", "ex.com", false, false, nil)
+
 	cancel, done := runDeliverer(t, d)
+
 	awaitSession(t, mx, 3*time.Second)
+
 	cancel()
 	<-done
 
@@ -744,17 +919,28 @@ func TestPostSTARTTLSEHLODoesNotFallback(t *testing.T) {
 
 func TestEnhancedStatusPersisted(t *testing.T) {
 	mx := &fakeMX{rcptReply: "550 5.1.1 no such user"}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	cfg := deliverCfg()
+
 	cfg.Delivery.MaxAttempts = 1
+
 	d := deliver.New(cfg, q, memLog{})
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	addEnvelope(t, q, "enhanced-status", "a@ex.com", "b@ex.com", "ex.com", false, false, nil)
+
 	cancel, done := runDeliverer(t, d)
+
 	awaitSession(t, mx, 3*time.Second)
+
 	cancel()
 	<-done
+
 	ids, err := q.DeadIDs()
 	if err != nil || len(ids) != 1 {
 		t.Fatalf("DeadIDs=%v err=%v", ids, err)
@@ -773,19 +959,29 @@ func TestEnhancedStatusPersisted(t *testing.T) {
 
 func TestTLSAbsentRequired(t *testing.T) {
 	cert, _, _ := mintCert(t, "mx.ex.com")
+
 	mx := &fakeMX{startTLS: false, cert: cert}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	cfg := deliverCfg()
+
 	cfg.Delivery.TLSMode = "required"
-	allow := false
-	cfg.Delivery.AllowPlaintext = &allow
+	cfg.Delivery.AllowPlaintext = new(false)
 	cfg.Delivery.MaxAttempts = 1
+
 	d := deliver.New(cfg, q, memLog{})
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	addEnvelope(t, q, "tls2", "a@ex.com", "b@ex.com", "ex.com", false, false, nil)
+
 	cancel, done := runDeliverer(t, d)
+
 	awaitSession(t, mx, 3*time.Second)
+
 	cancel()
 	<-done
 
@@ -796,21 +992,35 @@ func TestTLSAbsentRequired(t *testing.T) {
 
 func TestTLSVerifiedTrusted(t *testing.T) {
 	cert, pool, _ := mintCert(t, "mx.ex.com")
+
 	mx := &fakeMX{startTLS: true, cert: cert, ext8bit: true}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	cfg := deliverCfg()
+
 	cfg.Delivery.TLSMode = "opportunistic"
 	cfg.Delivery.RequireValidMXTLSCert = true
+
 	d := deliver.New(cfg, q, memLog{})
+
 	d.SetTLSRootCAs(pool)
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	addEnvelope(t, q, "tls3", "a@ex.com", "b@ex.com", "ex.com", false, false, nil)
+
 	cancel, done := runDeliverer(t, d)
+
 	await(t, mx.dataDone, 3*time.Second, "DATA")
+
 	cancel()
 	<-done
+
 	snaps := mx.snapshots()
+
 	var (
 		sni   string
 		ehlos int
@@ -847,19 +1057,31 @@ func TestTLSVerifiedTrusted(t *testing.T) {
 
 func TestTLSUntrustedNoInsecureRetry(t *testing.T) {
 	cert, _, _ := mintCert(t, "mx.ex.com")
+
 	mx := &fakeMX{startTLS: true, cert: cert, ext8bit: true}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	cfg := deliverCfg()
+
 	cfg.Delivery.TLSMode = "opportunistic"
 	cfg.Delivery.RequireValidMXTLSCert = true
 	cfg.Delivery.MaxAttempts = 1
+
 	d := deliver.New(cfg, q, memLog{})
+
 	d.SetTLSRootCAs(x509.NewCertPool())
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	addEnvelope(t, q, "tls4", "a@ex.com", "b@ex.com", "ex.com", false, false, nil)
+
 	cancel, done := runDeliverer(t, d)
+
 	awaitSession(t, mx, 3*time.Second)
+
 	cancel()
 	<-done
 
@@ -874,17 +1096,28 @@ func TestTLSUntrustedNoInsecureRetry(t *testing.T) {
 
 func TestTLSInsecureModeSingleConn(t *testing.T) {
 	cert, _, _ := mintCert(t, "mx.ex.com")
+
 	mx := &fakeMX{startTLS: true, cert: cert, ext8bit: true}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	cfg := deliverCfg()
+
 	cfg.Delivery.TLSMode = "opportunistic_insecure"
 	cfg.Delivery.RequireValidMXTLSCert = false
+
 	d := deliver.New(cfg, q, memLog{})
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	addEnvelope(t, q, "tls5", "a@ex.com", "b@ex.com", "ex.com", false, false, nil)
+
 	cancel, done := runDeliverer(t, d)
+
 	await(t, mx.dataDone, 3*time.Second, "DATA")
+
 	cancel()
 	<-done
 
@@ -895,17 +1128,29 @@ func TestTLSInsecureModeSingleConn(t *testing.T) {
 
 func TestTLSStartTLSCommandError(t *testing.T) {
 	cert, pool, _ := mintCert(t, "mx.ex.com")
+
 	mx := &fakeMX{startTLS: true, cert: cert, startTLSEr: true}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	cfg := deliverCfg()
+
 	cfg.Delivery.MaxAttempts = 1
+
 	d := deliver.New(cfg, q, memLog{})
+
 	d.SetTLSRootCAs(pool)
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	addEnvelope(t, q, "tls6", "a@ex.com", "b@ex.com", "ex.com", false, false, nil)
+
 	cancel, done := runDeliverer(t, d)
+
 	awaitSession(t, mx, 3*time.Second)
+
 	cancel()
 	<-done
 
@@ -916,20 +1161,32 @@ func TestTLSStartTLSCommandError(t *testing.T) {
 
 func TestOrdinaryDeliveryPathRegression(t *testing.T) {
 	cert, pool, _ := mintCert(t, "mx.ex.com")
+
 	mx := &fakeMX{startTLS: true, cert: cert, ext8bit: true, extUTF8: true}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	cfg := deliverCfg()
+
 	d := deliver.New(cfg, q, memLog{})
+
 	d.SetTLSRootCAs(pool)
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	body := []byte("From: sender@ex.com\r\nTo: dest@ex.com\r\nSubject: hello\r\nMIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nHello world\r\n")
+
 	addEnvelope(t, q, "reg1", "sender@ex.com", "dest@ex.com", "ex.com", false, false, body)
+
 	cancel, done := runDeliverer(t, d)
+
 	await(t, mx.dataDone, 3*time.Second, "DATA")
 
 	// Wait session end so Finish can complete before inspecting queue.
 	awaitSession(t, mx, 3*time.Second)
+
 	cancel()
 	<-done
 
@@ -953,21 +1210,29 @@ func (m mapDialer) DialContext(ctx context.Context, network, address string) (ne
 	}
 
 	var nd net.Dialer
+
 	return nd.DialContext(ctx, "tcp", target)
 }
 
 type errUnmapped string
 
-func (e errUnmapped) Error() string { return "unmapped " + string(e) }
+func (e errUnmapped) Error() string {
+	return "unmapped " + string(e)
+}
 
 func multiMX(t *testing.T, bad, good *fakeMX) (*deliver.Deliverer, *queue.Queue) {
 	t.Helper()
+
 	addrBad := startFakeMX(t, bad)
 	addrGood := startFakeMX(t, good)
+
 	ipBad := net.ParseIP("10.255.200.1")
 	ipGood := net.ParseIP("10.255.200.2")
+
 	q := openQueue(t)
+
 	d := deliver.New(deliverCfg(), q, memLog{})
+
 	d.SetResolver(&fakeResolver{
 		mx: map[string][]*net.MX{"ex.com": {
 			{Host: "mx1.ex.com.", Pref: 10},
@@ -978,21 +1243,29 @@ func multiMX(t *testing.T, bad, good *fakeMX) (*deliver.Deliverer, *queue.Queue)
 			"mx2.ex.com": {ipGood},
 		},
 	})
+
 	d.SetDialer(mapDialer{m: map[string]string{
 		net.JoinHostPort(ipBad.String(), "25"):  addrBad,
 		net.JoinHostPort(ipGood.String(), "25"): addrGood,
 	}})
+
 	return d, q
 }
 
 func TestMultiMXUTF8Fallback(t *testing.T) {
 	mxBad := &fakeMX{extUTF8: false, ext8bit: true}
 	mxGood := &fakeMX{extUTF8: true, ext8bit: true}
+
 	d, q := multiMX(t, mxBad, mxGood)
+
 	addEnvelope(t, q, "mxf", "björn@ex.com", "b@ex.com", "ex.com", true, false, nil)
+
 	cancel, done := runDeliverer(t, d)
+
 	await(t, mxGood.dataDone, 4*time.Second, "good MX DATA")
+
 	awaitSession(t, mxBad, 3*time.Second)
+
 	cancel()
 	<-done
 
@@ -1013,12 +1286,19 @@ func TestMultiMXUTF8Fallback(t *testing.T) {
 func TestMultiMX8BitFallback(t *testing.T) {
 	mxBad := &fakeMX{extUTF8: true, ext8bit: false}
 	mxGood := &fakeMX{extUTF8: true, ext8bit: true}
+
 	d, q := multiMX(t, mxBad, mxGood)
+
 	body := []byte("From: a@ex.com\r\nTo: b@ex.com\r\nSubject: t\r\n\r\n" + "caf\xc3\xa9\r\n")
+
 	addEnvelope(t, q, "mx8", "a@ex.com", "b@ex.com", "ex.com", false, true, body)
+
 	cancel, done := runDeliverer(t, d)
+
 	await(t, mxGood.dataDone, 4*time.Second, "good DATA")
+
 	awaitSession(t, mxBad, 3*time.Second)
+
 	cancel()
 	<-done
 
@@ -1039,12 +1319,19 @@ func TestMultiMX8BitFallback(t *testing.T) {
 func TestMultiMXBothCapabilities(t *testing.T) {
 	mxPartial := &fakeMX{extUTF8: true, ext8bit: false}
 	mxFull := &fakeMX{extUTF8: true, ext8bit: true}
+
 	d, q := multiMX(t, mxPartial, mxFull)
+
 	body := []byte("From: björn@ex.com\r\nTo: b@ex.com\r\nSubject: t\r\n\r\n" + "caf\xc3\xa9\r\n")
+
 	addEnvelope(t, q, "mxb", "björn@ex.com", "b@ex.com", "ex.com", true, true, body)
+
 	cancel, done := runDeliverer(t, d)
+
 	await(t, mxFull.dataDone, 4*time.Second, "full DATA")
+
 	awaitSession(t, mxPartial, 3*time.Second)
+
 	cancel()
 	<-done
 
@@ -1061,14 +1348,21 @@ func TestMultiMXBothCapabilities(t *testing.T) {
 func TestMultiMXAllLackCapability(t *testing.T) {
 	mx1 := &fakeMX{extUTF8: false, ext8bit: true}
 	mx2 := &fakeMX{extUTF8: false, ext8bit: true}
+
 	addr1 := startFakeMX(t, mx1)
 	addr2 := startFakeMX(t, mx2)
+
 	ip1 := net.ParseIP("10.255.200.1")
 	ip2 := net.ParseIP("10.255.200.2")
+
 	q := openQueue(t)
+
 	cfg := deliverCfg()
+
 	cfg.Delivery.MaxAttempts = 1
+
 	d := deliver.New(cfg, q, memLog{})
+
 	d.SetResolver(&fakeResolver{
 		mx: map[string][]*net.MX{"ex.com": {
 			{Host: "mx1.ex.com.", Pref: 10},
@@ -1079,14 +1373,19 @@ func TestMultiMXAllLackCapability(t *testing.T) {
 			"mx2.ex.com": {ip2},
 		},
 	})
+
 	d.SetDialer(mapDialer{m: map[string]string{
 		net.JoinHostPort(ip1.String(), "25"): addr1,
 		net.JoinHostPort(ip2.String(), "25"): addr2,
 	}})
+
 	addEnvelope(t, q, "mxall", "björn@ex.com", "b@ex.com", "ex.com", true, false, nil)
+
 	cancel, done := runDeliverer(t, d)
+
 	awaitSession(t, mx1, 3*time.Second)
 	awaitSession(t, mx2, 3*time.Second)
+
 	cancel()
 	<-done
 
@@ -1107,15 +1406,21 @@ func TestMultiMXAllLackCapability(t *testing.T) {
 
 func TestMultiMXMixedNetworkAndCapability(t *testing.T) {
 	mxCap := &fakeMX{extUTF8: false, ext8bit: true}
+
 	addrCap := startFakeMX(t, mxCap)
+
 	ipNet := net.ParseIP("10.255.201.1")
 	ipCap := net.ParseIP("10.255.201.2")
+
 	q := openQueue(t)
+
 	cfg := deliverCfg()
 
 	// Multiple attempts so a temporary outcome persists a retry rather than exhausting.
 	cfg.Delivery.MaxAttempts = 5
+
 	d := deliver.New(cfg, q, memLog{})
+
 	d.SetResolver(&fakeResolver{
 		mx: map[string][]*net.MX{"ex.com": {
 			{Host: "mx-net.ex.com.", Pref: 10},
@@ -1126,13 +1431,16 @@ func TestMultiMXMixedNetworkAndCapability(t *testing.T) {
 			"mx-cap.ex.com": {ipCap},
 		},
 	})
+
 	d.SetDialer(mapDialer{m: map[string]string{
 		net.JoinHostPort(ipCap.String(), "25"): addrCap,
 	}})
+
 	addEnvelope(t, q, "mix1", "björn@ex.com", "b@ex.com", "ex.com", true, false, nil)
 
 	// Deliverer will retry; cancel after first MX hosts have been tried (cap session ended).
 	cancel, done := runDeliverer(t, d)
+
 	awaitSession(t, mxCap, 3*time.Second)
 
 	// Give Finish path no permanent reject: wait for retry persistence by cancelling after session.
@@ -1156,17 +1464,29 @@ func TestMultiMXMixedNetworkAndCapability(t *testing.T) {
 
 func TestTLSHandshakeFailure(t *testing.T) {
 	cert, pool, _ := mintCert(t, "mx.ex.com")
+
 	mx := &fakeMX{startTLS: true, cert: cert, brokenTLS: true, ext8bit: true}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	cfg := deliverCfg()
+
 	cfg.Delivery.MaxAttempts = 1
+
 	d := deliver.New(cfg, q, memLog{})
+
 	d.SetTLSRootCAs(pool)
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	addEnvelope(t, q, "tls7", "a@ex.com", "b@ex.com", "ex.com", false, false, nil)
+
 	cancel, done := runDeliverer(t, d)
+
 	awaitSession(t, mx, 3*time.Second)
+
 	cancel()
 	<-done
 
@@ -1181,38 +1501,54 @@ func TestTLSHandshakeFailure(t *testing.T) {
 
 func TestTLSCandidateIPRetryKeepsPolicy(t *testing.T) {
 	cert, pool, _ := mintCert(t, "mx.ex.com")
+
 	mx := &fakeMX{startTLS: true, cert: cert, ext8bit: true}
+
 	addr := startFakeMX(t, mx)
+
 	ipBad := net.ParseIP("10.255.202.1")
 	ipGood := net.ParseIP("10.255.202.2")
+
 	q := openQueue(t)
+
 	cfg := deliverCfg()
 	cfg.Delivery.RequireValidMXTLSCert = true
+
 	d := deliver.New(cfg, q, memLog{})
+
 	d.SetTLSRootCAs(pool)
+
 	d.SetResolver(&fakeResolver{
 		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com.", Pref: 10}}},
 		ips: map[string][]net.IP{"mx.ex.com": {ipBad, ipGood}},
 	})
+
 	var (
 		dials []string
 		mu    sync.Mutex
 	)
+
 	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
 		mu.Lock()
 		dials = append(dials, address)
 		mu.Unlock()
+
 		host, _, _ := net.SplitHostPort(address)
 		if host == ipBad.String() {
 			return nil, errors.New("network down")
 		}
 
 		var nd net.Dialer
+
 		return nd.DialContext(ctx, "tcp", addr)
 	}))
+
 	addEnvelope(t, q, "ipfail", "a@ex.com", "b@ex.com", "ex.com", false, false, nil)
+
 	cancel, done := runDeliverer(t, d)
+
 	await(t, mx.dataDone, 4*time.Second, "DATA")
+
 	cancel()
 	<-done
 
@@ -1239,12 +1575,16 @@ func TestTLSCandidateIPRetryKeepsPolicy(t *testing.T) {
 
 func TestIDNARoutingUsesALabel(t *testing.T) {
 	mx := &fakeMX{extUTF8: true, ext8bit: true}
+
 	addr := startFakeMX(t, mx)
 	host, _, _ := net.SplitHostPort(addr)
+
 	q := openQueue(t)
+
 	d := deliver.New(deliverCfg(), q, memLog{})
 
 	unicodeDomain := "exämple.com"
+
 	routing, err := mailbox.RoutingDomain(unicodeDomain)
 	if err != nil {
 		t.Fatal(err)
@@ -1255,6 +1595,7 @@ func TestIDNARoutingUsesALabel(t *testing.T) {
 	}
 
 	var lookedMX []string
+
 	res := &recordingResolver{
 		fakeResolver: fakeResolver{
 			mx:  map[string][]*net.MX{routing: {{Host: "mx." + routing + ".", Pref: 10}}},
@@ -1262,16 +1603,23 @@ func TestIDNARoutingUsesALabel(t *testing.T) {
 		},
 		mxLookups: &lookedMX,
 	}
+
 	d.SetResolver(res)
+
 	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
 		var nd net.Dialer
+
 		return nd.DialContext(ctx, "tcp", addr)
 	}))
 
 	rcpt := "User@exämple.com"
+
 	addEnvelope(t, q, "idna1", "a@ex.com", rcpt, routing, true, false, nil)
+
 	cancel, done := runDeliverer(t, d)
+
 	await(t, mx.dataDone, 3*time.Second, "DATA")
+
 	cancel()
 	<-done
 
@@ -1285,8 +1633,9 @@ func TestIDNARoutingUsesALabel(t *testing.T) {
 		}
 	}
 
+	var rcptLine string
+
 	snaps := mx.snapshots()
-	rcptLine := ""
 	if len(snaps) > 0 && len(snaps[0].RcptLines) > 0 {
 		rcptLine = snaps[0].RcptLines[0]
 	}
@@ -1303,18 +1652,22 @@ type recordingResolver struct {
 
 func (r *recordingResolver) LookupMX(ctx context.Context, name string) ([]*net.MX, error) {
 	*r.mxLookups = append(*r.mxLookups, name)
+
 	return r.fakeResolver.LookupMX(ctx, name)
 }
 
 func TestQueueDomainMismatchRejected(t *testing.T) {
 	q := openQueue(t)
+
 	now := time.Now()
+
 	env := &queue.Envelope{
 		ID: "badmeta", Username: "u", Sender: "a@ex.com",
 		Recipients:  []queue.Recipient{{Address: "b@ex.com", Domain: "other.com", Status: queue.StatusPending}},
 		Created:     now,
 		NextAttempt: now,
 	}
+
 	err := q.Add(env, []byte("From: a@ex.com\r\nTo: b@ex.com\r\nSubject: t\r\n\r\nHi\r\n"))
 	if err == nil {
 		t.Fatal("expected domain mismatch")
@@ -1323,7 +1676,9 @@ func TestQueueDomainMismatchRejected(t *testing.T) {
 
 func TestQueueDomainALabelAccepted(t *testing.T) {
 	q := openQueue(t)
+
 	now := time.Now()
+
 	routing, err := mailbox.RoutingDomain("exämple.com")
 	if err != nil {
 		t.Fatal(err)
@@ -1336,6 +1691,7 @@ func TestQueueDomainALabelAccepted(t *testing.T) {
 		NextAttempt: now,
 		SMTPUTF8:    true,
 	}
+
 	err = q.Add(env, []byte("From: a@ex.com\r\nTo: b@exämple.com\r\nSubject: t\r\n\r\nHi\r\n"))
 	if err != nil {
 		t.Fatal(err)
@@ -1344,16 +1700,26 @@ func TestQueueDomainALabelAccepted(t *testing.T) {
 
 func TestBothParamsRequiredSingleMAIL(t *testing.T) {
 	mx := &fakeMX{extUTF8: true, ext8bit: true}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	d := deliver.New(deliverCfg(), q, memLog{})
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	body := []byte("From: björn@ex.com\r\nTo: b@ex.com\r\nSubject: t\r\n\r\n" + "caf\xc3\xa9\r\n")
+
 	addEnvelope(t, q, "bothp", "björn@ex.com", "b@ex.com", "ex.com", true, true, body)
+
 	cancel, done := runDeliverer(t, d)
+
 	await(t, mx.dataDone, 3*time.Second, "DATA")
+
 	cancel()
 	<-done
+
 	lines := mx.mailLines()
 	if len(lines) != 1 {
 		t.Fatalf("want one MAIL, got %v", lines)
@@ -1366,17 +1732,27 @@ func TestBothParamsRequiredSingleMAIL(t *testing.T) {
 
 func TestASCIIRCPTCasingPreserved(t *testing.T) {
 	mx := &fakeMX{ext8bit: true}
+
 	addr := startFakeMX(t, mx)
+
 	q := openQueue(t)
+
 	d := deliver.New(deliverCfg(), q, memLog{})
+
 	wireMX(t, d, "ex.com", "mx.ex.com", addr)
+
 	addEnvelope(t, q, "case2", "a@ex.com", "User.Name@ex.com", "ex.com", false, false, nil)
+
 	cancel, done := runDeliverer(t, d)
+
 	await(t, mx.dataDone, 3*time.Second, "DATA")
+
 	cancel()
 	<-done
+
+	var rcptLine string
+
 	snaps := mx.snapshots()
-	rcptLine := ""
 	if len(snaps) > 0 && len(snaps[0].RcptLines) > 0 {
 		rcptLine = snaps[0].RcptLines[0]
 	}

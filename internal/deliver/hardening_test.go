@@ -57,24 +57,29 @@ type captureLog struct {
 func (l *captureLog) Printf(format string, values ...any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
 	fmt.Fprintf(&l.lines, format, values...)
 }
 
 func (l *captureLog) Println(values ...any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
 	fmt.Fprintln(&l.lines, values...)
 }
 
 func (l *captureLog) String() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
 	return l.lines.String()
 }
 
 func servePlainSMTP(conn net.Conn, accepted chan<- struct{}, dataBytes chan<- string) {
 	defer conn.Close()
+
 	_, _ = io.WriteString(conn, "220 mx\r\n")
+
 	r := bufio.NewReader(conn)
 
 	for {
@@ -98,6 +103,7 @@ func servePlainSMTP(conn net.Conn, accepted chan<- struct{}, dataBytes chan<- st
 
 			for {
 				line, err = r.ReadString('\n')
+
 				body.WriteString(line)
 
 				if err != nil {
@@ -116,6 +122,7 @@ func servePlainSMTP(conn net.Conn, accepted chan<- struct{}, dataBytes chan<- st
 			_, _ = io.WriteString(conn, "250 queued\r\n")
 		case strings.HasPrefix(line, "QUIT"):
 			_, _ = io.WriteString(conn, "221 bye\r\n")
+
 			return
 		}
 	}
@@ -123,8 +130,11 @@ func servePlainSMTP(conn net.Conn, accepted chan<- struct{}, dataBytes chan<- st
 
 func hardeningEnvelope(id string, created time.Time, recipients ...queue.Recipient) *queue.Envelope {
 	return &queue.Envelope{
-		ID: id, Username: "u", Sender: "sender@example.com", Recipients: recipients,
-		Created: created, NextAttempt: created,
+		ID: id, Username: "u",
+		Sender:      "sender@example.com",
+		Recipients:  recipients,
+		Created:     created,
+		NextAttempt: created,
 	}
 }
 
@@ -134,28 +144,42 @@ func TestAttemptCancellationDoesNotConsumeFinalAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = q.Close() })
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	cfg := testDeliverCfg()
+
 	cfg.Delivery.MaxAttempts = 1
 	cfg.Delivery.CommandTimeout = "30s"
+
 	d := New(cfg, q, nopLogger{})
+
 	ip := net.ParseIP("127.0.0.1")
+
 	d.SetResolver(&fixedResolver{
 		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com."}}},
 		ips: map[string][]net.IP{"mx.ex.com": {ip}},
 	})
+
 	started := make(chan struct{})
+
 	d.SetDialer(dialFn(func(context.Context, string, string) (net.Conn, error) {
 		client, server := net.Pipe()
+
 		go func() {
 			defer server.Close()
+
 			_, _ = io.WriteString(server, "220 mx\r\n")
+
 			r := bufio.NewReader(server)
+
 			for {
 				line, err := r.ReadString('\n')
 				if err != nil {
 					return
 				}
+
 				switch {
 				case strings.HasPrefix(line, "EHLO"):
 					_, _ = io.WriteString(server, "250 mx\r\n")
@@ -163,16 +187,23 @@ func TestAttemptCancellationDoesNotConsumeFinalAttempt(t *testing.T) {
 					_, _ = io.WriteString(server, "250 ok\r\n")
 				case strings.HasPrefix(line, "RCPT"):
 					close(started)
+
 					_, _ = server.Read(make([]byte, 1))
+
 					return
 				}
 			}
 		}()
+
 		return client, nil
 	}))
+
 	env := hardeningEnvelope("cancel-final", time.Now(), queue.Recipient{
-		Address: "r@ex.com", Domain: "ex.com", Status: queue.StatusPending,
+		Address: "r@ex.com",
+		Domain:  "ex.com",
+		Status:  queue.StatusPending,
 	})
+
 	err = q.Add(env, []byte("body\r\n"))
 	if err != nil {
 		t.Fatal(err)
@@ -184,8 +215,13 @@ func TestAttemptCancellationDoesNotConsumeFinalAttempt(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+
 	done := make(chan error, 1)
-	go func() { done <- d.attempt(ctx, got) }()
+
+	go func() {
+		done <- d.attempt(ctx, got)
+	}()
+
 	<-started
 	cancel()
 
@@ -197,6 +233,7 @@ func TestAttemptCancellationDoesNotConsumeFinalAttempt(t *testing.T) {
 	if got.Attempts != 0 || got.Recipients[0].Status != queue.StatusPending {
 		t.Fatalf("attempts=%d recipient=%+v", got.Attempts, got.Recipients[0])
 	}
+
 	if got.Recipients[0].Detail != "" || got.LastError != "" {
 		t.Fatalf("cancellation diagnostics persisted: recipient=%q last=%q", got.Recipients[0].Detail, got.LastError)
 	}
@@ -217,48 +254,69 @@ func TestAttemptCancellationPreservesPartialMultiDomainProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = q.Close() })
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	cfg := testDeliverCfg()
+
 	cfg.Delivery.MaxAttempts = 1
 	cfg.Delivery.CommandTimeout = "30s"
+
 	d := New(cfg, q, nopLogger{})
+
 	ipA, ipB := net.ParseIP("127.0.0.1"), net.ParseIP("127.0.0.2")
+
 	d.SetResolver(&fixedResolver{
 		mx: map[string][]*net.MX{
 			"a.test": {{Host: "mx.a.test."}}, "b.test": {{Host: "mx.b.test."}},
 		},
 		ips: map[string][]net.IP{"mx.a.test": {ipA}, "mx.b.test": {ipB}},
 	})
+
 	stalled := make(chan struct{})
+
 	d.SetDialer(dialFn(func(_ context.Context, _ string, address string) (net.Conn, error) {
 		client, server := net.Pipe()
+
 		host, _, _ := net.SplitHostPort(address)
 		if host == ipA.String() {
 			go servePlainSMTP(server, nil, nil)
 		} else {
 			close(stalled)
+
 			go func() {
 				defer server.Close()
+
 				_, _ = server.Read(make([]byte, 1))
 			}()
 		}
 
 		return client, nil
 	}))
+
 	now := time.Now()
+
 	env := hardeningEnvelope("cancel-partial", now,
 		queue.Recipient{Address: "a@a.test", Domain: "a.test", Status: queue.StatusPending},
 		queue.Recipient{Address: "b@b.test", Domain: "b.test", Status: queue.StatusPending},
 	)
+
 	err = q.Add(env, []byte("hello\r\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	got, _ := q.Next(context.Background())
+
 	ctx, cancel := context.WithCancel(context.Background())
+
 	done := make(chan error, 1)
-	go func() { done <- d.attempt(ctx, got) }()
+
+	go func() {
+		done <- d.attempt(ctx, got)
+	}()
+
 	<-stalled
 	cancel()
 
@@ -279,6 +337,7 @@ type failingBody struct {
 func (r *failingBody) Read(p []byte) (int, error) {
 	if !r.sent {
 		r.sent = true
+
 		return copy(p, "partial body\r\n"), nil
 	}
 
@@ -291,23 +350,38 @@ func TestDataCopyErrorAbortsWithoutTerminator(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = q.Close() })
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	d := New(testDeliverCfg(), q, nopLogger{})
+
 	ip := net.ParseIP("127.0.0.1")
+
 	d.SetResolver(&fixedResolver{
 		mx: map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com."}}}, ips: map[string][]net.IP{"mx.ex.com": {ip}},
 	})
+
 	data := make(chan string, 1)
+
 	d.SetDialer(dialFn(func(context.Context, string, string) (net.Conn, error) {
 		client, server := net.Pipe()
+
 		go servePlainSMTP(server, nil, data)
+
 		return client, nil
 	}))
+
 	d.reader = func(string) (io.ReadCloser, error) { return io.NopCloser(&failingBody{}), nil }
+
 	env := hardeningEnvelope("copy-error", time.Now(), queue.Recipient{
-		Address: "r@ex.com", Domain: "ex.com", Status: queue.StatusPending,
+		Address: "r@ex.com",
+		Domain:  "ex.com",
+		Status:  queue.StatusPending,
 	})
+
 	env.Size = 100
+
 	_, err = d.send(context.Background(), env, "mx.ex.com", []int{0})
 	if err == nil || err.Error() != "spool read failed" {
 		t.Fatalf("body read error=%v", err)
@@ -333,25 +407,37 @@ func TestDataLengthMismatchAbortsWithoutTerminator(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { _ = q.Close() })
+
+			t.Cleanup(func() {
+				_ = q.Close()
+			})
 
 			d := New(testDeliverCfg(), q, nopLogger{})
+
 			ip := net.ParseIP("127.0.0.1")
+
 			d.SetResolver(&fixedResolver{
 				mx: map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com."}}}, ips: map[string][]net.IP{"mx.ex.com": {ip}},
 			})
+
 			data := make(chan string, 1)
+
 			d.SetDialer(dialFn(func(context.Context, string, string) (net.Conn, error) {
 				client, server := net.Pipe()
+
 				go servePlainSMTP(server, nil, data)
+
 				return client, nil
 			}))
+
 			d.reader = func(string) (io.ReadCloser, error) {
 				return io.NopCloser(strings.NewReader(tt.body)), nil
 			}
+
 			env := hardeningEnvelope("length-"+tt.name, time.Now(), queue.Recipient{
 				Address: "r@ex.com", Domain: "ex.com", Status: queue.StatusPending,
 			})
+
 			env.Size = 5
 
 			_, err = d.send(context.Background(), env, "mx.ex.com", []int{0})
@@ -372,20 +458,28 @@ func TestRunDomainAdmissionFairAtMinimumAttemptCapacity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = q.Close() })
+
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
 
 	cfg := testDeliverCfg()
+
 	cfg.Delivery.DomainConcurrency = 1
 	cfg.Delivery.GlobalConcurrency = 2
 	cfg.Delivery.CommandTimeout = "30s"
+
 	d := New(cfg, q, nopLogger{})
+
 	d.admission = 10 * time.Millisecond
+
 	if cap(d.active) != 8 {
 		t.Fatalf("attempt capacity=%d want 8", cap(d.active))
 	}
 
 	hotIP := net.ParseIP("127.0.0.1")
 	coldIP := net.ParseIP("127.0.0.2")
+
 	d.SetResolver(&fixedResolver{
 		mx: map[string][]*net.MX{
 			"hot.test":  {{Host: "mx.hot.test."}},
@@ -395,75 +489,110 @@ func TestRunDomainAdmissionFairAtMinimumAttemptCapacity(t *testing.T) {
 	})
 
 	coldAccepted := make(chan struct{}, 1)
-	var hotDials atomic.Int32
-	var hotOnce sync.Once
+
+	var (
+		hotDials atomic.Int32
+		hotOnce  sync.Once
+	)
+
 	hotStarted := make(chan struct{})
+
 	d.SetDialer(dialFn(func(_ context.Context, _ string, address string) (net.Conn, error) {
 		client, server := net.Pipe()
+
 		host, _, _ := net.SplitHostPort(address)
 		if host == hotIP.String() {
 			hotDials.Add(1)
-			hotOnce.Do(func() { close(hotStarted) })
+
+			hotOnce.Do(func() {
+				close(hotStarted)
+			})
+
 			go func() {
 				defer server.Close()
+
 				_, _ = server.Read(make([]byte, 1))
 			}()
 		} else {
 			go servePlainSMTP(server, coldAccepted, nil)
 		}
+
 		return client, nil
 	}))
 
 	now := time.Now()
+
 	for i := 0; i < cap(d.active); i++ {
 		env := hardeningEnvelope(fmt.Sprintf("hot-%02d", i), now, queue.Recipient{
 			Address: "r@hot.test", Domain: "hot.test", Status: queue.StatusPending,
 		})
-		if err := q.Add(env, []byte("body\r\n")); err != nil {
+
+		err = q.Add(env, []byte("body\r\n"))
+		if err != nil {
 			t.Fatal(err)
 		}
 	}
+
 	cold := hardeningEnvelope("cold", now, queue.Recipient{
 		Address: "r@cold.test", Domain: "cold.test", Status: queue.StatusPending,
 	})
-	if err := q.Add(cold, []byte("body\r\n")); err != nil {
+
+	err = q.Add(cold, []byte("body\r\n"))
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+
 	done := make(chan error, 1)
-	go func() { done <- d.Run(ctx) }()
+
+	go func() {
+		done <- d.Run(ctx)
+	}()
+
 	select {
 	case <-hotStarted:
 	case <-time.After(time.Second):
 		cancel()
 		<-done
+
 		t.Fatal("hot-domain attempt did not start")
 	}
+
 	select {
 	case <-coldAccepted:
 	case <-time.After(2 * time.Second):
 		cancel()
 		<-done
+
 		t.Fatal("cold domain was starved by hot-domain waiters")
 	}
-	if got := hotDials.Load(); got != 1 {
+
+	got := hotDials.Load()
+	if got != 1 {
 		cancel()
 		<-done
+
 		t.Fatalf("hot-domain dials=%d want 1", got)
 	}
 
 	cancel()
+
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
+
 	for i := 0; i < cap(d.active); i++ {
 		ctx, stop := context.WithTimeout(context.Background(), time.Second)
+
 		env, err := q.Next(ctx)
+
 		stop()
+
 		if err != nil {
 			t.Fatal(err)
 		}
+
 		if env.Attempts != 0 {
 			t.Fatalf("admission/cancellation consumed attempt for %s: %d", env.ID, env.Attempts)
 		}
@@ -475,13 +604,20 @@ func TestRunMixedDomainAdmissionDoesNotCaptureLaterDomainCapacity(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = q.Close() })
+
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
 
 	cfg := testDeliverCfg()
+
 	cfg.Delivery.DomainConcurrency = 1
 	cfg.Delivery.CommandTimeout = "30s"
+
 	d := New(cfg, q, nopLogger{})
+
 	firstIP := net.ParseIP("127.0.0.1")
+
 	d.SetResolver(&fixedResolver{
 		mx: map[string][]*net.MX{
 			"first.test": {{Host: "mx.first.test."}},
@@ -492,44 +628,63 @@ func TestRunMixedDomainAdmissionDoesNotCaptureLaterDomainCapacity(t *testing.T) 
 			"mx.later.test": {net.ParseIP("127.0.0.2")},
 		},
 	})
+
 	firstStarted := make(chan struct{})
+
 	d.SetDialer(dialFn(func(context.Context, string, string) (net.Conn, error) {
 		client, server := net.Pipe()
+
 		close(firstStarted)
+
 		go func() {
 			defer server.Close()
+
 			_, _ = server.Read(make([]byte, 1))
 		}()
+
 		return client, nil
 	}))
 
 	now := time.Now()
+
 	env := hardeningEnvelope("mixed-admission", now,
 		queue.Recipient{Address: "a@first.test", Domain: "first.test", Status: queue.StatusPending},
 		queue.Recipient{Address: "b@later.test", Domain: "later.test", Status: queue.StatusPending},
 	)
-	if err := q.Add(env, []byte("body\r\n")); err != nil {
+
+	err = q.Add(env, []byte("body\r\n"))
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+
 	done := make(chan error, 1)
-	go func() { done <- d.Run(ctx) }()
+
+	go func() {
+		done <- d.Run(ctx)
+	}()
+
 	select {
 	case <-firstStarted:
 	case <-time.After(time.Second):
 		cancel()
 		<-done
+
 		t.Fatal("first domain did not start")
 	}
 
 	if !d.domains.tryAcquire("later.test") {
 		cancel()
 		<-done
+
 		t.Fatal("slow first domain captured later domain capacity")
 	}
+
 	d.domains.release("later.test")
+
 	cancel()
+
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
@@ -540,53 +695,74 @@ func TestAttemptTemporaryFirstDomainAndBusyLaterConsumesAttemptWithBackoff(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = q.Close() })
+
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
 
 	cfg := testDeliverCfg()
+
 	cfg.Delivery.DomainConcurrency = 1
 	cfg.Delivery.InitialRetryDelay = "1h"
 	cfg.Delivery.MaximumRetryDelay = "1h"
+
 	d := New(cfg, q, nopLogger{})
+
 	d.SetResolver(domainErrorResolver{})
+
 	if !d.domains.tryAcquire("busy.test") {
 		t.Fatal("failed to reserve busy domain")
 	}
 
 	now := time.Now()
+
 	env := &queue.Envelope{
-		ID: "later-domain-contention", Username: "u", Sender: "sender@example.com",
+		ID:       "later-domain-contention",
+		Username: "u",
+		Sender:   "sender@example.com",
 		Recipients: []queue.Recipient{
 			{Address: "a@temporary.test", Domain: "temporary.test", Status: queue.StatusPending},
 			{Address: "b@busy.test", Domain: "busy.test", Status: queue.StatusPending},
 		},
-		Created: now, NextAttempt: now,
+		Created:     now,
+		NextAttempt: now,
 	}
-	if err := q.Add(env, []byte("body\r\n")); err != nil {
+
+	err = q.Add(env, []byte("body\r\n"))
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	got, err := q.Next(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.attempt(context.Background(), got); err != nil {
+
+	err = d.attempt(context.Background(), got)
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	if got.Attempts != 1 {
 		t.Fatalf("attempt accounting=%d want 1", got.Attempts)
 	}
+
 	if got.Recipients[0].Status != queue.StatusPending || !strings.Contains(got.Recipients[0].Detail, "temporary DNS failure") {
 		t.Fatalf("first domain outcome not preserved: %+v", got.Recipients[0])
 	}
+
 	if got.Recipients[1].Status != queue.StatusPending || got.Recipients[1].Detail != "" {
 		t.Fatalf("busy later domain was processed: %+v", got.Recipients[1])
 	}
+
 	if !strings.Contains(got.LastError, "temporary.test") || !strings.Contains(got.LastError, "busy.test: delivery concurrency unavailable") {
 		t.Fatalf("aggregate diagnostic=%q", got.LastError)
 	}
+
 	if got.NextAttempt.Before(now.Add(50 * time.Minute)) {
 		t.Fatalf("later-domain contention bypassed normal backoff: %s", got.NextAttempt.Sub(now))
 	}
+
 	d.domains.release("busy.test")
 }
 
@@ -595,27 +771,40 @@ func TestAttemptAllTemporaryRCPTPreservesDetailsAndAggregateDiagnostic(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = q.Close() })
+
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
 
 	cfg := testDeliverCfg()
+
 	log := new(captureLog)
+
 	d := New(cfg, q, log)
+
 	ip := net.ParseIP("127.0.0.1")
+
 	d.SetResolver(&fixedResolver{
 		mx:  map[string][]*net.MX{"temp.test": {{Host: "mx.temp.test."}}},
 		ips: map[string][]net.IP{"mx.temp.test": {ip}},
 	})
+
 	d.SetDialer(dialFn(func(context.Context, string, string) (net.Conn, error) {
 		client, server := net.Pipe()
+
 		go func() {
 			defer server.Close()
+
 			_, _ = io.WriteString(server, "220 mx\r\n")
+
 			r := bufio.NewReader(server)
+
 			for {
 				line, err := r.ReadString('\n')
 				if err != nil {
 					return
 				}
+
 				switch {
 				case strings.HasPrefix(line, "EHLO"):
 					_, _ = io.WriteString(server, "250 mx\r\n")
@@ -625,26 +814,34 @@ func TestAttemptAllTemporaryRCPTPreservesDetailsAndAggregateDiagnostic(t *testin
 					_, _ = io.WriteString(server, "451 4.7.1 greylisted\r\n")
 				case strings.HasPrefix(line, "QUIT"):
 					_, _ = io.WriteString(server, "221 bye\r\n")
+
 					return
 				}
 			}
 		}()
+
 		return client, nil
 	}))
 
 	now := time.Now()
+
 	env := hardeningEnvelope("temporary-rcpt", now,
 		queue.Recipient{Address: "a@temp.test", Domain: "temp.test", Status: queue.StatusPending},
 		queue.Recipient{Address: "b@temp.test", Domain: "temp.test", Status: queue.StatusPending},
 	)
-	if err := q.Add(env, []byte("body\r\n")); err != nil {
+
+	err = q.Add(env, []byte("body\r\n"))
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	got, err := q.Next(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.attempt(context.Background(), got); err != nil {
+
+	err = d.attempt(context.Background(), got)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -653,10 +850,12 @@ func TestAttemptAllTemporaryRCPTPreservesDetailsAndAggregateDiagnostic(t *testin
 			t.Fatalf("temporary recipient outcome not preserved: %+v", recipient)
 		}
 	}
+
 	for _, diagnostic := range []string{"temporary RCPT failures", "a@temp.test", "b@temp.test", "451 4.7.1 greylisted"} {
 		if !strings.Contains(got.LastError, diagnostic) {
 			t.Fatalf("LastError=%q missing %q", got.LastError, diagnostic)
 		}
+
 		if !strings.Contains(log.String(), diagnostic) {
 			t.Fatalf("log=%q missing %q", log.String(), diagnostic)
 		}
@@ -668,48 +867,70 @@ func TestAttemptPreservesPerDomainDiagnosticsAndAggregateLog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = q.Close() })
+
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
 
 	cfg := testDeliverCfg()
+
 	cfg.Delivery.MaxAttempts = 1
+
 	log := new(captureLog)
+
 	d := New(cfg, q, log)
+
 	d.SetResolver(domainErrorResolver{})
+
 	now := time.Now()
+
 	env := &queue.Envelope{
-		ID: "domain-diagnostics", Username: "u", Sender: "sender@example.com",
+		ID:       "domain-diagnostics",
+		Username: "u",
+		Sender:   "sender@example.com",
 		Recipients: []queue.Recipient{
 			{Address: "a@a.test", Domain: "a.test", Status: queue.StatusPending},
 			{Address: "b@b.test", Domain: "b.test", Status: queue.StatusPending},
 		},
-		Created: now, NextAttempt: now,
+		Created:     now,
+		NextAttempt: now,
 	}
-	if err := q.Add(env, []byte("body\r\n")); err != nil {
+
+	err = q.Add(env, []byte("body\r\n"))
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	got, err := q.Next(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.attempt(context.Background(), got); err != nil {
+
+	err = d.attempt(context.Background(), got)
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	if !strings.Contains(got.Recipients[0].Detail, "a.test") || strings.Contains(got.Recipients[0].Detail, "b.test") {
 		t.Fatalf("first recipient detail copied across domains: %q", got.Recipients[0].Detail)
 	}
+
 	if !strings.Contains(got.Recipients[1].Detail, "b.test") || strings.Contains(got.Recipients[1].Detail, "a.test") {
 		t.Fatalf("second recipient detail copied across domains: %q", got.Recipients[1].Detail)
 	}
+
 	for _, recipient := range got.Recipients {
 		if recipient.EnhancedCode != terminalEnhancedCode {
 			t.Fatalf("recipient missing exhaustion status: %+v", recipient)
 		}
 	}
+
 	if !strings.Contains(got.LastError, "a.test") || !strings.Contains(got.LastError, "b.test") {
 		t.Fatalf("aggregate diagnostic=%q", got.LastError)
 	}
-	if output := log.String(); !strings.Contains(output, "a.test") || !strings.Contains(output, "b.test") {
+
+	output := log.String()
+	if !strings.Contains(output, "a.test") || !strings.Contains(output, "b.test") {
 		t.Fatalf("aggregate log missing domain diagnostics: %q", output)
 	}
 }
@@ -720,22 +941,40 @@ func TestEstablishedSessionClosesPromptlyOnCancel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = q.Close() })
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	log := new(captureLog)
+
 	d := New(testDeliverCfg(), q, log)
+
 	connected := make(chan struct{})
+
 	d.SetDialer(dialFn(func(context.Context, string, string) (net.Conn, error) {
 		client, server := net.Pipe()
+
 		close(connected)
+
 		go func() {
 			defer server.Close()
+
 			_, _ = server.Read(make([]byte, 1))
 		}()
+
 		return client, nil
 	}))
+
 	ctx, cancel := context.WithCancel(context.Background())
+
 	done := make(chan error, 1)
-	go func() { _, err := d.dialAndSession(ctx, "mx.ex.com", net.ParseIP("127.0.0.1"), true); done <- err }()
+
+	go func() {
+		_, err := d.dialAndSession(ctx, "mx.ex.com", net.ParseIP("127.0.0.1"), true)
+
+		done <- err
+	}()
+
 	<-connected
 	cancel()
 
@@ -755,33 +994,49 @@ func TestAttemptSessionCappedAtQueueLifetime(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = q.Close() })
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	cfg := testDeliverCfg()
+
 	cfg.Delivery.MaximumLifetime = "100ms"
 	cfg.Delivery.CommandTimeout = "30s"
+
 	d := New(cfg, q, nopLogger{})
+
 	d.SetResolver(&fixedResolver{
 		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com."}}},
 		ips: map[string][]net.IP{"mx.ex.com": {net.ParseIP("127.0.0.1")}},
 	})
+
 	d.SetDialer(dialFn(func(context.Context, string, string) (net.Conn, error) {
 		client, server := net.Pipe()
+
 		go func() {
 			defer server.Close()
+
 			_, _ = server.Read(make([]byte, 1))
 		}()
+
 		return client, nil
 	}))
+
 	env := hardeningEnvelope("lifetime", time.Now(), queue.Recipient{
-		Address: "r@ex.com", Domain: "ex.com", Status: queue.StatusPending,
+		Address: "r@ex.com",
+		Domain:  "ex.com",
+		Status:  queue.StatusPending,
 	})
+
 	err = q.Add(env, []byte("body\r\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	got, _ := q.Next(context.Background())
+
 	start := time.Now()
+
 	err = d.attempt(context.Background(), got)
 	if err != nil {
 		t.Fatal(err)
@@ -799,10 +1054,13 @@ func TestAttemptSessionCappedAtQueueLifetime(t *testing.T) {
 func TestSMTPResponseBounds(t *testing.T) {
 	t.Run("exact boundary", func(t *testing.T) {
 		client, server := net.Pipe()
+
 		go func() {
 			defer server.Close()
+
 			_, _ = io.WriteString(server, "220 "+strings.Repeat("x", maxSMTPResponseBytes-6)+"\r\n")
 		}()
+
 		c := NewClient(client, time.Second, time.Second)
 		defer c.Close()
 
@@ -811,12 +1069,15 @@ func TestSMTPResponseBounds(t *testing.T) {
 			t.Fatalf("exact-boundary Greet error=%v", err)
 		}
 	})
+
 	t.Run("banner", func(t *testing.T) {
 		client, server := net.Pipe()
 		go func() {
 			defer server.Close()
+
 			_, _ = io.WriteString(server, "220 "+strings.Repeat("x", maxSMTPResponseBytes)+"\r\n")
 		}()
+
 		c := NewClient(client, time.Second, time.Second)
 		defer c.Close()
 
@@ -825,12 +1086,16 @@ func TestSMTPResponseBounds(t *testing.T) {
 			t.Fatalf("Greet error=%v", err)
 		}
 	})
+
 	t.Run("multiline EHLO", func(t *testing.T) {
 		client, server := net.Pipe()
 		go func() {
 			defer server.Close()
+
 			_, _ = io.WriteString(server, "220 mx\r\n")
+
 			r := bufio.NewReader(server)
+
 			_, _ = r.ReadString('\n')
 
 			for range maxSMTPResponseBytes/8 + 1 {
@@ -842,6 +1107,7 @@ func TestSMTPResponseBounds(t *testing.T) {
 
 			_, _ = io.WriteString(server, "250 ok\r\n")
 		}()
+
 		c := NewClient(client, time.Second, time.Second)
 		defer c.Close()
 
@@ -859,9 +1125,12 @@ func TestSMTPResponseBounds(t *testing.T) {
 
 func TestSubmissionDeadlineIncludesFinalDataResponse(t *testing.T) {
 	client, server := net.Pipe()
+
 	go func() {
 		defer server.Close()
+
 		r := bufio.NewReader(server)
+
 		line, err := r.ReadString('\n')
 		if err != nil || line != "DATA\r\n" {
 			return
@@ -881,11 +1150,13 @@ func TestSubmissionDeadlineIncludesFinalDataResponse(t *testing.T) {
 		}
 
 		time.Sleep(75 * time.Millisecond)
+
 		_, _ = io.WriteString(server, "250 queued\r\n")
 	}()
 
 	c := NewClient(client, time.Second, 100*time.Millisecond)
 	defer c.Close()
+
 	dw, err := c.Data()
 	if err != nil {
 		t.Fatal(err)
@@ -899,6 +1170,7 @@ func TestSubmissionDeadlineIncludesFinalDataResponse(t *testing.T) {
 	}
 
 	start := time.Now()
+
 	err = dw.Close()
 	if err == nil {
 		t.Fatal("final response exceeded the DATA submission deadline")
@@ -911,29 +1183,44 @@ func TestSubmissionDeadlineIncludesFinalDataResponse(t *testing.T) {
 
 func TestRunQuarantinesCorruptBodyAndContinues(t *testing.T) {
 	root := t.TempDir()
+
 	q, err := queue.Open(root, queue.Limits{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = q.Close() })
+
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
 
 	now := time.Now()
+
 	corrupt := hardeningEnvelope("corrupt-runtime", now, queue.Recipient{Address: "r@bad.test", Domain: "bad.test", Status: queue.StatusPending})
 	healthy := hardeningEnvelope("healthy-runtime", now, queue.Recipient{Address: "r@good.test", Domain: "good.test", Status: queue.StatusPending})
+
 	healthy.Username = "other-user"
-	if err := q.Add(corrupt, []byte("body-a\r\n")); err != nil {
+
+	err = q.Add(corrupt, []byte("body-a\r\n"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := q.Add(healthy, []byte("body-b\r\n")); err != nil {
+
+	err = q.Add(healthy, []byte("body-b\r\n"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "ready", corrupt.ID, "message.eml"), []byte("body-x\r\n"), 0600); err != nil {
+
+	err = os.WriteFile(filepath.Join(root, "ready", corrupt.ID, "message.eml"), []byte("body-x\r\n"), 0600)
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	log := new(captureLog)
+
 	d := New(testDeliverCfg(), q, log)
+
 	badIP, goodIP := net.ParseIP("127.0.0.1"), net.ParseIP("127.0.0.2")
+
 	d.SetResolver(&fixedResolver{
 		mx: map[string][]*net.MX{
 			"bad.test":  {{Host: "mx.bad.test."}},
@@ -941,46 +1228,64 @@ func TestRunQuarantinesCorruptBodyAndContinues(t *testing.T) {
 		},
 		ips: map[string][]net.IP{"mx.bad.test": {badIP}, "mx.good.test": {goodIP}},
 	})
+
 	healthyAccepted := make(chan struct{}, 1)
+
 	d.SetDialer(dialFn(func(_ context.Context, _ string, address string) (net.Conn, error) {
 		client, server := net.Pipe()
+
 		host, _, _ := net.SplitHostPort(address)
 		if host == goodIP.String() {
 			go servePlainSMTP(server, healthyAccepted, nil)
 		} else {
 			go servePlainSMTP(server, nil, nil)
 		}
+
 		return client, nil
 	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
+
 	done := make(chan error, 1)
-	go func() { done <- d.Run(ctx) }()
+
+	go func() {
+		done <- d.Run(ctx)
+	}()
+
 	select {
 	case <-healthyAccepted:
 	case <-time.After(time.Second):
 		cancel()
 		<-done
+
 		t.Fatal("healthy delivery was blocked by corrupt queue item")
 	}
+
 	deadline := time.Now().Add(time.Second)
+
 	for q.Len() != 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
+
 	if q.Len() != 0 {
 		cancel()
 		<-done
+
 		t.Fatalf("queue length=%d after healthy completion and quarantine", q.Len())
 	}
+
 	select {
 	case err := <-done:
 		t.Fatalf("Run stopped after item corruption: %v", err)
 	default:
 	}
+
 	cancel()
+
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
+
 	if len(q.Corrupt) != 1 || !queue.IsCorruption(q.Corrupt[0]) {
 		t.Fatalf("corrupt records=%v log=%s", q.Corrupt, log.String())
 	}
@@ -991,20 +1296,28 @@ func TestPerUserDeliveryIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = q.Close() })
+
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
 
 	cfg := testDeliverCfg()
+
 	cfg.Delivery.UserConcurrency = 1
 	cfg.Delivery.DomainConcurrency = 2
 	cfg.Delivery.GlobalConcurrency = 2
 	cfg.Delivery.CommandTimeout = "30s"
+
 	d := New(cfg, q, nopLogger{})
+
 	d.admission = 5 * time.Millisecond
+
 	ips := map[string]net.IP{
 		"mx.a1.test": net.ParseIP("127.0.0.1"),
 		"mx.a2.test": net.ParseIP("127.0.0.2"),
 		"mx.b.test":  net.ParseIP("127.0.0.3"),
 	}
+
 	d.SetResolver(&fixedResolver{
 		mx: map[string][]*net.MX{
 			"a1.test": {{Host: "mx.a1.test."}},
@@ -1013,68 +1326,99 @@ func TestPerUserDeliveryIsolation(t *testing.T) {
 		},
 		ips: map[string][]net.IP{"mx.a1.test": {ips["mx.a1.test"]}, "mx.a2.test": {ips["mx.a2.test"]}, "mx.b.test": {ips["mx.b.test"]}},
 	})
+
 	var aDials atomic.Int32
+
 	aStarted := make(chan struct{}, 1)
 	bAccepted := make(chan struct{}, 1)
+
 	d.SetDialer(dialFn(func(_ context.Context, _ string, address string) (net.Conn, error) {
 		client, server := net.Pipe()
+
 		host, _, _ := net.SplitHostPort(address)
 		if host == ips["mx.b.test"].String() {
 			go servePlainSMTP(server, bAccepted, nil)
+
 			return client, nil
 		}
+
 		aDials.Add(1)
+
 		select {
 		case aStarted <- struct{}{}:
 		default:
 		}
+
 		go func() {
 			defer server.Close()
+
 			_, _ = server.Read(make([]byte, 1))
 		}()
+
 		return client, nil
 	}))
 
 	now := time.Now()
+
 	add := func(id, username, domain string) {
 		env := hardeningEnvelope(id, now, queue.Recipient{Address: "r@" + domain, Domain: domain, Status: queue.StatusPending})
+
 		env.Username = username
-		if err := q.Add(env, []byte("body\r\n")); err != nil {
+
+		err := q.Add(env, []byte("body\r\n"))
+		if err != nil {
 			t.Fatal(err)
 		}
 	}
+
 	add("a-one", "user-a", "a1.test")
 	add("a-two", "user-a", "a2.test")
 	add("b-one", "user-b", "b.test")
 
 	ctx, cancel := context.WithCancel(context.Background())
+
 	done := make(chan error, 1)
-	go func() { done <- d.Run(ctx) }()
+
+	go func() {
+		done <- d.Run(ctx)
+	}()
+
 	select {
 	case <-aStarted:
 	case <-time.After(time.Second):
 		cancel()
 		<-done
+
 		t.Fatal("user A did not start")
 	}
+
 	select {
 	case <-bAccepted:
 	case <-time.After(time.Second):
 		cancel()
 		<-done
+
 		t.Fatal("user B was starved by stalled user A")
 	}
-	if got := aDials.Load(); got != 1 {
+
+	got := aDials.Load()
+	if got != 1 {
 		cancel()
 		<-done
+
 		t.Fatalf("user A active dials=%d want 1", got)
 	}
+
 	cancel()
+
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
+
 	ordinary := &queue.Envelope{Username: "mailer-daemon"}
+
 	dsn := &queue.Envelope{Username: "mailer-daemon", DSNSourceID: "source"}
+
 	if deliveryOwner(ordinary) == deliveryOwner(dsn) || deliveryOwner(dsn) != generatedDSNOwner {
 		t.Fatal("generated DSN owner is not isolated from ordinary users")
 	}
@@ -1085,13 +1429,20 @@ func TestCandidateCeilings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = q.Close() })
+
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	cfg := testDeliverCfg()
+
 	cfg.Delivery.MaxMXCandidates = 3
 	cfg.Delivery.MaxIPCandidatesPerMX = 2
+
 	d := New(cfg, q, nopLogger{})
 
 	var addressLookups, dials atomic.Int32
+
 	d.SetResolver(resolverFuncs{
 		mx: func(context.Context, string) ([]*net.MX, error) {
 			return []*net.MX{
@@ -1102,24 +1453,34 @@ func TestCandidateCeilings(t *testing.T) {
 		},
 		ips: func(_ context.Context, _, host string) ([]net.IP, error) {
 			addressLookups.Add(1)
+
 			return []net.IP{
 				net.ParseIP("8.8.8.4"), net.ParseIP("8.8.8.3"), net.ParseIP("8.8.8.2"),
 				net.ParseIP("8.8.8.1"), net.ParseIP("8.8.8.1"),
 			}, nil
 		},
 	})
+
 	d.SetDialer(dialFn(func(context.Context, string, string) (net.Conn, error) {
 		dials.Add(1)
+
 		return nil, errors.New("blocked")
 	}))
+
 	env := hardeningEnvelope("candidate-cap", time.Now(), queue.Recipient{Address: "r@test", Domain: "test", Status: queue.StatusPending})
-	if err := d.domain(context.Background(), env, "test", []int{0}); err == nil {
+
+	err = d.domain(context.Background(), env, "test", []int{0})
+	if err == nil {
 		t.Fatal("expected candidate failures")
 	}
-	if got := addressLookups.Load(); got != 3 {
+
+	got := addressLookups.Load()
+	if got != 3 {
 		t.Fatalf("address lookups=%d want 3", got)
 	}
-	if got := dials.Load(); got != 6 {
+
+	got = dials.Load()
+	if got != 6 {
 		t.Fatalf("dials=%d want 6", got)
 	}
 }
@@ -1129,10 +1490,17 @@ func TestMXEqualPreferenceOrderingBeforeTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = q.Close() })
+
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	cfg := testDeliverCfg()
+
 	cfg.Delivery.MaxMXCandidates = 4
+
 	d := New(cfg, q, nopLogger{})
+
 	d.SetResolver(resolverFuncs{
 		mx: func(context.Context, string) ([]*net.MX, error) {
 			return []*net.MX{
@@ -1145,9 +1513,12 @@ func TestMXEqualPreferenceOrderingBeforeTruncation(t *testing.T) {
 			return nil, errors.New("unexpected address lookup")
 		},
 	})
+
 	groups := make([]uint16, 0, 3)
+
 	d.orderMX = func(records []*net.MX) {
 		groups = append(groups, records[0].Pref)
+
 		for left, right := 0, len(records)-1; left < right; left, right = left+1, right-1 {
 			records[left], records[right] = records[right], records[left]
 		}
@@ -1157,9 +1528,11 @@ func TestMXEqualPreferenceOrderingBeforeTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got, want := strings.Join(hosts, ","), "c.test,b.test,a.test,e.test"; got != want {
 		t.Fatalf("MX cap/order=%q want %q", got, want)
 	}
+
 	if fmt.Sprint(groups) != "[10 20 30]" {
 		t.Fatalf("preference groups=%v", groups)
 	}
@@ -1170,8 +1543,13 @@ func TestMXMixedWithNullMXFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = q.Close() })
+
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	d := New(testDeliverCfg(), q, nopLogger{})
+
 	d.SetResolver(resolverFuncs{
 		mx: func(context.Context, string) ([]*net.MX, error) {
 			return []*net.MX{{Host: "."}, {Host: "mx.example."}}, nil
@@ -1192,10 +1570,17 @@ func TestMXEqualPreferenceCandidatesCanRotateAcrossRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = q.Close() })
+
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	cfg := testDeliverCfg()
+
 	cfg.Delivery.MaxMXCandidates = 2
+
 	d := New(cfg, q, nopLogger{})
+
 	d.SetResolver(resolverFuncs{
 		mx: func(context.Context, string) ([]*net.MX, error) {
 			return []*net.MX{
@@ -1207,12 +1592,16 @@ func TestMXEqualPreferenceCandidatesCanRotateAcrossRetries(t *testing.T) {
 			return nil, errors.New("unexpected address lookup")
 		},
 	})
-	calls := 0
+
+	var calls int
+
 	d.orderMX = func(records []*net.MX) {
 		calls++
+
 		if len(records) != 4 {
 			t.Fatalf("orderMX received %d candidates before truncation", len(records))
 		}
+
 		if calls == 1 {
 			for left, right := 0, len(records)-1; left < right; left, right = left+1, right-1 {
 				records[left], records[right] = records[right], records[left]
@@ -1224,13 +1613,16 @@ func TestMXEqualPreferenceCandidatesCanRotateAcrossRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	second, err := d.hosts(context.Background(), "test")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got, want := strings.Join(first, ","), "d.test,c.test"; got != want {
 		t.Fatalf("first retry MXs=%q want %q", got, want)
 	}
+
 	if got, want := strings.Join(second, ","), "a.test,b.test"; got != want {
 		t.Fatalf("second retry MXs=%q want %q", got, want)
 	}
@@ -1241,12 +1633,20 @@ func TestRestrictedAddressesDoNotConsumeCandidateBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = q.Close() })
+
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	cfg := testDeliverCfg()
+
 	cfg.Delivery.AllowPrivateDestinations = false
 	cfg.Delivery.MaxIPCandidatesPerMX = 1
+
 	d := New(cfg, q, nopLogger{})
+
 	d.orderIPs = func([]net.IP) {}
+
 	d.SetResolver(resolverFuncs{
 		mx: func(context.Context, string) ([]*net.MX, error) {
 			return nil, errors.New("unexpected MX lookup")
@@ -1270,6 +1670,7 @@ func TestRestrictedAddressesDoNotConsumeCandidateBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if len(ips) != 1 || !ips[0].Equal(net.ParseIP("8.8.8.8")) {
 		t.Fatalf("eligible candidates=%v", ips)
 	}
@@ -1280,10 +1681,17 @@ func TestIPOrderingRunsBeforeTruncationAndRotatesRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = q.Close() })
+
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	cfg := testDeliverCfg()
+
 	cfg.Delivery.MaxIPCandidatesPerMX = 2
+
 	d := New(cfg, q, nopLogger{})
+
 	d.SetResolver(resolverFuncs{
 		mx: func(context.Context, string) ([]*net.MX, error) {
 			return nil, errors.New("unexpected MX lookup")
@@ -1295,12 +1703,16 @@ func TestIPOrderingRunsBeforeTruncationAndRotatesRetries(t *testing.T) {
 			}, nil
 		},
 	})
-	calls := 0
+
+	var calls int
+
 	d.orderIPs = func(ips []net.IP) {
 		calls++
+
 		if len(ips) != 4 {
 			t.Fatalf("orderIPs received %d candidates before truncation", len(ips))
 		}
+
 		if calls == 1 {
 			for left, right := 0, len(ips)-1; left < right; left, right = left+1, right-1 {
 				ips[left], ips[right] = ips[right], ips[left]
@@ -1312,10 +1724,12 @@ func TestIPOrderingRunsBeforeTruncationAndRotatesRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	second, err := d.lookupHostIPs(context.Background(), "mx.test")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if calls != 2 || len(first) != 2 || len(second) != 2 || first[0].Equal(second[0]) {
 		t.Fatalf("retry candidates first=%v second=%v calls=%d", first, second, calls)
 	}
@@ -1326,11 +1740,18 @@ func TestAttemptTimeoutIsNormalFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = q.Close() })
+
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	cfg := testDeliverCfg()
+
 	cfg.Delivery.AttemptTimeout = "50ms"
 	cfg.Delivery.DNSTimeout = "5s"
+
 	d := New(cfg, q, nopLogger{})
+
 	d.SetResolver(resolverFuncs{
 		mx: func(ctx context.Context, _ string) ([]*net.MX, error) {
 			<-ctx.Done()
@@ -1340,17 +1761,24 @@ func TestAttemptTimeoutIsNormalFailure(t *testing.T) {
 			return nil, errors.New("unexpected lookup")
 		},
 	})
+
 	env := hardeningEnvelope("attempt-timeout", time.Now(), queue.Recipient{Address: "r@ex.test", Domain: "ex.test", Status: queue.StatusPending})
-	if err := q.Add(env, []byte("body\r\n")); err != nil {
+
+	err = q.Add(env, []byte("body\r\n"))
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	got, err := q.Next(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.attempt(context.Background(), got); err != nil {
+
+	err = d.attempt(context.Background(), got)
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got.Attempts != 1 || got.Recipients[0].Status != queue.StatusPending || !strings.Contains(got.LastError, errAttemptTimeout.Error()) {
 		t.Fatalf("timed-out attempt=%+v", got)
 	}
@@ -1363,72 +1791,112 @@ func TestBlockedOutboundWorkDoesNotBlockUnrelatedDelivery(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { _ = q.Close() })
+
+			t.Cleanup(func() {
+				_ = q.Close()
+			})
+
 			cfg := testDeliverCfg()
+
 			cfg.Delivery.DNSTimeout = "60ms"
 			cfg.Delivery.ConnectionTimeout = "60ms"
 			cfg.Delivery.AttemptTimeout = "150ms"
 			cfg.Delivery.GlobalConcurrency = 2
+
 			d := New(cfg, q, nopLogger{})
+
 			badIP, goodIP := net.ParseIP("127.0.0.1"), net.ParseIP("127.0.0.2")
+
 			blockedDone := make(chan struct{}, 1)
+
 			d.SetResolver(resolverFuncs{
 				mx: func(ctx context.Context, name string) ([]*net.MX, error) {
 					if name == "bad.test" && mode == "resolver" {
 						<-ctx.Done()
+
 						blockedDone <- struct{}{}
+
 						return nil, ctx.Err()
 					}
+
 					return []*net.MX{{Host: "mx." + name + "."}}, nil
 				},
 				ips: func(_ context.Context, _ string, host string) ([]net.IP, error) {
 					if host == "mx.bad.test" {
 						return []net.IP{badIP}, nil
 					}
+
 					return []net.IP{goodIP}, nil
 				},
 			})
+
 			goodAccepted := make(chan struct{}, 1)
+
 			d.SetDialer(dialFn(func(ctx context.Context, _ string, address string) (net.Conn, error) {
 				host, _, _ := net.SplitHostPort(address)
 				if host == badIP.String() {
 					<-ctx.Done()
+
 					blockedDone <- struct{}{}
+
 					return nil, ctx.Err()
 				}
+
 				client, server := net.Pipe()
+
 				go servePlainSMTP(server, goodAccepted, nil)
+
 				return client, nil
 			}))
+
 			now := time.Now()
+
 			bad := hardeningEnvelope("blocked-"+mode, now, queue.Recipient{Address: "r@bad.test", Domain: "bad.test", Status: queue.StatusPending})
+
 			bad.Username = "bad-user"
+
 			good := hardeningEnvelope("unrelated-"+mode, now, queue.Recipient{Address: "r@good.test", Domain: "good.test", Status: queue.StatusPending})
+
 			good.Username = "good-user"
-			if err := q.Add(bad, []byte("body\r\n")); err != nil {
+
+			err = q.Add(bad, []byte("body\r\n"))
+			if err != nil {
 				t.Fatal(err)
 			}
-			if err := q.Add(good, []byte("body\r\n")); err != nil {
+
+			err = q.Add(good, []byte("body\r\n"))
+			if err != nil {
 				t.Fatal(err)
 			}
+
 			ctx, cancel := context.WithCancel(context.Background())
+
 			done := make(chan error, 1)
-			go func() { done <- d.Run(ctx) }()
+
+			go func() {
+				done <- d.Run(ctx)
+			}()
+
 			select {
 			case <-goodAccepted:
 			case <-time.After(time.Second):
 				cancel()
 				<-done
+
 				t.Fatal("unrelated delivery was blocked")
 			}
+
 			select {
 			case <-blockedDone:
 			case <-time.After(time.Second):
 				cancel()
 				<-done
+
 				t.Fatal("blocked operation ignored its deadline")
 			}
+
 			cancel()
+
 			if err := <-done; err != nil {
 				t.Fatal(err)
 			}
@@ -1438,6 +1906,7 @@ func TestBlockedOutboundWorkDoesNotBlockUnrelatedDelivery(t *testing.T) {
 
 func TestNormalizeDiagnostic(t *testing.T) {
 	in := "bad\r\n\x00\x1f\x7f\u0085\u009b\u200b\u2028\u2029\u202e" + string([]byte{0xff}) + strings.Repeat("é", maxDiagnosticBytes)
+
 	got := normalizeDiagnostic(in)
 	if !utf8.ValidString(got) || len(got) > maxDiagnosticBytes {
 		t.Fatalf("invalid normalized diagnostic: valid=%v bytes=%d", utf8.ValidString(got), len(got))
@@ -1496,7 +1965,6 @@ func TestBackoffSaturates(t *testing.T) {
 	d := &Deliverer{initial: time.Duration(1 << 62), maximum: time.Duration(1<<63 - 1)}
 
 	for _, attempts := range []int{2, 10, 1000} {
-
 		got := d.backoff(attempts)
 		if got < 0 || got > d.maximum {
 			t.Fatalf("backoff(%d)=%s", attempts, got)

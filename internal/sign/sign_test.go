@@ -16,9 +16,13 @@ import (
 
 func TestLoadIsReadOnly(t *testing.T) {
 	dir := t.TempDir()
+
 	cfg := config.Default()
+
 	cfg.Server.DataDirectory = dir
+
 	path := filepath.Join(dir, cfg.DKIM.PrivateKeyFile)
+
 	_, err := Load(cfg)
 	if err == nil {
 		t.Fatal("missing key must fail")
@@ -53,7 +57,9 @@ func TestLoadIsReadOnly(t *testing.T) {
 
 func TestEnsureCreatesKeyOnce(t *testing.T) {
 	dir := t.TempDir()
+
 	cfg := config.Default()
+
 	cfg.Server.DataDirectory = dir
 
 	first, created, err := Ensure(cfg)
@@ -66,6 +72,7 @@ func TestEnsureCreatesKeyOnce(t *testing.T) {
 	}
 
 	path := filepath.Join(dir, cfg.DKIM.PrivateKeyFile)
+
 	before, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -92,19 +99,27 @@ func TestEnsureCreatesKeyOnce(t *testing.T) {
 
 func TestEnsureDoesNotReplaceMalformedExistingKey(t *testing.T) {
 	dir := t.TempDir()
+
 	cfg := config.Default()
+
 	cfg.Server.DataDirectory = dir
+
 	path := filepath.Join(dir, cfg.DKIM.PrivateKeyFile)
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+
+	err := os.MkdirAll(filepath.Dir(path), 0700)
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	before := []byte("not a private key\n")
-	if err := os.WriteFile(path, before, 0600); err != nil {
+
+	err = os.WriteFile(path, before, 0600)
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	if _, _, err := Ensure(cfg); err == nil {
+	_, _, err = Ensure(cfg)
+	if err == nil {
 		t.Fatal("provision accepted malformed existing key")
 	}
 
@@ -125,6 +140,7 @@ func TestParseKeyRejectsWeakAndInvalidRSA(t *testing.T) {
 	}
 
 	body := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(weak)})
+
 	_, err = parseKey(body)
 	if err == nil || !strings.Contains(err.Error(), "at least 2048 bits") {
 		t.Fatalf("weak RSA key error=%v", err)
@@ -135,6 +151,7 @@ func TestParseKeyRejectsWeakAndInvalidRSA(t *testing.T) {
 		D:         big.NewInt(1),
 		Primes:    []*big.Int{big.NewInt(3), big.NewInt(5)},
 	}
+
 	_, err = validateKey(invalid)
 	if err == nil || !strings.Contains(err.Error(), "invalid dkim RSA") {
 		t.Fatalf("mathematically invalid RSA key error=%v", err)
@@ -143,9 +160,13 @@ func TestParseKeyRejectsWeakAndInvalidRSA(t *testing.T) {
 
 func TestDKIMKeyReadLimit(t *testing.T) {
 	dir := t.TempDir()
+
 	cfg := config.Default()
+
 	cfg.Server.DataDirectory = dir
+
 	path := filepath.Join(dir, cfg.DKIM.PrivateKeyFile)
+
 	err := os.MkdirAll(filepath.Dir(path), 0700)
 	if err != nil {
 		t.Fatal(err)

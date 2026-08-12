@@ -13,12 +13,15 @@ type connectionKey struct {
 
 func keyForConn(conn net.Conn) connectionKey {
 	key := connectionKey{}
+
 	if conn.LocalAddr() != nil {
 		key.local = conn.LocalAddr().String()
 	}
+
 	if conn.RemoteAddr() != nil {
 		key.remote = conn.RemoteAddr().String()
 	}
+
 	return key
 }
 
@@ -45,8 +48,11 @@ func (l *authDeadlineListener) Accept() (net.Conn, error) {
 		deadline: time.Now().Add(l.lifetime),
 		active:   true,
 	}
+
 	l.server.authConnections.Store(bounded.key, bounded)
+
 	_ = bounded.SetDeadline(bounded.deadline)
+
 	return bounded, nil
 }
 
@@ -64,9 +70,11 @@ type authDeadlineConn struct {
 func (c *authDeadlineConn) clamp(deadline time.Time) time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	if c.active && (deadline.IsZero() || deadline.After(c.deadline)) {
 		return c.deadline
 	}
+
 	return deadline
 }
 
@@ -86,20 +94,25 @@ func (c *authDeadlineConn) clear() {
 	c.mu.Lock()
 	c.active = false
 	c.mu.Unlock()
+
 	_ = c.Conn.SetDeadline(time.Time{})
 }
 
 func (c *authDeadlineConn) Close() error {
 	var err error
+
 	c.once.Do(func() {
 		c.server.authConnections.Delete(c.key)
 		err = c.Conn.Close()
 	})
+
 	return err
 }
 
 func (s *Server) authDeadline(conn net.Conn) *authDeadlineConn {
 	bounded, _ := s.authConnections.Load(keyForConn(conn))
+
 	deadline, _ := bounded.(*authDeadlineConn)
+
 	return deadline
 }

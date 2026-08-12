@@ -28,6 +28,7 @@ func FreeBytes(path string) (int64, error) {
 		&totalNumberOfBytes,
 		&totalNumberOfFreeBytes,
 	)
+
 	if err != nil {
 		return 0, fmt.Errorf("GetDiskFreeSpaceEx %s: %w", path, err)
 	}

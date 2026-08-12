@@ -45,6 +45,7 @@ func (l *connectionLimiter) acquire(ip string) bool {
 
 	l.active++
 	l.byIP[ip]++
+
 	return true
 }
 
@@ -88,6 +89,7 @@ func (l *limitListener) Accept() (net.Conn, error) {
 		}
 
 		ip := connIP(c.RemoteAddr())
+
 		if l.limiter.acquire(ip) {
 			return &limitedConn{Conn: c, ip: ip, limiter: l.limiter}, nil
 		}
@@ -107,10 +109,13 @@ type limitedConn struct {
 
 func (c *limitedConn) Close() error {
 	var err error
+
 	c.once.Do(func() {
 		c.limiter.release(c.ip)
+
 		err = c.Conn.Close()
 	})
+
 	return err
 }
 
@@ -140,11 +145,13 @@ func newConnectionTracker() *connectionTracker {
 func (t *connectionTracker) add(c *trackedConn) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
 	if t.closed {
 		return false
 	}
 
 	t.conns[c] = struct{}{}
+
 	return true
 }
 
@@ -157,10 +164,13 @@ func (t *connectionTracker) remove(c *trackedConn) {
 func (t *connectionTracker) closeAll() {
 	t.mu.Lock()
 	t.closed = true
+
 	conns := make([]*trackedConn, 0, len(t.conns))
+
 	for conn := range t.conns {
 		conns = append(conns, conn)
 	}
+
 	t.mu.Unlock()
 
 	for _, conn := range conns {
@@ -189,8 +199,10 @@ func (l *trackListener) Accept() (net.Conn, error) {
 	}
 
 	tracked := &trackedConn{Conn: conn, tracker: l.tracker}
+
 	if !l.tracker.add(tracked) {
 		_ = tracked.Close()
+
 		return nil, net.ErrClosed
 	}
 
@@ -207,7 +219,9 @@ type trackedConn struct {
 func (c *trackedConn) Close() error {
 	c.once.Do(func() {
 		c.tracker.remove(c)
+
 		c.err = c.Conn.Close()
 	})
+
 	return c.err
 }

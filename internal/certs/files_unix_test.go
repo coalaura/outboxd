@@ -10,12 +10,14 @@ import (
 
 func TestEnsureRejectsAccessibleAndAllowsOperatorSymlinkUnix(t *testing.T) {
 	dir := t.TempDir()
+
 	err := writeSelfSigned(dir, "mail.test.example")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	key := filepath.Join(dir, "server.key")
+
 	err = os.Chmod(key, 0640)
 	if err != nil {
 		t.Fatal(err)
@@ -32,6 +34,7 @@ func TestEnsureRejectsAccessibleAndAllowsOperatorSymlinkUnix(t *testing.T) {
 	}
 
 	real := filepath.Join(dir, "real.key")
+
 	err = os.Rename(key, real)
 	if err != nil {
 		t.Fatal(err)

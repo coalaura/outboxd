@@ -22,7 +22,9 @@ type resourceBoundaryCase struct {
 
 func writeYAML(t *testing.T, dir, name, body string) string {
 	t.Helper()
+
 	path := filepath.Join(dir, name)
+
 	err := os.WriteFile(path, []byte(body), 0600)
 	if err != nil {
 		t.Fatal(err)
@@ -33,6 +35,7 @@ func writeYAML(t *testing.T, dir, name, body string) string {
 
 func validUserPHC(t *testing.T) string {
 	t.Helper()
+
 	h, err := passwd.Hash("test-password-123")
 	if err != nil {
 		t.Fatal(err)
@@ -88,6 +91,7 @@ users:
 func TestOldConfigsGetDefaults(t *testing.T) {
 	dir := t.TempDir()
 	data := filepath.Join(dir, "data")
+
 	hash := validUserPHC(t)
 
 	// Omit new fields: max_queue_*, auth_workers, message_burst, disable_*, etc.
@@ -130,7 +134,9 @@ users:
     allowed_senders: ["alice@example.com"]
     enabled: true
 `, filepath.ToSlash(data), hash)
+
 	path := writeYAML(t, dir, "config.yml", body)
+
 	cfg, err := LoadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -160,9 +166,11 @@ users:
 	if cfg.Server.MaxQueueMessages != 10000 {
 		t.Fatalf("MaxQueueMessages %d", cfg.Server.MaxQueueMessages)
 	}
+
 	if cfg.Server.MaxQueueMessagesPerUser != 1000 || cfg.Server.MaxQueueBytesPerUser != 1<<30 {
 		t.Fatalf("per-user queue defaults: messages=%d bytes=%d", cfg.Server.MaxQueueMessagesPerUser, cfg.Server.MaxQueueBytesPerUser)
 	}
+
 	if cfg.Delivery.UserConcurrency != 2 || cfg.Delivery.DNSTimeout != "30s" || cfg.Delivery.AttemptTimeout != "30m" || cfg.Delivery.MaxMXCandidates != 10 || cfg.Delivery.MaxIPCandidatesPerMX != 8 {
 		t.Fatalf("delivery work defaults: %+v", cfg.Delivery)
 	}
@@ -170,13 +178,17 @@ users:
 
 func TestInvalidDurationRelationships(t *testing.T) {
 	dir := t.TempDir()
+
 	hash := validUserPHC(t)
 
 	// initial > maximum
 	body := minimalYAML(filepath.Join(dir, "d"), hash)
+
 	body = strings.Replace(body, "initial_retry_delay: 1m", "initial_retry_delay: 2h", 1)
 	body = strings.Replace(body, "maximum_retry_delay: 1h", "maximum_retry_delay: 30m", 1)
+
 	path := writeYAML(t, dir, "bad1.yml", body)
+
 	_, err := LoadFile(path)
 	if err == nil || !strings.Contains(err.Error(), "initial_retry_delay") {
 		t.Fatalf("want initial>max error, got %v", err)
@@ -185,7 +197,9 @@ func TestInvalidDurationRelationships(t *testing.T) {
 	body2 := minimalYAML(filepath.Join(dir, "d2"), hash)
 	body2 = strings.Replace(body2, "maximum_retry_delay: 1h", "maximum_retry_delay: 48h", 1)
 	body2 = strings.Replace(body2, "maximum_lifetime: 24h", "maximum_lifetime: 24h", 1)
+
 	path2 := writeYAML(t, dir, "bad2.yml", body2)
+
 	_, err = LoadFile(path2)
 	if err == nil || !strings.Contains(err.Error(), "maximum_retry_delay") {
 		t.Fatalf("want max>lifetime error, got %v", err)
@@ -194,6 +208,7 @@ func TestInvalidDurationRelationships(t *testing.T) {
 
 func TestHostilePHCRejected(t *testing.T) {
 	dir := t.TempDir()
+
 	good, err := passwd.Hash("x")
 	if err != nil {
 		t.Fatal(err)
@@ -203,8 +218,10 @@ func TestHostilePHCRejected(t *testing.T) {
 
 	// $ argon2id v= m=,t=,p= salt key — inflate memory cost
 	hostile := "$" + parts[1] + "$" + parts[2] + "$m=2147483648,t=2,p=1$" + parts[4] + "$" + parts[5]
+
 	body := minimalYAML(filepath.Join(dir, "d"), hostile)
 	path := writeYAML(t, dir, "hostile.yml", body)
+
 	_, err = LoadFile(path)
 	if err == nil {
 		t.Fatal("hostile PHC must fail Validate")
@@ -213,20 +230,25 @@ func TestHostilePHCRejected(t *testing.T) {
 
 func TestIsReadyRequiresEnabledUser(t *testing.T) {
 	cfg := Default()
+
 	cfg.Server.Hostname = "mail.example.com"
 	cfg.Server.Domain = "example.com"
 	cfg.DNS.PublicIPv4 = "203.0.113.1"
 	cfg.TLS.AllowSelfSignedServing = true
 	cfg.Users = []User{{
-		Username: "alice", PasswordHash: validUserPHC(t),
-		AllowedSenders: []string{"alice@example.com"}, Enabled: false,
+		Username:       "alice",
+		PasswordHash:   validUserPHC(t),
+		AllowedSenders: []string{"alice@example.com"},
+		Enabled:        false,
 	}}
+
 	err := cfg.IsReady()
 	if err == nil || !strings.Contains(err.Error(), "enabled") {
 		t.Fatalf("want enabled user error, got %v", err)
 	}
 
 	cfg.Users[0].Enabled = true
+
 	err = cfg.IsReady()
 	if err != nil {
 		t.Fatal(err)
@@ -235,7 +257,9 @@ func TestIsReadyRequiresEnabledUser(t *testing.T) {
 
 func TestExplicitEmptyListenerRemainsDisabled(t *testing.T) {
 	dir := t.TempDir()
+
 	body := strings.Replace(minimalYAML(filepath.Join(dir, "data"), validUserPHC(t)), "  data_directory:", "  submission_addr: \"\"\n  implicit_tls_addr: \"127.0.0.1:465\"\n  data_directory:", 1)
+
 	cfg, err := LoadFile(writeYAML(t, dir, "config.yml", body))
 	if err != nil {
 		t.Fatal(err)
@@ -248,6 +272,7 @@ func TestExplicitEmptyListenerRemainsDisabled(t *testing.T) {
 
 func TestDefaultOutboundPolicyFailsClosed(t *testing.T) {
 	cfg := Default()
+
 	if cfg.Delivery.TLSMode != "required" || cfg.Delivery.PlaintextAllowed() || cfg.Delivery.InsecureTLSAllowed() || !cfg.Delivery.RequireValidMXTLSCert {
 		t.Fatalf("insecure default delivery policy: %+v", cfg.Delivery)
 	}
@@ -255,16 +280,19 @@ func TestDefaultOutboundPolicyFailsClosed(t *testing.T) {
 
 func TestSelfSignedServingRequiresExplicitOptIn(t *testing.T) {
 	cfg := Default()
+
 	cfg.Server.Hostname = "mail.example.com"
 	cfg.Server.Domain = "example.com"
 	cfg.DNS.PublicIPv4 = "203.0.113.1"
 	cfg.Users = []User{{Enabled: true}}
+
 	err := cfg.IsReady()
 	if err == nil || !strings.Contains(err.Error(), "allow_self_signed_serving") {
 		t.Fatalf("expected self-signed serving gate, got %v", err)
 	}
 
 	cfg.TLS.AllowSelfSignedServing = true
+
 	err = cfg.IsReady()
 	if err != nil {
 		t.Fatal(err)
@@ -301,6 +329,7 @@ func TestResourceBoundaries(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := Default()
+
 			tt.set(cfg)
 
 			err := cfg.Validate()
@@ -316,6 +345,7 @@ func TestResourceBoundaries(t *testing.T) {
 	}
 
 	max := Default()
+
 	max.Server.MaxMessageBytes = MaxMessageBytes
 	max.Server.MaxRecipients = MaxRecipients
 	max.Server.MaxConnections = MaxConnections
@@ -327,6 +357,7 @@ func TestResourceBoundaries(t *testing.T) {
 	max.Delivery.UserConcurrency = MaxUserConcurrency
 	max.Delivery.MaxMXCandidates = MaxMXCandidates
 	max.Delivery.MaxIPCandidatesPerMX = MaxIPCandidatesPerMX
+
 	err = max.Validate()
 	if err != nil {
 		t.Fatalf("inclusive maximum boundaries invalid: %v", err)
@@ -335,14 +366,19 @@ func TestResourceBoundaries(t *testing.T) {
 
 func TestRateAndBurstBoundaries(t *testing.T) {
 	maxInt := int(^uint(0) >> 1)
+
 	tests := []struct {
 		name string
 		max  int
 		set  func(*Config, int)
 		zero bool
 	}{
-		{"message rate", MaxMessagesPerHour, func(c *Config, value int) { c.Server.MaxMessagesPerHour = value }, false},
-		{"recipient rate", MaxRecipientsPerHour, func(c *Config, value int) { c.Server.MaxRecipientsPerHour = value }, false},
+		{"message rate", MaxMessagesPerHour, func(c *Config, value int) {
+			c.Server.MaxMessagesPerHour = value
+		}, false},
+		{"recipient rate", MaxRecipientsPerHour, func(c *Config, value int) {
+			c.Server.MaxRecipientsPerHour = value
+		}, false},
 		{"message burst", MaxMessageBurst, func(c *Config, value int) {
 			c.Server.MaxMessagesPerHour = MaxMessagesPerHour
 			c.Server.MessageBurst = value
@@ -367,6 +403,7 @@ func TestRateAndBurstBoundaries(t *testing.T) {
 		} {
 			t.Run(tt.name+"/"+boundary.name, func(t *testing.T) {
 				cfg := Default()
+
 				tt.set(cfg, boundary.value)
 
 				err := cfg.Validate()
@@ -392,6 +429,7 @@ func TestDeliveryAttemptBoundaries(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := Default()
+
 			cfg.Delivery.MaxAttempts = tt.value
 
 			err := cfg.Validate()
@@ -408,11 +446,21 @@ func TestDurationBoundaries(t *testing.T) {
 		max  time.Duration
 		set  func(*Config, string)
 	}{
-		{"server read", MaxSMTPReadTimeout, func(c *Config, value string) { c.Server.ReadTimeout = value }},
-		{"server write", MaxSMTPWriteTimeout, func(c *Config, value string) { c.Server.WriteTimeout = value }},
-		{"dead retention", MaxDeadRetention, func(c *Config, value string) { c.Server.DeadRetention = value }},
-		{"corrupt retention", MaxCorruptRetention, func(c *Config, value string) { c.Server.CorruptRetention = value }},
-		{"delivery lifetime", MaxDeliveryLifetime, func(c *Config, value string) { c.Delivery.MaximumLifetime = value }},
+		{"server read", MaxSMTPReadTimeout, func(c *Config, value string) {
+			c.Server.ReadTimeout = value
+		}},
+		{"server write", MaxSMTPWriteTimeout, func(c *Config, value string) {
+			c.Server.WriteTimeout = value
+		}},
+		{"dead retention", MaxDeadRetention, func(c *Config, value string) {
+			c.Server.DeadRetention = value
+		}},
+		{"corrupt retention", MaxCorruptRetention, func(c *Config, value string) {
+			c.Server.CorruptRetention = value
+		}},
+		{"delivery lifetime", MaxDeliveryLifetime, func(c *Config, value string) {
+			c.Delivery.MaximumLifetime = value
+		}},
 		{"initial retry", MaxInitialRetryDelay, func(c *Config, value string) {
 			c.Delivery.InitialRetryDelay = value
 			c.Delivery.MaximumRetryDelay = MaxInitialRetryDelay.String()
@@ -421,12 +469,18 @@ func TestDurationBoundaries(t *testing.T) {
 			c.Delivery.MaximumRetryDelay = value
 			c.Delivery.MaximumLifetime = MaxRetryDelay.String()
 		}},
-		{"delivery DNS", MaxDeliveryDNSTimeout, func(c *Config, value string) { c.Delivery.DNSTimeout = value }},
+		{"delivery DNS", MaxDeliveryDNSTimeout, func(c *Config, value string) {
+			c.Delivery.DNSTimeout = value
+		}},
 		{"delivery attempt", MaxDeliveryAttemptTimeout, func(c *Config, value string) {
 			c.Delivery.AttemptTimeout = value
 		}},
-		{"delivery connection", MaxDeliveryConnectionTimeout, func(c *Config, value string) { c.Delivery.ConnectionTimeout = value }},
-		{"delivery command", MaxDeliveryCommandTimeout, func(c *Config, value string) { c.Delivery.CommandTimeout = value }},
+		{"delivery connection", MaxDeliveryConnectionTimeout, func(c *Config, value string) {
+			c.Delivery.ConnectionTimeout = value
+		}},
+		{"delivery command", MaxDeliveryCommandTimeout, func(c *Config, value string) {
+			c.Delivery.CommandTimeout = value
+		}},
 		{"delivery submission", MaxDeliverySubmissionTimeout, func(c *Config, value string) {
 			c.Delivery.SubmissionTimeout = value
 			c.Delivery.AttemptTimeout = MaxDeliverySubmissionTimeout.String()
@@ -447,6 +501,7 @@ func TestDurationBoundaries(t *testing.T) {
 		} {
 			t.Run(tt.name+"/"+boundary.name, func(t *testing.T) {
 				cfg := Default()
+
 				tt.set(cfg, boundary.value)
 
 				err := cfg.Validate()
@@ -511,6 +566,7 @@ func TestResourceRelationships(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := Default()
+
 			tt.set(cfg)
 
 			if err := cfg.Validate(); err == nil {
@@ -525,8 +581,8 @@ func TestIPv4FieldsRejectMappedIPv6(t *testing.T) {
 		func(cfg *Config) { cfg.DNS.PublicIPv4 = "::ffff:192.0.2.1" },
 		func(cfg *Config) { cfg.Delivery.BindIPv4 = "::ffff:192.0.2.1" },
 	} {
-
 		cfg := Default()
+
 		set(cfg)
 
 		err := cfg.Validate()
@@ -538,6 +594,7 @@ func TestIPv4FieldsRejectMappedIPv6(t *testing.T) {
 
 func TestConfigReadLimit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yml")
+
 	err := os.WriteFile(path, make([]byte, maxConfigFileBytes+1), 0600)
 	if err != nil {
 		t.Fatal(err)
@@ -572,6 +629,7 @@ func TestSupportedMaximaAggregateBound(t *testing.T) {
 	if concurrent > 5000 {
 		t.Fatalf("aggregate concurrent maximum=%d", concurrent)
 	}
+
 	if MaxDeliveryAttempts > 100 {
 		t.Fatalf("delivery attempts maximum=%d", MaxDeliveryAttempts)
 	}
@@ -579,7 +637,9 @@ func TestSupportedMaximaAggregateBound(t *testing.T) {
 
 func TestAuthQueueRejected(t *testing.T) {
 	dir := t.TempDir()
+
 	body := strings.Replace(minimalYAML(filepath.Join(dir, "data"), validUserPHC(t)), "  data_directory:", "  auth_queue: 8\n  data_directory:", 1)
+
 	_, err := LoadFile(writeYAML(t, dir, "config.yml", body))
 	if err == nil {
 		t.Fatal("obsolete auth_queue field was accepted")
@@ -630,12 +690,14 @@ func TestSPFLookupBudget(t *testing.T) {
 
 func TestGeneratedPathsConfined(t *testing.T) {
 	dir := t.TempDir()
+
 	cfg := Default()
+
 	cfg.Server.DataDirectory = filepath.Join(dir, "data")
+
 	inside := filepath.Join(cfg.Server.DataDirectory, "keys", "mail.key")
 
 	for _, path := range []string{"../escape", filepath.Join(dir, "outside"), cfg.Server.DataDirectory, "C:\\outside\\mail.key"} {
-
 		if runtime.GOOS != "windows" && strings.HasPrefix(path, "C:") {
 			continue
 		}
@@ -674,18 +736,24 @@ func TestConcurrentSubprocessAddUser(t *testing.T) {
 	}
 
 	dir := t.TempDir()
+
 	hash := validUserPHC(t)
+
 	path := writeYAML(t, dir, "config.yml", minimalYAML(filepath.Join(dir, "data"), hash))
+
 	commands := make([]*exec.Cmd, 2)
 	outputs := make([]bytes.Buffer, 2)
 
 	for i, username := range []string{"bob", "carol"} {
-
 		cmd := exec.Command(os.Args[0], "-test.run=^TestConcurrentSubprocessAddUser$")
+
 		cmd.Env = append(os.Environ(), "OUTBOXD_ADD_USER_CHILD=1", "OUTBOXD_TEST_CONFIG="+path, "OUTBOXD_TEST_USER="+username, "OUTBOXD_TEST_HASH="+hash)
+
 		commands[i] = cmd
+
 		cmd.Stdout = &outputs[i]
 		cmd.Stderr = &outputs[i]
+
 		err := cmd.Start()
 		if err != nil {
 			t.Fatal(err)
@@ -705,7 +773,6 @@ func TestConcurrentSubprocessAddUser(t *testing.T) {
 	}
 
 	for _, username := range []string{"alice", "bob", "carol"} {
-
 		_, ok := cfg.User(username)
 		if !ok {
 			t.Fatalf("concurrent update lost user %q", username)
@@ -715,8 +782,11 @@ func TestConcurrentSubprocessAddUser(t *testing.T) {
 
 func TestAddUserAtomicAndDuplicateCaseInsens(t *testing.T) {
 	dir := t.TempDir()
+
 	hash := validUserPHC(t)
+
 	path := writeYAML(t, dir, "config.yml", minimalYAML(filepath.Join(dir, "data"), hash))
+
 	cfg, err := LoadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -727,6 +797,7 @@ func TestAddUserAtomicAndDuplicateCaseInsens(t *testing.T) {
 		Username: "Alice", PasswordHash: hash,
 		AllowedSenders: []string{"other@example.com"}, Enabled: true,
 	})
+
 	if err == nil || !strings.Contains(err.Error(), "duplicate") {
 		t.Fatalf("want duplicate, got %v", err)
 	}
@@ -736,6 +807,7 @@ func TestAddUserAtomicAndDuplicateCaseInsens(t *testing.T) {
 		Username: "bob", PasswordHash: hash,
 		AllowedSenders: []string{"bob@example.com"}, Enabled: true,
 	})
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -753,10 +825,12 @@ func TestAddUserAtomicAndDuplicateCaseInsens(t *testing.T) {
 
 	// Failed add must not leave partial user permanently
 	before := len(cfg2.Users)
+
 	err = cfg2.AddUser(User{
 		Username: "bad", PasswordHash: "not-a-hash",
 		AllowedSenders: []string{"bad@example.com"}, Enabled: true,
 	})
+
 	if err == nil {
 		t.Fatal("expected AddUser error")
 	}
@@ -768,9 +842,12 @@ func TestAddUserAtomicAndDuplicateCaseInsens(t *testing.T) {
 
 func TestResolvePathRelativeToConfigDir(t *testing.T) {
 	dir := t.TempDir()
+
 	hash := validUserPHC(t)
+
 	dataRel := "rel-data"
 	path := writeYAML(t, dir, "config.yml", minimalYAML(dataRel, hash))
+
 	cfg, err := LoadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -778,6 +855,7 @@ func TestResolvePathRelativeToConfigDir(t *testing.T) {
 
 	got := cfg.ResolvePath("tls/server.crt")
 	want := filepath.Join(dir, dataRel, "tls", "server.crt")
+
 	if filepath.Clean(got) != filepath.Clean(want) {
 		t.Fatalf("ResolvePath=%q want %q", got, want)
 	}
@@ -785,9 +863,13 @@ func TestResolvePathRelativeToConfigDir(t *testing.T) {
 
 func TestLoadFileMultiDocRejected(t *testing.T) {
 	dir := t.TempDir()
+
 	hash := validUserPHC(t)
+
 	body := minimalYAML(filepath.Join(dir, "d"), hash) + "\n---\nserver:\n  hostname: x\n"
+
 	path := writeYAML(t, dir, "multi.yml", body)
+
 	_, err := LoadFile(path)
 	if err == nil {
 		t.Fatal("want multi-doc rejection")
@@ -798,16 +880,20 @@ func TestLoadFileMultiDocRejected(t *testing.T) {
 
 func TestValidatePHCViaUser(t *testing.T) {
 	cfg := Default()
+
 	cfg.Server.Hostname = "mail.example.com"
 	cfg.Server.Domain = "example.com"
+
 	cfg.initializeRuntime()
 
 	// Good user
 	h := validUserPHC(t)
+
 	cfg.Users = []User{{
 		Username: "a", PasswordHash: h,
 		AllowedSenders: []string{"a@example.com"}, Enabled: true,
 	}}
+
 	err := cfg.Validate()
 	if err != nil {
 		t.Fatal(err)
@@ -816,9 +902,11 @@ func TestValidatePHCViaUser(t *testing.T) {
 
 func TestDKIMHeadersRequireSender(t *testing.T) {
 	cfg := Default()
+
 	cfg.Server.Hostname = "mail.example.com"
 	cfg.Server.Domain = "example.com"
 	cfg.DKIM.Headers = []string{"From"}
+
 	cfg.initializeRuntime()
 
 	err := cfg.Validate()

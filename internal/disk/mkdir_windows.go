@@ -16,11 +16,13 @@ func mkdirDurableComponent(path string) (bool, error) {
 	}
 
 	remove := true
+
 	defer func() {
 		if remove {
 			_ = os.Remove(temp)
 		}
 	}()
+
 	oldptr, err := windows.UTF16PtrFromString(temp)
 	if err != nil {
 		return false, err
@@ -37,5 +39,6 @@ func mkdirDurableComponent(path string) (bool, error) {
 	}
 
 	remove = false
+
 	return true, nil
 }

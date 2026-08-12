@@ -27,6 +27,7 @@ func TestAvailableBytes(t *testing.T) {
 			if (err != nil) != test.wantErr {
 				t.Fatalf("availableBytes error=%v wantErr=%t", err, test.wantErr)
 			}
+
 			if got != test.want {
 				t.Fatalf("availableBytes=%d want %d", got, test.want)
 			}

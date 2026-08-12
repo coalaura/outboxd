@@ -34,6 +34,7 @@ func AllocationSize(size int64) int64 {
 // root. WalkDir uses Lstat semantics and never follows symbolic links.
 func AllocatedBytes(root string) (int64, error) {
 	var total int64
+
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -50,8 +51,10 @@ func AllocatedBytes(root string) (int64, error) {
 		}
 
 		total += charge
+
 		return nil
 	})
+
 	return total, err
 }
 
@@ -89,9 +92,11 @@ type Hooks struct {
 // CheckRead runs the recovery read fault seam.
 func CheckRead(path string) error {
 	h := currentHooks()
+
 	if h.BeforeRead != nil {
 		return h.BeforeRead(path)
 	}
+
 	return nil
 }
 
@@ -110,12 +115,14 @@ func SetHooks(h Hooks) {
 func currentHooks() Hooks {
 	hookMu.RLock()
 	defer hookMu.RUnlock()
+
 	return hooks
 }
 
 // SyncFile flushes an open file and runs the file-sync fault hook.
 func SyncFile(file *os.File) error {
 	h := currentHooks()
+
 	if h.BeforeSyncFile != nil {
 		err := h.BeforeSyncFile(file.Name())
 		if err != nil {
@@ -129,6 +136,7 @@ func SyncFile(file *os.File) error {
 	}
 
 	h = currentHooks()
+
 	if h.AfterSyncFile != nil {
 		return h.AfterSyncFile(file.Name())
 	}
@@ -198,6 +206,7 @@ func MkdirDurable(path string) error {
 		}
 
 		missing = append(missing, current)
+
 		parent := filepath.Dir(current)
 		if parent == current {
 			return statErr
@@ -256,6 +265,7 @@ func MkdirDurable(path string) error {
 // RemoveAll recursively removes path through the test fault seam.
 func RemoveAll(path string) error {
 	h := currentHooks()
+
 	if h.BeforeRemoveAll != nil {
 		err := h.BeforeRemoveAll(path)
 		if err != nil {
@@ -286,6 +296,7 @@ func Commit(file *os.File, path string, mode os.FileMode) error {
 	if err != nil {
 		file.Close()
 		os.Remove(temp)
+
 		return err
 	}
 
@@ -305,12 +316,14 @@ func WriteWithTempState(path string, body []byte, mode os.FileMode) (bool, error
 	if err != nil {
 		return false, err
 	}
+
 	temp := file.Name()
 
 	_, err = file.Write(body)
 	if err != nil {
 		file.Close()
 		os.Remove(temp)
+
 		return pathMayExist(temp), err
 	}
 
@@ -340,6 +353,7 @@ func WriteExclusive(path string, body []byte, mode os.FileMode) error {
 	}
 
 	remove := true
+
 	defer func() {
 		if remove {
 			os.Remove(path)
@@ -349,12 +363,14 @@ func WriteExclusive(path string, body []byte, mode os.FileMode) error {
 	_, err = file.Write(body)
 	if err != nil {
 		file.Close()
+
 		return err
 	}
 
 	err = file.Sync()
 	if err != nil {
 		file.Close()
+
 		return err
 	}
 
@@ -363,6 +379,7 @@ func WriteExclusive(path string, body []byte, mode os.FileMode) error {
 		err = h.AfterSyncFile(path)
 		if err != nil {
 			file.Close()
+
 			return err
 		}
 	}
@@ -381,12 +398,14 @@ func WriteExclusive(path string, body []byte, mode os.FileMode) error {
 	}
 
 	remove = false
+
 	return Sync(filepath.Dir(path))
 }
 
 // Rename replaces newpath with oldpath and syncs the parent directory.
 func Rename(oldpath, newpath string) error {
 	h := currentHooks()
+
 	if h.BeforeRename != nil {
 		err := h.BeforeRename(oldpath, newpath)
 		if err != nil {
@@ -400,6 +419,7 @@ func Rename(oldpath, newpath string) error {
 	}
 
 	h = currentHooks()
+
 	if h.AfterRename != nil {
 		err := h.AfterRename(oldpath, newpath)
 		if err != nil {
@@ -436,6 +456,7 @@ func commit(file *os.File, temp, path string, mode os.FileMode) error {
 	}
 
 	h := currentHooks()
+
 	if h.AfterSyncFile != nil {
 		err = h.AfterSyncFile(temp)
 		if err != nil {
@@ -449,6 +470,7 @@ func commit(file *os.File, temp, path string, mode os.FileMode) error {
 	}
 
 	h = currentHooks()
+
 	if h.AfterClose != nil {
 		err = h.AfterClose(temp)
 		if err != nil {
@@ -457,6 +479,7 @@ func commit(file *os.File, temp, path string, mode os.FileMode) error {
 	}
 
 	h = currentHooks()
+
 	if h.BeforeRename != nil {
 		err = h.BeforeRename(temp, path)
 		if err != nil {
@@ -470,6 +493,7 @@ func commit(file *os.File, temp, path string, mode os.FileMode) error {
 	}
 
 	h = currentHooks()
+
 	if h.AfterRename != nil {
 		err = h.AfterRename(temp, path)
 		if err != nil {

@@ -54,6 +54,7 @@ func newSubmissionLimiter(maxMessages, maxRecipients, msgBurst, rcptBurst int) *
 
 func (l *submissionLimiter) take(username string, recipients int) bool {
 	now := time.Now()
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -68,6 +69,7 @@ func (l *submissionLimiter) take(username string, recipients int) bool {
 			updated:    now,
 			seen:       now,
 		}
+
 		if len(l.entries) >= maxRateEntries {
 			l.forcePrune(now)
 
@@ -80,6 +82,7 @@ func (l *submissionLimiter) take(username string, recipients int) bool {
 	}
 
 	l.refill(allowance, now)
+
 	allowance.seen = now
 
 	if allowance.messages < 1 || allowance.recipients < float64(recipients) {
@@ -88,11 +91,13 @@ func (l *submissionLimiter) take(username string, recipients int) bool {
 
 	allowance.messages--
 	allowance.recipients -= float64(recipients)
+
 	return true
 }
 
 func (l *submissionLimiter) refill(a *submissionAllowance, now time.Time) {
 	elapsed := now.Sub(a.updated)
+
 	a.updated = now
 	if elapsed <= 0 {
 		return

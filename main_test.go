@@ -16,8 +16,8 @@ import (
 
 func TestServeDataDirectoryResolvedAgainstConfig(t *testing.T) {
 	// Relative data_directory must resolve next to the config file, not CWD.
-	// t.Chdir keeps this test serial with respect to process CWD.
 	cfgDir := t.TempDir()
+
 	hash, err := passwd.Hash("test-password-123")
 	if err != nil {
 		t.Fatal(err)
@@ -36,6 +36,7 @@ func TestServeDataDirectoryResolvedAgainstConfig(t *testing.T) {
 		"    allowed_senders: [\"alice@example.com\"]\n    enabled: true\n"
 
 	cfgPath := filepath.Join(cfgDir, "config.yml")
+
 	err = os.WriteFile(cfgPath, []byte(cfgBody), 0600)
 	if err != nil {
 		t.Fatal(err)
@@ -56,12 +57,14 @@ func TestServeDataDirectoryResolvedAgainstConfig(t *testing.T) {
 	}
 
 	want := filepath.Join(cfgDir, "data")
+
 	st, err := os.Stat(want)
 	if err != nil || !st.IsDir() {
 		t.Fatalf("data dir next to config: %v (stat err %v)", want, err)
 	}
 
 	stray := filepath.Join(cwd, "data")
+
 	_, err = os.Stat(stray)
 	if !os.IsNotExist(err) {
 		t.Fatalf("stray data dir created under CWD %s", stray)
@@ -71,6 +74,7 @@ func TestServeDataDirectoryResolvedAgainstConfig(t *testing.T) {
 func TestRunCheckDoesNotGenerateMissingDKIMKey(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
+
 	cfg, _, err := config.EnsurePath(path)
 	if err != nil {
 		t.Fatal(err)
@@ -85,7 +89,15 @@ func TestRunCheckDoesNotGenerateMissingDKIMKey(t *testing.T) {
 	cfg.Server.Domain = "example.com"
 	cfg.DNS.PublicIPv4 = "203.0.113.10"
 	cfg.TLS.AllowSelfSignedServing = true
-	cfg.Users = []config.User{{Username: "alice", PasswordHash: hash, AllowedSenders: []string{"alice@example.com"}, Enabled: true}}
+	cfg.Users = []config.User{
+		{
+			Username:       "alice",
+			PasswordHash:   hash,
+			AllowedSenders: []string{"alice@example.com"},
+			Enabled:        true,
+		},
+	}
+
 	err = cfg.Init()
 	if err != nil {
 		t.Fatal(err)
@@ -115,21 +127,33 @@ func TestRunCheckDoesNotGenerateMissingDKIMKey(t *testing.T) {
 func TestRunCheckRejectsUnassignedDeliveryBindAddress(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
+
 	cfg, _, err := config.EnsurePath(path)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	hash, err := passwd.Hash("test-password-123")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	cfg.Server.Hostname = "mail.example.com"
 	cfg.Server.Domain = "example.com"
 	cfg.DNS.PublicIPv4 = "203.0.113.10"
 	cfg.TLS.AllowSelfSignedServing = true
-	cfg.Users = []config.User{{Username: "alice", PasswordHash: hash, AllowedSenders: []string{"alice@example.com"}, Enabled: true}}
+	cfg.Users = []config.User{
+		{
+			Username:       "alice",
+			PasswordHash:   hash,
+			AllowedSenders: []string{"alice@example.com"},
+			Enabled:        true,
+		},
+	}
 	cfg.Delivery.BindIPv4 = "192.0.2.123"
-	if err = cfg.Save(); err != nil {
+
+	err = cfg.Save()
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -142,15 +166,21 @@ func TestRunCheckRejectsUnassignedDeliveryBindAddress(t *testing.T) {
 func TestOperationsRejectLinkedDataDirectory(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "external")
-	if err := os.Mkdir(target, 0700); err != nil {
+
+	err := os.Mkdir(target, 0700)
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	path := filepath.Join(dir, "config.yml")
+
 	cfg, _, err := config.EnsurePath(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = os.Symlink(target, cfg.ResolvedDataDir()); err != nil {
+
+	err = os.Symlink(target, cfg.ResolvedDataDir())
+	if err != nil {
 		t.Skipf("cannot create test data-directory link: %v", err)
 	}
 
@@ -177,7 +207,8 @@ func TestProvisionCreatesDKIMKeyOnce(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yml")
 
-	if err := provision(configPath); err != nil {
+	err := provision(configPath)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -195,7 +226,8 @@ func TestProvisionCreatesDKIMKeyOnce(t *testing.T) {
 		t.Fatalf("first provision must stop after creating config: %v", err)
 	}
 
-	if err = provision(configPath); err != nil {
+	err = provision(configPath)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -204,7 +236,8 @@ func TestProvisionCreatesDKIMKeyOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err = provision(configPath); err != nil {
+	err = provision(configPath)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -221,6 +254,7 @@ func TestProvisionCreatesDKIMKeyOnce(t *testing.T) {
 func TestServeDoesNotGenerateMissingDKIMKeyOrReplaceDNS(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
+
 	cfg, _, err := config.EnsurePath(path)
 	if err != nil {
 		t.Fatal(err)
@@ -236,11 +270,14 @@ func TestServeDoesNotGenerateMissingDKIMKeyOrReplaceDNS(t *testing.T) {
 	cfg.DNS.PublicIPv4 = "203.0.113.10"
 	cfg.TLS.AllowSelfSignedServing = true
 	cfg.Users = []config.User{{Username: "alice", PasswordHash: hash, AllowedSenders: []string{"alice@example.com"}, Enabled: true}}
-	if err = cfg.Init(); err != nil {
+
+	err = cfg.Init()
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err = cfg.Save(); err != nil {
+	err = cfg.Save()
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -249,9 +286,11 @@ func TestServeDoesNotGenerateMissingDKIMKeyOrReplaceDNS(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err = disk.Write(dnsPath, []byte("published identity\n"), 0644); err != nil {
+	err = disk.Write(dnsPath, []byte("published identity\n"), 0644)
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	keyPath, err := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
 	if err != nil {
 		t.Fatal(err)
@@ -265,6 +304,7 @@ func TestServeDoesNotGenerateMissingDKIMKeyOrReplaceDNS(t *testing.T) {
 	if _, err = os.Stat(keyPath); !os.IsNotExist(err) {
 		t.Fatalf("serve generated missing DKIM key: %v", err)
 	}
+
 	if info, statErr := os.Stat(path + ".outboxd.lock"); statErr != nil || !info.Mode().IsRegular() {
 		t.Fatalf("serve did not create regular ownership lock: info=%v err=%v", info, statErr)
 	}
@@ -300,6 +340,7 @@ func TestServeMissingConfigDoesNotCreateIt(t *testing.T) {
 func TestRunCheckMissingTLSDoesNotMutateFilesystem(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
+
 	cfg, _, err := config.EnsurePath(path)
 	if err != nil {
 		t.Fatal(err)
@@ -314,7 +355,15 @@ func TestRunCheckMissingTLSDoesNotMutateFilesystem(t *testing.T) {
 	cfg.Server.Domain = "example.com"
 	cfg.DNS.PublicIPv4 = "203.0.113.10"
 	cfg.TLS.AllowSelfSignedServing = true
-	cfg.Users = []config.User{{Username: "alice", PasswordHash: hash, AllowedSenders: []string{"alice@example.com"}, Enabled: true}}
+	cfg.Users = []config.User{
+		{
+			Username:       "alice",
+			PasswordHash:   hash,
+			AllowedSenders: []string{"alice@example.com"},
+			Enabled:        true,
+		},
+	}
+
 	err = cfg.Init()
 	if err != nil {
 		t.Fatal(err)
@@ -336,6 +385,7 @@ func TestRunCheckMissingTLSDoesNotMutateFilesystem(t *testing.T) {
 	}
 
 	before := filesystemSnapshot(t, dir)
+
 	err = runCheck(path)
 	if err == nil || !strings.Contains(err.Error(), "TLS certificate") {
 		t.Fatalf("missing TLS pair must fail check, got %v", err)
@@ -349,7 +399,9 @@ func TestRunCheckMissingTLSDoesNotMutateFilesystem(t *testing.T) {
 
 func filesystemSnapshot(t *testing.T, root string) []string {
 	t.Helper()
+
 	var snapshot []string
+
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -371,8 +423,10 @@ func filesystemSnapshot(t *testing.T, root string) []string {
 		}
 
 		snapshot = append(snapshot, entry)
+
 		return nil
 	})
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +436,9 @@ func filesystemSnapshot(t *testing.T, root string) []string {
 
 func provisionOwnershipFiles(t *testing.T, cfg *config.Config) {
 	t.Helper()
-	if err := disk.Mkdir(cfg.ResolvePath("queue")); err != nil {
+
+	err := disk.Mkdir(cfg.ResolvePath("queue"))
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -391,7 +447,8 @@ func provisionOwnershipFiles(t *testing.T, cfg *config.Config) {
 		t.Fatal(err)
 	}
 
-	if err = lock.Close(); err != nil {
+	err = lock.Close()
+	if err != nil {
 		t.Fatal(err)
 	}
 }
@@ -406,6 +463,7 @@ func TestEscapeControl(t *testing.T) {
 func TestServeLocksQueueBeforeGeneratingAssets(t *testing.T) {
 	// serve must take exclusive queue ownership before writing TLS assets.
 	cfgDir := t.TempDir()
+
 	hash, err := passwd.Hash("test-password-123")
 	if err != nil {
 		t.Fatal(err)
@@ -425,6 +483,7 @@ func TestServeLocksQueueBeforeGeneratingAssets(t *testing.T) {
 
 	cfgPath := filepath.Join(cfgDir, "config.yml")
 	cfgBody = strings.Replace(cfgBody, "  mode: self_signed\n", "  mode: self_signed\n  allow_self_signed_serving: true\n", 1)
+
 	err = os.WriteFile(cfgPath, []byte(cfgBody), 0600)
 	if err != nil {
 		t.Fatal(err)
@@ -444,6 +503,7 @@ func TestServeLocksQueueBeforeGeneratingAssets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	provisionOwnershipFiles(t, cfg)
 
 	held, err := queue.Open(cfg.ResolvePath("queue"), queue.Limits{})
@@ -458,9 +518,7 @@ func TestServeLocksQueueBeforeGeneratingAssets(t *testing.T) {
 	dnsOut := cfg.ResolvePath(cfg.DNS.OutputFile)
 
 	for _, p := range []string{tlsCert, tlsKey, dnsOut} {
-
-		_, err = os.Stat(p)
-		if !os.IsNotExist(err) {
+		if _, err = os.Stat(p); !os.IsNotExist(err) {
 			t.Fatalf("asset must not exist before serve: %s (%v)", p, err)
 		}
 	}
@@ -471,9 +529,7 @@ func TestServeLocksQueueBeforeGeneratingAssets(t *testing.T) {
 	}
 
 	for _, p := range []string{tlsCert, tlsKey, dnsOut} {
-
-		_, err = os.Stat(p)
-		if !os.IsNotExist(err) {
+		if _, err = os.Stat(p); !os.IsNotExist(err) {
 			t.Fatalf("asset created despite lock failure: %s (%v)", p, err)
 		}
 	}

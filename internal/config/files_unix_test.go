@@ -11,6 +11,7 @@ import (
 func TestPrivateFileSecurityUnix(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "private")
+
 	err := os.WriteFile(path, []byte("secret"), 0644)
 	if err != nil {
 		t.Fatal(err)
@@ -32,6 +33,7 @@ func TestPrivateFileSecurityUnix(t *testing.T) {
 	}
 
 	link := filepath.Join(dir, "link")
+
 	err = os.Symlink(path, link)
 	if err != nil {
 		t.Fatal(err)
@@ -46,12 +48,14 @@ func TestPrivateFileSecurityUnix(t *testing.T) {
 func TestGeneratedSymlinkParentRejectedUnix(t *testing.T) {
 	dir := t.TempDir()
 	realDir := filepath.Join(dir, "real")
+
 	err := os.Mkdir(realDir, 0700)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	data := filepath.Join(dir, "data")
+
 	err = os.Mkdir(data, 0700)
 	if err != nil {
 		t.Fatal(err)
@@ -63,7 +67,9 @@ func TestGeneratedSymlinkParentRejectedUnix(t *testing.T) {
 	}
 
 	cfg := Default()
+
 	cfg.Server.DataDirectory = data
+
 	path, err := cfg.ResolveGeneratedPath("keys/mail.key")
 	if err != nil {
 		t.Fatal(err)
@@ -77,6 +83,7 @@ func TestGeneratedSymlinkParentRejectedUnix(t *testing.T) {
 
 func TestReadCheckedFileLimitUnix(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bounded")
+
 	err := os.WriteFile(path, []byte("12345"), 0600)
 	if err != nil {
 		t.Fatal(err)

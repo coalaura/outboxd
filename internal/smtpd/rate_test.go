@@ -23,6 +23,7 @@ func TestSubmissionLimiterBurstNotFullHourly(t *testing.T) {
 
 func TestSubmissionLimiterRefill(t *testing.T) {
 	l := newSubmissionLimiter(3600, 3600, 2, 2) // 1 token/sec rate effective for pratical test
+
 	if !l.take("u", 1) {
 		t.Fatal("first")
 	}
@@ -38,6 +39,7 @@ func TestSubmissionLimiterRefill(t *testing.T) {
 	// Manually age the allowance
 	l.mu.Lock()
 	a := l.entries["u"]
+
 	a.updated = time.Now().Add(-2 * time.Second)
 	l.mu.Unlock()
 
@@ -48,12 +50,14 @@ func TestSubmissionLimiterRefill(t *testing.T) {
 
 func TestSubmissionLimiterEntryExpiry(t *testing.T) {
 	l := newSubmissionLimiter(10, 10, 2, 2)
+
 	if !l.take("gone", 1) {
 		t.Fatal("take")
 	}
 
 	l.mu.Lock()
 	l.entries["gone"].seen = time.Now().Add(-entryExpiry - time.Minute)
+
 	l.pruned = time.Now().Add(-entryExpiry - time.Minute)
 	l.mu.Unlock()
 

@@ -110,6 +110,7 @@ func newAuthLimiterSized(maxIP, maxKey int, expiry, pruneEvery time.Duration) *a
 	}
 
 	now := time.Now()
+
 	return &authLimiter{
 		byIP:       make(map[string]*attemptState),
 		byKey:      make(map[string]*attemptState),
@@ -134,6 +135,7 @@ func (l *authLimiter) nowTime() time.Time {
 
 func canonicalLimiterKey(ip, username string) (string, string, string) {
 	canonUser := strings.ToLower(strings.TrimSpace(username))
+
 	return ip, ip + "\x00" + canonUser, canonUser
 }
 
@@ -186,12 +188,14 @@ func (l *authLimiter) safeToPrune(st *attemptState, now time.Time) bool {
 // reserve attempts to reserve an authentication slot for the given IP and username.
 func (l *authLimiter) reserve(ip, username string) bool {
 	now := l.nowTime()
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	l.maybePeriodicPrune(now)
 
 	ipKey, key, userKey := canonicalLimiterKey(ip, username)
+
 	ipState := l.byIP[ipKey]
 	keyState := l.byKey[key]
 	userState := l.byUser[userKey]
@@ -208,11 +212,15 @@ func (l *authLimiter) reserve(ip, username string) bool {
 		}
 
 		l.lastCapSweep = now
+
 		l.forcePrune(now)
+
 		ipState = l.byIP[ipKey]
 		keyState = l.byKey[key]
+
 		needNewIP = ipState == nil
 		needNewKey = keyState == nil
+
 		if needNewIP && len(l.byIP) >= l.maxIP && !l.evictOldestIP(now) {
 			return false
 		}
@@ -226,8 +234,7 @@ func (l *authLimiter) reserve(ip, username string) bool {
 		return false
 	}
 
-	if !canReserve(ipState, now) || !canReserve(keyState, now) ||
-		(userState != nil && userState.inFlight >= freeAttempts) {
+	if !canReserve(ipState, now) || !canReserve(keyState, now) || (userState != nil && userState.inFlight >= freeAttempts) {
 		return false
 	}
 
@@ -259,15 +266,18 @@ func (l *authLimiter) reserve(ip, username string) bool {
 	ipState.inFlight++
 	keyState.inFlight++
 	userState.inFlight++
+
 	ipState.seen = now
 	keyState.seen = now
 	userState.seen = now
+
 	return true
 }
 
 // failed records a failed authentication attempt.
 func (l *authLimiter) failed(ip, username string) {
 	now := l.nowTime()
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -282,16 +292,19 @@ func (l *authLimiter) failed(ip, username string) {
 
 	l.convertFail(l.byKey, key, now)
 	l.convertFail(l.byIP, ipKey, now)
+
 	l.releaseUser(userKey, now)
 }
 
 // canceled releases an in-flight reservation without recording a failure or resetting failures.
 func (l *authLimiter) canceled(ip, username string) {
 	now := l.nowTime()
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	ipKey, key, userKey := canonicalLimiterKey(ip, username)
+
 	st := l.byKey[key]
 	if st == nil || st.inFlight == 0 {
 		return
@@ -299,7 +312,9 @@ func (l *authLimiter) canceled(ip, username string) {
 
 	l.releaseInFlight(l.byKey, key, now)
 	l.releaseInFlight(l.byIP, ipKey, now)
+
 	l.releaseUser(userKey, now)
+
 	l.dropEmpty(key, ipKey, now)
 }
 
@@ -307,6 +322,7 @@ func (l *authLimiter) canceled(ip, username string) {
 // that identity's prior failure contribution from the IP aggregate.
 func (l *authLimiter) succeeded(ip, username string) {
 	now := l.nowTime()
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -319,14 +335,17 @@ func (l *authLimiter) succeeded(ip, username string) {
 
 	// Exact identity contribution before clearing.
 	cleared := 0
+
 	if keyState.inFlight > 0 {
 		keyState.inFlight--
 	}
 
 	cleared = keyState.failures
+
 	keyState.failures = 0
 	keyState.until = time.Time{}
 	keyState.seen = now
+
 	if emptyState(keyState, now) {
 		delete(l.byKey, key)
 	}
@@ -350,6 +369,7 @@ func (l *authLimiter) succeeded(ip, username string) {
 		}
 
 		ipState.seen = now
+
 		if emptyState(ipState, now) {
 			delete(l.byIP, ipKey)
 		}
@@ -369,6 +389,7 @@ func (l *authLimiter) releaseUser(userKey string, now time.Time) {
 	}
 
 	st.seen = now
+
 	if st.inFlight == 0 {
 		delete(l.byUser, userKey)
 	}
@@ -376,11 +397,13 @@ func (l *authLimiter) releaseUser(userKey string, now time.Time) {
 
 func (l *authLimiter) dropEmpty(key, ipKey string, now time.Time) {
 	st := l.byKey[key]
+
 	if emptyState(st, now) {
 		delete(l.byKey, key)
 	}
 
 	st = l.byIP[ipKey]
+
 	if emptyState(st, now) {
 		delete(l.byIP, ipKey)
 	}
@@ -420,6 +443,7 @@ func (l *authLimiter) convertFail(m map[string]*attemptState, key string, now ti
 	shift := min(st.failures-freeAttempts, 10)
 
 	lockout := lockoutBase << shift
+
 	st.until = now.Add(min(lockout, lockoutMax))
 }
 
@@ -435,7 +459,8 @@ func (l *authLimiter) maybePeriodicPrune(now time.Time) {
 func (l *authLimiter) forcePrune(now time.Time) bool {
 	l.pruned = now
 	l.fullSweeps++
-	reclaimed := false
+
+	var reclaimed bool
 
 	// Prune identities first so IP aggregates can be adjusted consistently.
 	for k, st := range l.byKey {
@@ -444,12 +469,14 @@ func (l *authLimiter) forcePrune(now time.Time) bool {
 		}
 
 		l.dropIdentityLocked(k, st, now)
+
 		reclaimed = true
 	}
 
 	for k, st := range l.byIP {
 		if l.safeToPrune(st, now) {
 			delete(l.byIP, k)
+
 			reclaimed = true
 		}
 	}
@@ -457,6 +484,7 @@ func (l *authLimiter) forcePrune(now time.Time) bool {
 	for k, st := range l.byUser {
 		if st.inFlight == 0 {
 			delete(l.byUser, k)
+
 			reclaimed = true
 		}
 	}
@@ -485,6 +513,7 @@ func (l *authLimiter) evictOldestKey(now time.Time) bool {
 	}
 
 	l.dropIdentityLocked(oldestKey, l.byKey[oldestKey], now)
+
 	return true
 }
 
@@ -523,12 +552,14 @@ func (l *authLimiter) evictOldestIP(now time.Time) bool {
 	}
 
 	delete(l.byIP, oldestIP)
+
 	return true
 }
 
 // dropIdentityLocked removes an identity and subtracts its contributions from the IP aggregate.
 func (l *authLimiter) dropIdentityLocked(key string, st *attemptState, now time.Time) {
 	ip := ipFromKey(key)
+
 	ipState := l.byIP[ip]
 	if ipState != nil {
 		if st.failures > 0 {
@@ -552,6 +583,7 @@ func (l *authLimiter) dropIdentityLocked(key string, st *attemptState, now time.
 		}
 
 		ipState.seen = now
+
 		if emptyState(ipState, now) {
 			delete(l.byIP, ip)
 		}
@@ -564,16 +596,22 @@ func (l *authLimiter) dropIdentityLocked(key string, st *attemptState, now time.
 // Used only by tests; panics on violation so race tests surface corruption quickly.
 func (l *authLimiter) assertAggregatesLocked() error {
 	type sum struct {
-		fail, inflight int
+		fail     int
+		inflight int
 	}
+
 	want := make(map[string]sum)
 
 	for k, st := range l.byKey {
 		ip := ipFromKey(k)
+
 		s := want[ip]
+
 		s.fail += st.failures
 		s.inflight += st.inFlight
+
 		want[ip] = s
+
 		if st.failures < 0 || st.inFlight < 0 {
 			return fmt.Errorf("negative identity state key=%q failures=%d inFlight=%d", k, st.failures, st.inFlight)
 		}
@@ -585,9 +623,9 @@ func (l *authLimiter) assertAggregatesLocked() error {
 		}
 
 		s := want[ip]
+
 		if st.failures != s.fail || st.inFlight != s.inflight {
-			return fmt.Errorf("aggregate mismatch ip=%q got fail=%d inFlight=%d want fail=%d inFlight=%d",
-				ip, st.failures, st.inFlight, s.fail, s.inflight)
+			return fmt.Errorf("aggregate mismatch ip=%q got fail=%d inFlight=%d want fail=%d inFlight=%d", ip, st.failures, st.inFlight, s.fail, s.inflight)
 		}
 
 		delete(want, ip)

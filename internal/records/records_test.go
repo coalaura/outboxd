@@ -9,10 +9,13 @@ import (
 
 func TestSPFDedupeWhenHostnameEqualsDomain(t *testing.T) {
 	cfg := config.Default()
+
 	cfg.Server.Hostname = "example.com"
 	cfg.Server.Domain = "example.com"
 	cfg.DNS.PublicIPv4 = "203.0.113.1"
+
 	recs := Build(cfg, "v=DKIM1; p=x")
+
 	var spf int
 
 	for _, r := range recs {
@@ -32,6 +35,7 @@ func TestSPFDedupeWhenHostnameEqualsDomain(t *testing.T) {
 
 func TestSPFForSenderDomainsAndIncludes(t *testing.T) {
 	cfg := config.Default()
+
 	cfg.Server.Hostname = "mail.example.com"
 	cfg.Server.Domain = "example.com"
 	cfg.DNS.PublicIPv4 = "203.0.113.1"
@@ -39,19 +43,22 @@ func TestSPFForSenderDomainsAndIncludes(t *testing.T) {
 	cfg.Users = []config.User{{
 		AllowedSenders: []string{"a@example.com", "*@news.example.com"},
 	}}
+
 	recs := Build(cfg, "v=DKIM1; p=x")
+
 	owners := map[string]bool{}
+
 	var spfVal string
 
 	for _, r := range recs {
 		if r.Type == "TXT" && strings.HasPrefix(r.Value, "v=spf1") {
 			owners[r.Name] = true
+
 			spfVal = r.Value
 		}
 	}
 
 	for _, want := range []string{"example.com.", "news.example.com.", "mail.example.com."} {
-
 		if !owners[want] {
 			t.Fatalf("missing SPF owner %s in %v", want, owners)
 		}
@@ -68,6 +75,7 @@ func TestSPFForSenderDomainsAndIncludes(t *testing.T) {
 
 func TestMappedIPv6IsNotEmittedAsIPv4(t *testing.T) {
 	cfg := config.Default()
+
 	cfg.Server.Hostname = "mail.example.com"
 	cfg.Server.Domain = "example.com"
 	cfg.DNS.PublicIPv4 = "::ffff:192.0.2.1"
@@ -81,13 +89,19 @@ func TestMappedIPv6IsNotEmittedAsIPv4(t *testing.T) {
 
 func TestTLSRPTSeparateFromDMARC(t *testing.T) {
 	cfg := config.Default()
+
 	cfg.Server.Hostname = "mail.example.com"
 	cfg.Server.Domain = "example.com"
 	cfg.DNS.ReportURI = "mailto:dmarc@example.com"
 	cfg.DNS.TLSRPTURI = "mailto:tlsrpt@example.com"
 	cfg.DNS.DMARC = "none"
+
 	recs := Build(cfg, "v=DKIM1; p=x")
-	var dmarc, tlsrpt string
+
+	var (
+		dmarc  string
+		tlsrpt string
+	)
 
 	for _, r := range recs {
 		if strings.HasPrefix(r.Name, "_dmarc.") {
@@ -126,6 +140,7 @@ func TestExternalDMARCMailboxBangIsNotSizeSuffix(t *testing.T) {
 func TestExternalDMARCHTTPSDestination(t *testing.T) {
 	hosts := external("mailto:ops!alerts@reports.example.net, https://aggregate.example.org/v1!12x, https://limited.example.net/report!10M", "example.com")
 	want := []string{"reports.example.net", "aggregate.example.org", "limited.example.net"}
+
 	if len(hosts) != len(want) {
 		t.Fatalf("external hosts=%v", hosts)
 	}
@@ -137,6 +152,7 @@ func TestExternalDMARCHTTPSDestination(t *testing.T) {
 	}
 
 	cfg := config.Default()
+
 	cfg.Server.Domain = "example.com"
 	cfg.DNS.ReportURI = "https://aggregate.example.org/v1/reports"
 
@@ -151,9 +167,11 @@ func TestExternalDMARCHTTPSDestination(t *testing.T) {
 
 func TestInstructionsListOnlyEnabledListenerPorts(t *testing.T) {
 	cfg := config.Default()
+
 	cfg.Server.DataDirectory = t.TempDir()
 	cfg.Server.DisableImplicitTLS = true
 	cfg.Server.SubmissionAddr = "127.0.0.1:2525"
+
 	_, body, err := Write(cfg, "v=DKIM1; p=x")
 	if err != nil {
 		t.Fatal(err)

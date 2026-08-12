@@ -34,14 +34,18 @@ func (l *domainLimiter) tryAcquire(domain string) bool {
 	if domain == "" {
 		return true
 	}
+
 	entry := l.slots[domain]
 	if entry != nil && entry.holders >= l.limit {
 		return false
 	}
+
 	if entry == nil {
 		entry = &slot{}
+
 		l.slots[domain] = entry
 	}
+
 	entry.holders++
 
 	return true

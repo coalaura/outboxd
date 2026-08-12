@@ -29,7 +29,8 @@ type dataWorkerCountCase struct {
 type testLog struct{}
 
 func (testLog) Printf(string, ...any) {}
-func (testLog) Println(...any)        {}
+
+func (testLog) Println(...any) {}
 
 type pausedAcceptListener struct {
 	net.Listener
@@ -45,14 +46,18 @@ func (l *pausedAcceptListener) Accept() (net.Conn, error) {
 
 	close(l.accepted)
 	<-l.resume
+
 	return conn, nil
 }
 
 func testServerParts(t *testing.T) (*config.Config, *certs.Keeper, *queue.Queue) {
 	t.Helper()
+
 	base := t.TempDir()
+
 	cfgPath := filepath.Join(base, "config.yml")
 	dataDir := filepath.Join(base, "data")
+
 	err := os.MkdirAll(dataDir, 0700)
 	if err != nil {
 		t.Fatal(err)
@@ -68,6 +73,7 @@ func testServerParts(t *testing.T) (*config.Config, *certs.Keeper, *queue.Queue)
 		"delivery:\n  tls_mode: opportunistic\n  max_attempts: 3\n  maximum_lifetime: 1h\n  initial_retry_delay: 1s\n  maximum_retry_delay: 1m\n" +
 		"  domain_concurrency: 1\n  global_concurrency: 2\n  connection_timeout: 5s\n  command_timeout: 30s\n  submission_timeout: 1m\n" +
 		"dns:\n  dmarc_policy: none\n  output_file: dns-records.txt\n"
+
 	err = os.WriteFile(cfgPath, []byte(body), 0600)
 	if err != nil {
 		t.Fatal(err)
@@ -88,17 +94,26 @@ func testServerParts(t *testing.T) (*config.Config, *certs.Keeper, *queue.Queue)
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = spool.Close() })
+	t.Cleanup(func() {
+		_ = spool.Close()
+	})
+
 	return cfg, k, spool
 }
 
 func waitServeEntered(t *testing.T, srv *Server) <-chan struct{} {
 	t.Helper()
+
 	ch := make(chan struct{})
+
 	var once sync.Once
+
 	srv.serveEntered = func() {
-		once.Do(func() { close(ch) })
+		once.Do(func() {
+			close(ch)
+		})
 	}
+
 	return ch
 }
 
@@ -114,7 +129,9 @@ func awaitCh(t *testing.T, ch <-chan struct{}, timeout time.Duration, what strin
 
 func TestRunParentCancel(t *testing.T) {
 	cfg, k, spool := testServerParts(t)
+
 	srv := New(cfg, k, nil, spool, testLog{})
+
 	err := srv.Listen()
 	if err != nil {
 		t.Fatal(err)
@@ -125,10 +142,17 @@ func TestRunParentCancel(t *testing.T) {
 	}
 
 	entered := waitServeEntered(t, srv)
+
 	ctx, cancel := context.WithCancel(context.Background())
+
 	done := make(chan error, 1)
-	go func() { done <- srv.Run(ctx) }()
+
+	go func() {
+		done <- srv.Run(ctx)
+	}()
+
 	awaitCh(t, entered, 3*time.Second, "serve entered")
+
 	cancel()
 
 	select {
@@ -140,18 +164,27 @@ func TestRunParentCancel(t *testing.T) {
 
 func TestRunSTARTTLSListenerFailure(t *testing.T) {
 	cfg, k, spool := testServerParts(t)
+
 	cfg.Server.DisableImplicitTLS = true
 	cfg.Server.ImplicitTLSAddr = ""
+
 	srv := New(cfg, k, nil, spool, testLog{})
+
 	err := srv.Listen()
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	entered := waitServeEntered(t, srv)
+
 	done := make(chan error, 1)
-	go func() { done <- srv.Run(context.Background()) }()
+
+	go func() {
+		done <- srv.Run(context.Background())
+	}()
+
 	awaitCh(t, entered, 3*time.Second, "serve entered")
+
 	_ = srv.starttlsListener.Close()
 
 	select {
@@ -163,9 +196,12 @@ func TestRunSTARTTLSListenerFailure(t *testing.T) {
 
 func TestRunImplicitTLSListenerFailure(t *testing.T) {
 	cfg, k, spool := testServerParts(t)
+
 	cfg.Server.DisableSubmission = true
 	cfg.Server.SubmissionAddr = ""
+
 	srv := New(cfg, k, nil, spool, testLog{})
+
 	err := srv.Listen()
 	if err != nil {
 		t.Fatal(err)
@@ -176,9 +212,15 @@ func TestRunImplicitTLSListenerFailure(t *testing.T) {
 	}
 
 	entered := waitServeEntered(t, srv)
+
 	done := make(chan error, 1)
-	go func() { done <- srv.Run(context.Background()) }()
+
+	go func() {
+		done <- srv.Run(context.Background())
+	}()
+
 	awaitCh(t, entered, 3*time.Second, "serve entered")
+
 	_ = srv.implicitListener.Close()
 
 	select {
@@ -190,16 +232,24 @@ func TestRunImplicitTLSListenerFailure(t *testing.T) {
 
 func TestRunBothExitTogether(t *testing.T) {
 	cfg, k, spool := testServerParts(t)
+
 	srv := New(cfg, k, nil, spool, testLog{})
+
 	err := srv.Listen()
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	entered := waitServeEntered(t, srv)
+
 	done := make(chan error, 1)
-	go func() { done <- srv.Run(context.Background()) }()
+
+	go func() {
+		done <- srv.Run(context.Background())
+	}()
+
 	awaitCh(t, entered, 3*time.Second, "serve entered")
+
 	_ = srv.starttlsListener.Close()
 
 	select {
@@ -211,9 +261,12 @@ func TestRunBothExitTogether(t *testing.T) {
 
 func TestGracefulShutdownTimeoutPath(t *testing.T) {
 	cfg, k, spool := testServerParts(t)
+
 	cfg.Server.DisableImplicitTLS = true
 	cfg.Server.ImplicitTLSAddr = ""
+
 	srv := New(cfg, k, nil, spool, testLog{})
+
 	err := srv.Listen()
 	if err != nil {
 		t.Fatal(err)
@@ -222,7 +275,9 @@ func TestGracefulShutdownTimeoutPath(t *testing.T) {
 	// Inject a shutdown context that is already past its deadline once the session is held,
 	// so Shutdown must take the deadline path and surface deadline exceeded.
 	arm := make(chan struct{})
+
 	var armed atomic.Bool
+
 	srv.shutdownContext = func(parent context.Context) (context.Context, context.CancelFunc) {
 		select {
 		case <-arm:
@@ -231,15 +286,26 @@ func TestGracefulShutdownTimeoutPath(t *testing.T) {
 		}
 
 		armed.Store(true)
+
 		return context.WithDeadline(parent, time.Now().Add(-time.Millisecond))
 	}
 
 	var hook atomic.Int32
-	srv.shutdownHook = func() { hook.Add(1) }
+
+	srv.shutdownHook = func() {
+		hook.Add(1)
+	}
+
 	entered := waitServeEntered(t, srv)
+
 	ctx, cancel := context.WithCancel(context.Background())
+
 	done := make(chan error, 1)
-	go func() { done <- srv.Run(ctx) }()
+
+	go func() {
+		done <- srv.Run(ctx)
+	}()
+
 	awaitCh(t, entered, 3*time.Second, "serve entered")
 
 	// Hold an active session open so Shutdown must wait and hit the deadline.
@@ -249,7 +315,9 @@ func TestGracefulShutdownTimeoutPath(t *testing.T) {
 	}
 
 	defer conn.Close()
+
 	br := bufio.NewReader(conn)
+
 	_, err = br.ReadString('\n')
 	if err != nil {
 		t.Fatal(err)
@@ -257,6 +325,7 @@ func TestGracefulShutdownTimeoutPath(t *testing.T) {
 
 	close(arm)
 	cancel()
+
 	var runErr error
 
 	select {
@@ -283,8 +352,7 @@ func TestGracefulShutdownTimeoutPath(t *testing.T) {
 	}
 
 	low := strings.ToLower(runErr.Error())
-	if !errors.Is(runErr, context.DeadlineExceeded) &&
-		!strings.Contains(low, "deadline") && !strings.Contains(low, "timeout") {
+	if !errors.Is(runErr, context.DeadlineExceeded) && !strings.Contains(low, "deadline") && !strings.Contains(low, "timeout") {
 		t.Fatalf("expected deadline/timeout in error, got %v", runErr)
 	}
 
@@ -292,15 +360,20 @@ func TestGracefulShutdownTimeoutPath(t *testing.T) {
 
 func TestGracefulShutdownRejectsAcceptedConnectionBeforeTracking(t *testing.T) {
 	cfg, k, spool := testServerParts(t)
+
 	cfg.Server.DisableImplicitTLS = true
 	cfg.Server.ImplicitTLSAddr = ""
+
 	srv := New(cfg, k, nil, spool, testLog{})
-	if err := srv.Listen(); err != nil {
+
+	err := srv.Listen()
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	accepted := make(chan struct{})
 	resume := make(chan struct{})
+
 	srv.starttlsListener = &pausedAcceptListener{
 		Listener: srv.starttlsListener,
 		accepted: accepted,
@@ -308,8 +381,10 @@ func TestGracefulShutdownRejectsAcceptedConnectionBeforeTracking(t *testing.T) {
 	}
 
 	shutdownComplete := make(chan struct{})
+
 	srv.shutdownContext = func(parent context.Context) (context.Context, context.CancelFunc) {
 		ctx, cancel := context.WithCancel(parent)
+
 		return ctx, func() {
 			cancel()
 			close(shutdownComplete)
@@ -317,32 +392,47 @@ func TestGracefulShutdownRejectsAcceptedConnectionBeforeTracking(t *testing.T) {
 	}
 
 	entered := waitServeEntered(t, srv)
+
 	ctx, cancel := context.WithCancel(context.Background())
+
 	runDone := make(chan error, 1)
-	go func() { runDone <- srv.Run(ctx) }()
+
+	go func() {
+		runDone <- srv.Run(ctx)
+	}()
+
 	awaitCh(t, entered, 3*time.Second, "serve entered")
 
 	conn, err := net.DialTimeout("tcp", srv.starttls.Addr, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer conn.Close()
 
 	awaitCh(t, accepted, 3*time.Second, "accepted connection")
+
 	cancel()
+
 	awaitCh(t, shutdownComplete, 3*time.Second, "successful graceful shutdown")
+
 	close(resume)
 
-	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+	err = conn.SetReadDeadline(time.Now().Add(time.Second))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := conn.Read(make([]byte, 1)); err == nil {
+
+	_, err = conn.Read(make([]byte, 1))
+	if err == nil {
 		_ = conn.Close()
+
 		select {
 		case <-runDone:
 		case <-time.After(3 * time.Second):
 			t.Fatal("server did not exit after late connection cleanup")
 		}
+
 		t.Fatal("connection accepted before tracking survived successful graceful shutdown")
 	}
 
@@ -358,17 +448,26 @@ func TestGracefulShutdownRejectsAcceptedConnectionBeforeTracking(t *testing.T) {
 
 func TestNoLeakedWaiterOnListenerFail(t *testing.T) {
 	cfg, k, spool := testServerParts(t)
+
 	srv := New(cfg, k, nil, spool, testLog{})
+
 	err := srv.Listen()
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	entered := waitServeEntered(t, srv)
+
 	ctx := t.Context()
+
 	done := make(chan error, 1)
-	go func() { done <- srv.Run(ctx) }()
+
+	go func() {
+		done <- srv.Run(ctx)
+	}()
+
 	awaitCh(t, entered, 3*time.Second, "serve entered")
+
 	_ = srv.starttlsListener.Close()
 
 	select {
@@ -380,6 +479,7 @@ func TestNoLeakedWaiterOnListenerFail(t *testing.T) {
 
 func TestConnectionLimitSaturation(t *testing.T) {
 	lim := newConnectionLimiter(2, 2)
+
 	if !lim.acquire("1.2.3.4") {
 		t.Fatal("first")
 	}
@@ -400,18 +500,23 @@ func TestConnectionLimitSaturation(t *testing.T) {
 }
 
 func TestAllowDataTerminatorReaderGuards(t *testing.T) {
-	if err := allowDataTerminator(strings.NewReader("message"), 7); err == nil {
+	err := allowDataTerminator(strings.NewReader("message"), 7)
+	if err == nil {
 		t.Fatal("unknown DATA reader was accepted")
 	}
 
 	reader, writer := io.Pipe()
+
 	defer reader.Close()
 	defer writer.Close()
-	if err := allowDataTerminator(reader, 7); err != nil {
+
+	err = allowDataTerminator(reader, 7)
+	if err != nil {
 		t.Fatalf("BDAT pipe reader rejected: %v", err)
 	}
 
-	if err := allowDataTerminator(strings.NewReader("unlimited"), 0); err != nil {
+	err = allowDataTerminator(strings.NewReader("unlimited"), 0)
+	if err != nil {
 		t.Fatalf("unlimited reader rejected: %v", err)
 	}
 }
@@ -425,7 +530,6 @@ func TestDataWorkerCountMemoryBound(t *testing.T) {
 		{"default", config.Default().Server.MaxMessageBytes, 2},
 		{"configured upper bound", config.MaxMessageBytes, 1},
 	} {
-
 		t.Run(tt.name, func(t *testing.T) {
 			got := dataWorkerCount(tt.maxBytes)
 			if got != tt.workers {
@@ -435,7 +539,6 @@ func TestDataWorkerCountMemoryBound(t *testing.T) {
 	}
 
 	for _, maxBytes := range []int64{1, config.MaxMessageBytes, config.DataMemoryBudget, math.MaxInt64} {
-
 		workers := dataWorkerCount(maxBytes)
 		if workers < 1 || workers > config.MaxDataWorkers {
 			t.Fatalf("maxBytes=%d workers=%d", maxBytes, workers)
@@ -453,12 +556,14 @@ func TestDataWorkerCountMemoryBound(t *testing.T) {
 
 func TestDataWorkersIndependentOfAuthWorkers(t *testing.T) {
 	cfg, keeper, spool := testServerParts(t)
+
 	want := dataWorkerCount(cfg.Server.MaxMessageBytes)
 
 	for _, authWorkers := range []int{1, 1024} {
-
 		cfg.Server.AuthWorkers = authWorkers
+
 		srv := New(cfg, keeper, nil, spool, testLog{})
+
 		got := cap(srv.dataWork)
 		if got != want {
 			t.Fatalf("authWorkers=%d dataWorkers=%d want %d", authWorkers, got, want)
@@ -468,7 +573,9 @@ func TestDataWorkersIndependentOfAuthWorkers(t *testing.T) {
 
 func TestListenUpdatesBoundAddr(t *testing.T) {
 	cfg, k, spool := testServerParts(t)
+
 	srv := New(cfg, k, nil, spool, testLog{})
+
 	err := srv.Listen()
 	if err != nil {
 		t.Fatal(err)
@@ -483,6 +590,7 @@ func TestListenUpdatesBoundAddr(t *testing.T) {
 			_ = srv.implicitListener.Close()
 		}
 	})
+
 	host, port, err := net.SplitHostPort(srv.starttls.Addr)
 	if err != nil || port == "0" || host == "" {
 		t.Fatalf("bad starttls addr %q err=%v", srv.starttls.Addr, err)

@@ -19,7 +19,9 @@ func (l *FileLock) Close() error {
 	}
 
 	err := l.impl.close()
+
 	l.impl = nil
+
 	return err
 }
 

@@ -43,9 +43,12 @@ func TestUserValidateAllowsCaseDistinctExactSenders(t *testing.T) {
 		PasswordHash:   "$argon2id$placeholder",
 		AllowedSenders: []string{"User@Example.COM", "user@example.com"},
 	}
-	if err := u.Validate(); err != nil {
+
+	err := u.Validate()
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got := u.AllowedSenders; got[0] != "User@example.com" || got[1] != "user@example.com" {
 		t.Fatalf("normalized senders=%q", got)
 	}
@@ -80,7 +83,9 @@ func TestAllowedSenderUsesStrictMailboxLimits(t *testing.T) {
 		PasswordHash:   "$argon2id$placeholder",
 		AllowedSenders: []string{strings.Repeat("a", 65) + "@example.com"},
 	}
-	if err := u.Validate(); err == nil {
+
+	err := u.Validate()
+	if err == nil {
 		t.Fatal("overlong configured sender accepted")
 	}
 }

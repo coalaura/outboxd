@@ -20,6 +20,7 @@ func Lock(path string) (*FileLock, error) {
 	err = unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
 	if err != nil {
 		_ = f.Close()
+
 		if err == unix.EWOULDBLOCK || err == unix.EAGAIN {
 			return nil, ErrLocked
 		}
@@ -40,7 +41,10 @@ func (l *unixFileLock) close() error {
 	}
 
 	_ = unix.Flock(int(l.f.Fd()), unix.LOCK_UN)
+
 	err := l.f.Close()
+
 	l.f = nil
+
 	return err
 }

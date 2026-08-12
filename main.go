@@ -28,6 +28,11 @@ import (
 
 var log = plain.New(plain.WithDate(plain.RFC3339Local))
 
+var (
+	serviceShutdownTimeout = 45 * time.Second
+	queueShutdownTimeout   = 30 * time.Second
+)
+
 func main() {
 	configPath, args := parseGlobalFlags(os.Args[1:])
 
@@ -42,6 +47,7 @@ func main() {
 	case "dns":
 		if len(args) != 1 {
 			log.MustExit(errors.New("usage: outboxd dns"))
+
 			return
 		}
 
@@ -49,6 +55,7 @@ func main() {
 	case "provision":
 		if len(args) != 1 {
 			log.MustExit(errors.New("usage: outboxd provision"))
+
 			return
 		}
 
@@ -56,6 +63,7 @@ func main() {
 	case "check":
 		if len(args) != 1 {
 			log.MustExit(errors.New("usage: outboxd check"))
+
 			return
 		}
 
@@ -67,6 +75,7 @@ func main() {
 	case "serve":
 		if len(args) != 1 {
 			log.MustExit(errors.New("usage: outboxd serve"))
+
 			return
 		}
 
@@ -79,6 +88,7 @@ func main() {
 // parseGlobalFlags extracts -config / --config before the subcommand.
 func parseGlobalFlags(args []string) (configPath string, rest []string) {
 	fs := flag.NewFlagSet("outboxd", flag.ContinueOnError)
+
 	fs.SetOutput(os.Stderr)
 	fs.StringVar(&configPath, "config", "", "path to config.yml (or set OUTBOXD_CONFIG)")
 
@@ -110,6 +120,7 @@ func loadOperationalConfig(configPath string) (*config.Config, *disk.FileLock, e
 	}
 
 	lockPath := path + ".outboxd.lock"
+
 	info, err := os.Lstat(lockPath)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
@@ -127,6 +138,7 @@ func loadOperationalConfig(configPath string) (*config.Config, *disk.FileLock, e
 	cfg, err := config.LoadFile(path)
 	if err != nil {
 		_ = ownership.Close()
+
 		return nil, nil, err
 	}
 
@@ -135,6 +147,7 @@ func loadOperationalConfig(configPath string) (*config.Config, *disk.FileLock, e
 
 func lockSpool(cfg *config.Config) (*disk.FileLock, error) {
 	queuePath := cfg.ResolvePath("queue")
+
 	err := disk.ValidatePath(queuePath)
 	if err != nil {
 		return nil, fmt.Errorf("validate spool namespace %s: %w", queuePath, err)
@@ -165,6 +178,7 @@ func provision(configPath string) error {
 
 	if created {
 		fmt.Fprintf(os.Stdout, "Created default config at %q. Edit it, then rerun provision. Configuration changes require an outboxd restart.\n", cfg.Path())
+
 		return nil
 	}
 
@@ -172,6 +186,7 @@ func provision(configPath string) error {
 	if err != nil {
 		return fmt.Errorf("configuration %s: %w", cfg.Path(), err)
 	}
+
 	defer ownership.Close()
 
 	err = disk.ValidatePath(cfg.ResolvedDataDir())
@@ -193,6 +208,7 @@ func provision(configPath string) error {
 	if err != nil {
 		return err
 	}
+
 	defer spoolOwnership.Close()
 
 	_, generated, err := sign.Ensure(cfg)
@@ -221,6 +237,7 @@ func serve(configPath string) error {
 	if err != nil {
 		return err
 	}
+
 	defer ownership.Close()
 
 	for _, warning := range cfg.Warnings() {
@@ -256,6 +273,7 @@ func serve(configPath string) error {
 		DeadRetention:       config.Duration(cfg.Server.DeadRetention),
 		CorruptRetention:    config.Duration(cfg.Server.CorruptRetention),
 	})
+
 	if err != nil {
 		return err
 	}
@@ -263,10 +281,13 @@ func serve(configPath string) error {
 	defer func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), queueShutdownTimeout)
 		defer cancel()
-		if closeErr := spool.CloseContext(closeCtx); closeErr != nil {
+
+		closeErr := spool.CloseContext(closeCtx)
+		if closeErr != nil {
 			log.Warnln("queue shutdown incomplete:", escapeControl(closeErr.Error()))
 		}
 	}()
+
 	spool.FreeDisk = disk.FreeBytes
 
 	for _, cerr := range spool.Corrupt {
@@ -349,6 +370,7 @@ func serve(configPath string) error {
 	log.Println("Server ready")
 
 	done := make(chan struct{})
+
 	go func() {
 		wg.Wait()
 		close(done)
@@ -359,6 +381,7 @@ func serve(configPath string) error {
 	case <-ctx.Done():
 		timer := time.NewTimer(serviceShutdownTimeout)
 		defer timer.Stop()
+
 		select {
 		case <-done:
 		case <-timer.C:
@@ -371,17 +394,13 @@ func serve(configPath string) error {
 	return errors.Join(errs[0], errs[1])
 }
 
-var (
-	serviceShutdownTimeout = 45 * time.Second
-	queueShutdownTimeout   = 30 * time.Second
-)
-
 func logSpoolStats(spool *queue.Queue) {
 	stats := spool.SpoolStats()
 	message := fmt.Sprintf("Spool estimated usage: %d bytes used, %d reserved, %d admission limit", stats.Used, stats.Reserved, stats.Limit)
 
 	if stats.HighWater {
 		log.Warnln("HIGH WATER:", message)
+
 		return
 	}
 
@@ -391,6 +410,7 @@ func logSpoolStats(spool *queue.Queue) {
 // verifyBindAddresses ensures configured outbound bind IPs exist on this host.
 func verifyBindAddresses(cfg *config.Config) error {
 	need := make([]net.IP, 0, 2)
+
 	if cfg.Delivery.BindIPv4 != "" {
 		ip := net.ParseIP(cfg.Delivery.BindIPv4)
 		if ip == nil || ip.To4() == nil {
@@ -436,11 +456,12 @@ func verifyBindAddresses(cfg *config.Config) error {
 	}
 
 	for _, want := range need {
-		found := false
+		var found bool
 
 		for _, have := range local {
 			if have.Equal(want) {
 				found = true
+
 				break
 			}
 		}
@@ -477,6 +498,7 @@ func runCheck(configPath string) error {
 	}
 
 	opts.DKIM = &check.DKIMKey{Selector: cfg.DKIM.Selector, PublicKey: signer.PublicKey}
+
 	err = certs.Check(cfg)
 	if err != nil {
 		return fmt.Errorf("check serving TLS certificate: %w", err)
@@ -484,9 +506,12 @@ func runCheck(configPath string) error {
 
 	signalCtx, stop := terminationContext(context.Background())
 	defer stop()
+
 	ctx, cancel := context.WithTimeout(signalCtx, 30*time.Second)
 	defer cancel()
+
 	results := check.Run(ctx, opts)
+
 	var failed bool
 
 	for _, r := range results {
@@ -509,15 +534,19 @@ func runCheck(configPath string) error {
 // force-termination behavior.
 func terminationContext(parent context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(parent)
+
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+
 	var once sync.Once
+
 	stop := func() {
 		once.Do(func() {
 			signal.Stop(signals)
 			cancel()
 		})
 	}
+
 	go func() {
 		select {
 		case <-signals:
@@ -527,6 +556,7 @@ func terminationContext(parent context.Context) (context.Context, context.Cancel
 		case <-ctx.Done():
 		}
 	}()
+
 	return ctx, stop
 }
 

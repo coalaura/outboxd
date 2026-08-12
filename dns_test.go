@@ -14,6 +14,7 @@ import (
 func TestDNSDoesNotGenerateMissingDKIMKeyOrReplaceOutput(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yml")
+
 	cfg, _, err := config.EnsurePath(configPath)
 	if err != nil {
 		t.Fatal(err)
@@ -24,9 +25,11 @@ func TestDNSDoesNotGenerateMissingDKIMKeyOrReplaceOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err = disk.Write(dnsPath, []byte("published identity\n"), 0644); err != nil {
+	err = disk.Write(dnsPath, []byte("published identity\n"), 0644)
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	provisionOwnershipFiles(t, cfg)
 
 	keyPath, err := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
@@ -74,11 +77,14 @@ func TestDNSMissingConfigDoesNotCreateIt(t *testing.T) {
 func TestDNSRejectsDaemonOwnedSpool(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
-	if err := provision(path); err != nil {
+
+	err := provision(path)
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := provision(path); err != nil {
+	err = provision(path)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -91,6 +97,7 @@ func TestDNSRejectsDaemonOwnedSpool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer held.Close()
 
 	err = dns(path)
@@ -102,16 +109,19 @@ func TestDNSRejectsDaemonOwnedSpool(t *testing.T) {
 func TestDNSRejectsChangedPathsWhileStartupSnapshotOwned(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
+
 	cfg, _, err := config.EnsurePath(path)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	provisionOwnershipFiles(t, cfg)
 
 	startup, err := disk.Lock(path + ".outboxd.lock")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer startup.Close()
 
 	cfg.Server.DataDirectory = filepath.Join(dir, "changed-data")

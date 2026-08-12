@@ -27,7 +27,8 @@ import (
 type nopLogger struct{}
 
 func (nopLogger) Printf(string, ...any) {}
-func (nopLogger) Println(...any)        {}
+
+func (nopLogger) Println(...any) {}
 
 type fixedResolver struct {
 	mx  map[string][]*net.MX
@@ -39,6 +40,7 @@ func (f *fixedResolver) LookupMX(ctx context.Context, name string) ([]*net.MX, e
 	if ok {
 		out := make([]*net.MX, len(mx))
 		copy(out, mx)
+
 		return out, nil
 	}
 
@@ -53,6 +55,7 @@ func (f *fixedResolver) LookupNetIP(ctx context.Context, network, host string) (
 
 	out := make([]net.IP, len(ips))
 	copy(out, ips)
+
 	return out, nil
 }
 
@@ -66,6 +69,7 @@ func (d *dialRec) DialContext(ctx context.Context, network, address string) (net
 	d.mu.Lock()
 	d.order = append(d.order, address)
 	d.mu.Unlock()
+
 	return d.fn(ctx, network, address)
 }
 
@@ -82,16 +86,16 @@ func (m mapDial) DialContext(ctx context.Context, network, address string) (net.
 	}
 
 	var nd net.Dialer
+
 	return nd.DialContext(ctx, "tcp", target)
 }
 
 func testDeliverCfg() *config.Config {
-	allow := true
 	return &config.Config{
 		Server: config.Server{Hostname: "outboxd.test", Domain: "outboxd.test"},
 		Delivery: config.Delivery{
 			TLSMode:                  "opportunistic",
-			AllowPlaintext:           &allow,
+			AllowPlaintext:           new(true),
 			MaxAttempts:              5,
 			MaximumLifetime:          "1h",
 			InitialRetryDelay:        "1ms",
@@ -109,6 +113,7 @@ func testDeliverCfg() *config.Config {
 
 func mintTestCert(t *testing.T, cn string) (tls.Certificate, *x509.CertPool) {
 	t.Helper()
+
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -123,18 +128,21 @@ func mintTestCert(t *testing.T, cn string) (tls.Certificate, *x509.CertPool) {
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		DNSNames:     []string{cn},
 	}
+
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
 	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		t.Fatal(err)
@@ -146,7 +154,9 @@ func mintTestCert(t *testing.T, cn string) (tls.Certificate, *x509.CertPool) {
 	}
 
 	pool := x509.NewCertPool()
+
 	pool.AddCert(parsed)
+
 	return tlsCert, pool
 }
 
@@ -159,7 +169,9 @@ func serveCapOnly(ln net.Listener, utf8, eight bool) {
 
 		go func(c net.Conn) {
 			defer c.Close()
+
 			_, _ = io.WriteString(c, "220 mx\r\n")
+
 			br := bufio.NewReader(c)
 
 			for {
@@ -182,9 +194,11 @@ func serveCapOnly(ln net.Listener, utf8, eight bool) {
 					}
 
 					resp += "250 OK\r\n"
+
 					_, _ = io.WriteString(c, resp)
 				case strings.HasPrefix(upper, "QUIT"):
 					_, _ = io.WriteString(c, "221 bye\r\n")
+
 					return
 				default:
 					_, _ = io.WriteString(c, "250 OK\r\n")
@@ -197,17 +211,23 @@ func serveCapOnly(ln net.Listener, utf8, eight bool) {
 // startMiniMX is a minimal STARTTLS MX for package-internal tests.
 func startMiniMX(t *testing.T, startTLS bool, cert tls.Certificate, utf8, eight bool) (addr string, dataDone <-chan struct{}, conns *atomic.Int32) {
 	t.Helper()
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = ln.Close() })
+	t.Cleanup(func() {
+		_ = ln.Close()
+	})
+
 	done := make(chan struct{})
+
 	var (
 		closeDone sync.Once
 		n         atomic.Int32
 	)
+
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -216,12 +236,17 @@ func startMiniMX(t *testing.T, startTLS bool, cert tls.Certificate, utf8, eight 
 			}
 
 			n.Add(1)
+
 			go func(c net.Conn) {
 				defer c.Close()
+
 				rw := net.Conn(c)
+
 				br := bufio.NewReader(rw)
+
 				_, _ = io.WriteString(rw, "220 mx\r\n")
-				secured := false
+
+				var secured bool
 
 				for {
 					line, err := br.ReadString('\n')
@@ -247,17 +272,22 @@ func startMiniMX(t *testing.T, startTLS bool, cert tls.Certificate, utf8, eight 
 						}
 
 						resp += "250 OK\r\n"
+
 						_, _ = io.WriteString(rw, resp)
 					case strings.HasPrefix(upper, "STARTTLS"):
 						_, _ = io.WriteString(rw, "220 ready\r\n")
+
 						tc := tls.Server(rw, &tls.Config{Certificates: []tls.Certificate{cert}})
+
 						err = tc.Handshake()
 						if err != nil {
 							return
 						}
 
 						rw = tc
+
 						br = bufio.NewReader(rw)
+
 						secured = true
 					case strings.HasPrefix(upper, "MAIL FROM:"):
 						_, _ = io.WriteString(rw, "250 OK\r\n")
@@ -278,9 +308,13 @@ func startMiniMX(t *testing.T, startTLS bool, cert tls.Certificate, utf8, eight 
 						}
 
 						_, _ = io.WriteString(rw, "250 queued\r\n")
-						closeDone.Do(func() { close(done) })
+
+						closeDone.Do(func() {
+							close(done)
+						})
 					case strings.HasPrefix(upper, "QUIT"):
 						_, _ = io.WriteString(rw, "221 bye\r\n")
+
 						return
 					default:
 						_, _ = io.WriteString(rw, "250 OK\r\n")
@@ -289,12 +323,15 @@ func startMiniMX(t *testing.T, startTLS bool, cert tls.Certificate, utf8, eight 
 			}(c)
 		}
 	}()
+
 	return ln.Addr().String(), done, &n
 }
 
 func TestCandidateIPFallbackOrder(t *testing.T) {
 	cert, pool := mintTestCert(t, "mx.ex.com")
+
 	mxAddr, dataDone, conns := startMiniMX(t, true, cert, false, true)
+
 	ipBad := net.ParseIP("10.255.202.1")
 	ipGood := net.ParseIP("10.255.202.2")
 
@@ -303,17 +340,24 @@ func TestCandidateIPFallbackOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = q.Close() })
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	cfg := testDeliverCfg()
+
 	d := New(cfg, q, nopLogger{})
+
 	d.SetTLSRootCAs(pool)
 
 	// Preserve resolver order: bad then good.
 	d.orderIPs = func([]net.IP) {}
+
 	d.SetResolver(&fixedResolver{
 		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com.", Pref: 10}}},
 		ips: map[string][]net.IP{"mx.ex.com": {ipBad, ipGood}},
 	})
+
 	rec := &dialRec{fn: func(ctx context.Context, network, address string) (net.Conn, error) {
 		host, _, _ := net.SplitHostPort(address)
 		if host == ipBad.String() {
@@ -325,18 +369,23 @@ func TestCandidateIPFallbackOrder(t *testing.T) {
 		}
 
 		var nd net.Dialer
+
 		return nd.DialContext(ctx, "tcp", mxAddr)
 	}}
+
 	d.SetDialer(rec)
 
 	now := time.Now()
+
 	env := &queue.Envelope{
 		ID: "ipord", Username: "u", Sender: "a@ex.com",
 		Recipients:  []queue.Recipient{{Address: "b@ex.com", Domain: "ex.com", Status: queue.StatusPending}},
 		Created:     now,
 		NextAttempt: now,
 	}
+
 	body := []byte("From: a@ex.com\r\nTo: b@ex.com\r\nSubject: t\r\n\r\nHi\r\n")
+
 	err = q.Add(env, body)
 	if err != nil {
 		t.Fatal(err)
@@ -386,7 +435,10 @@ func TestDomainCapabilityAllSMTPUTF8Missing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = ln1.Close() })
+	t.Cleanup(func() {
+		_ = ln1.Close()
+	})
+
 	go serveCapOnly(ln1, false, true)
 
 	q, err := queue.Open(t.TempDir(), queue.Limits{})
@@ -394,26 +446,38 @@ func TestDomainCapabilityAllSMTPUTF8Missing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = q.Close() })
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	cfg := testDeliverCfg()
+
 	allow := true
+
 	cfg.Delivery.AllowPlaintext = &allow
 	cfg.Delivery.RequireValidMXTLSCert = false
+
 	d := New(cfg, q, nopLogger{})
+
 	ip := net.ParseIP("10.255.210.1")
+
 	d.SetResolver(&fixedResolver{
 		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com.", Pref: 10}}},
 		ips: map[string][]net.IP{"mx.ex.com": {ip}},
 	})
+
 	d.orderIPs = func([]net.IP) {}
+
 	d.SetDialer(dialMap(map[string]string{net.JoinHostPort(ip.String(), "25"): ln1.Addr().String()}))
 
 	now := time.Now()
+
 	env := &queue.Envelope{
 		ID: "cap1", Username: "u", Sender: "björn@ex.com",
 		Recipients: []queue.Recipient{{Address: "b@ex.com", Domain: "ex.com", Status: queue.StatusPending}},
 		Created:    now, NextAttempt: now, SMTPUTF8: true,
 	}
+
 	err = d.domain(context.Background(), env, "ex.com", []int{0})
 	if err != nil {
 		t.Fatalf("domain err=%v", err)
@@ -434,7 +498,10 @@ func TestDomainCapabilityAll8BitMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = ln1.Close() })
+	t.Cleanup(func() {
+		_ = ln1.Close()
+	})
+
 	go serveCapOnly(ln1, true, false)
 
 	q, err := queue.Open(t.TempDir(), queue.Limits{})
@@ -442,26 +509,38 @@ func TestDomainCapabilityAll8BitMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = q.Close() })
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	cfg := testDeliverCfg()
+
 	allow := true
+
 	cfg.Delivery.AllowPlaintext = &allow
 	cfg.Delivery.RequireValidMXTLSCert = false
+
 	d := New(cfg, q, nopLogger{})
+
 	ip := net.ParseIP("10.255.210.2")
+
 	d.SetResolver(&fixedResolver{
 		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com.", Pref: 10}}},
 		ips: map[string][]net.IP{"mx.ex.com": {ip}},
 	})
+
 	d.orderIPs = func([]net.IP) {}
+
 	d.SetDialer(dialMap(map[string]string{net.JoinHostPort(ip.String(), "25"): ln1.Addr().String()}))
 
 	now := time.Now()
+
 	env := &queue.Envelope{
 		ID: "cap8", Username: "u", Sender: "a@ex.com",
 		Recipients: []queue.Recipient{{Address: "b@ex.com", Domain: "ex.com", Status: queue.StatusPending}},
 		Created:    now, NextAttempt: now, EightBit: true,
 	}
+
 	err = d.domain(context.Background(), env, "ex.com", []int{0})
 	if err != nil {
 		t.Fatalf("domain err=%v", err)
@@ -482,14 +561,21 @@ func TestDomainMixedCapabilitiesCombined(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = lnA.Close() })
+	t.Cleanup(func() {
+		_ = lnA.Close()
+	})
+
 	go serveCapOnly(lnA, true, false)
+
 	lnB, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = lnB.Close() })
+	t.Cleanup(func() {
+		_ = lnB.Close()
+	})
+
 	go serveCapOnly(lnB, false, true)
 
 	q, err := queue.Open(t.TempDir(), queue.Limits{})
@@ -497,14 +583,22 @@ func TestDomainMixedCapabilitiesCombined(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = q.Close() })
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	cfg := testDeliverCfg()
+
 	allow := true
+
 	cfg.Delivery.AllowPlaintext = &allow
 	cfg.Delivery.RequireValidMXTLSCert = false
+
 	d := New(cfg, q, nopLogger{})
+
 	ipA := net.ParseIP("10.255.211.1")
 	ipB := net.ParseIP("10.255.211.2")
+
 	d.SetResolver(&fixedResolver{
 		mx: map[string][]*net.MX{"ex.com": {
 			{Host: "a.ex.com.", Pref: 10},
@@ -515,18 +609,22 @@ func TestDomainMixedCapabilitiesCombined(t *testing.T) {
 			"b.ex.com": {ipB},
 		},
 	})
+
 	d.orderIPs = func([]net.IP) {}
+
 	d.SetDialer(dialMap(map[string]string{
 		net.JoinHostPort(ipA.String(), "25"): lnA.Addr().String(),
 		net.JoinHostPort(ipB.String(), "25"): lnB.Addr().String(),
 	}))
 
 	now := time.Now()
+
 	env := &queue.Envelope{
 		ID: "bothcap", Username: "u", Sender: "björn@ex.com",
 		Recipients: []queue.Recipient{{Address: "b@ex.com", Domain: "ex.com", Status: queue.StatusPending}},
 		Created:    now, NextAttempt: now, SMTPUTF8: true, EightBit: true,
 	}
+
 	err = d.domain(context.Background(), env, "ex.com", []int{0})
 	if err != nil {
 		t.Fatalf("domain err=%v", err)
@@ -548,7 +646,10 @@ func TestDomainTempThenCapabilityKeepsPending(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = lnCap.Close() })
+	t.Cleanup(func() {
+		_ = lnCap.Close()
+	})
+
 	go serveCapOnly(lnCap, false, true)
 
 	q, err := queue.Open(t.TempDir(), queue.Limits{})
@@ -556,14 +657,22 @@ func TestDomainTempThenCapabilityKeepsPending(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = q.Close() })
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	cfg := testDeliverCfg()
+
 	allow := true
+
 	cfg.Delivery.AllowPlaintext = &allow
 	cfg.Delivery.RequireValidMXTLSCert = false
+
 	d := New(cfg, q, nopLogger{})
+
 	ipNet := net.ParseIP("10.255.212.1")
 	ipCap := net.ParseIP("10.255.212.2")
+
 	d.SetResolver(&fixedResolver{
 		mx: map[string][]*net.MX{"ex.com": {
 			{Host: "net.ex.com.", Pref: 10},
@@ -574,17 +683,21 @@ func TestDomainTempThenCapabilityKeepsPending(t *testing.T) {
 			"cap.ex.com": {ipCap},
 		},
 	})
+
 	d.orderIPs = func([]net.IP) {}
+
 	d.SetDialer(dialMap(map[string]string{
 		net.JoinHostPort(ipCap.String(), "25"): lnCap.Addr().String(),
 	}))
 
 	now := time.Now()
+
 	env := &queue.Envelope{
 		ID: "mix", Username: "u", Sender: "björn@ex.com",
 		Recipients: []queue.Recipient{{Address: "b@ex.com", Domain: "ex.com", Status: queue.StatusPending}},
 		Created:    now, NextAttempt: now, SMTPUTF8: true,
 	}
+
 	err = d.domain(context.Background(), env, "ex.com", []int{0})
 	if err == nil {
 		t.Fatal("expected temporary error from mixed outcomes")
@@ -605,17 +718,25 @@ func TestDomainTempThenPrivateKeepsPending(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = q.Close() })
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	cfg := testDeliverCfg()
+
 	cfg.Delivery.AllowPrivateDestinations = false
+
 	allow := true
+
 	cfg.Delivery.AllowPlaintext = &allow
 	cfg.Delivery.RequireValidMXTLSCert = false
+
 	d := New(cfg, q, nopLogger{})
 
 	// First MX: publicly-routable IP, unmapped dialer → temporary; second: private.
 	ipPub := net.ParseIP("8.8.8.8")
 	ipPriv := net.ParseIP("10.255.100.2")
+
 	d.SetResolver(&fixedResolver{
 		mx: map[string][]*net.MX{"ex.com": {
 			{Host: "net.ex.com.", Pref: 10},
@@ -626,15 +747,19 @@ func TestDomainTempThenPrivateKeepsPending(t *testing.T) {
 			"priv.ex.com": {ipPriv},
 		},
 	})
+
 	d.orderIPs = func([]net.IP) {}
+
 	d.SetDialer(dialMap(map[string]string{})) // unmapped → temp on public MX
 
 	now := time.Now()
+
 	env := &queue.Envelope{
 		ID: "privmix", Username: "u", Sender: "a@ex.com",
 		Recipients: []queue.Recipient{{Address: "b@ex.com", Domain: "ex.com", Status: queue.StatusPending}},
 		Created:    now, NextAttempt: now,
 	}
+
 	err = d.domain(context.Background(), env, "ex.com", []int{0})
 	if err == nil {
 		t.Fatal("expected temporary error when any candidate is retryable")
@@ -655,15 +780,24 @@ func TestDomainPrivateThenTempKeepsPending(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = q.Close() })
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	cfg := testDeliverCfg()
+
 	cfg.Delivery.AllowPrivateDestinations = false
+
 	allow := true
+
 	cfg.Delivery.AllowPlaintext = &allow
 	cfg.Delivery.RequireValidMXTLSCert = false
+
 	d := New(cfg, q, nopLogger{})
+
 	ipPriv := net.ParseIP("10.255.101.1")
 	ipPub := net.ParseIP("1.1.1.1")
+
 	d.SetResolver(&fixedResolver{
 		mx: map[string][]*net.MX{"ex.com": {
 			{Host: "priv.ex.com.", Pref: 10},
@@ -674,15 +808,19 @@ func TestDomainPrivateThenTempKeepsPending(t *testing.T) {
 			"net.ex.com":  {ipPub},
 		},
 	})
+
 	d.orderIPs = func([]net.IP) {}
+
 	d.SetDialer(dialMap(map[string]string{}))
 
 	now := time.Now()
+
 	env := &queue.Envelope{
 		ID: "privmix2", Username: "u", Sender: "a@ex.com",
 		Recipients: []queue.Recipient{{Address: "b@ex.com", Domain: "ex.com", Status: queue.StatusPending}},
 		Created:    now, NextAttempt: now,
 	}
+
 	err = d.domain(context.Background(), env, "ex.com", []int{0})
 	if err == nil {
 		t.Fatal("expected temporary error")
@@ -703,7 +841,10 @@ func TestDomainCapabilityThenTempKeepsPending(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = lnCap.Close() })
+	t.Cleanup(func() {
+		_ = lnCap.Close()
+	})
+
 	go serveCapOnly(lnCap, false, true)
 
 	q, err := queue.Open(t.TempDir(), queue.Limits{})
@@ -711,12 +852,19 @@ func TestDomainCapabilityThenTempKeepsPending(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = q.Close() })
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
 	cfg := testDeliverCfg()
+
 	allow := true
+
 	cfg.Delivery.AllowPlaintext = &allow
 	cfg.Delivery.RequireValidMXTLSCert = false
+
 	d := New(cfg, q, nopLogger{})
+
 	ipCap := net.ParseIP("10.255.213.1")
 	ipNet := net.ParseIP("10.255.213.2")
 
@@ -731,17 +879,21 @@ func TestDomainCapabilityThenTempKeepsPending(t *testing.T) {
 			"net.ex.com": {ipNet},
 		},
 	})
+
 	d.orderIPs = func([]net.IP) {}
+
 	d.SetDialer(dialMap(map[string]string{
 		net.JoinHostPort(ipCap.String(), "25"): lnCap.Addr().String(),
 	}))
 
 	now := time.Now()
+
 	env := &queue.Envelope{
 		ID: "mix2", Username: "u", Sender: "björn@ex.com",
 		Recipients: []queue.Recipient{{Address: "b@ex.com", Domain: "ex.com", Status: queue.StatusPending}},
 		Created:    now, NextAttempt: now, SMTPUTF8: true,
 	}
+
 	err = d.domain(context.Background(), env, "ex.com", []int{0})
 	if err == nil {
 		t.Fatal("expected temporary error")
@@ -759,29 +911,44 @@ func TestRunQueueErrorCancelsAttemptsBeforeWait(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = q.Close() })
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
 
 	cfg := testDeliverCfg()
+
 	cfg.Delivery.MaxAttempts = 5
 	cfg.Delivery.ConnectionTimeout = "30s"
 	cfg.Delivery.SubmissionTimeout = "30s"
+
 	d := New(cfg, q, nopLogger{})
 
 	dialStarted := make(chan struct{})
 	dialCanceled := make(chan struct{})
+
 	var startOnce, cancelOnce sync.Once
+
 	d.SetResolver(&fixedResolver{
 		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com.", Pref: 10}}},
 		ips: map[string][]net.IP{"mx.ex.com": {net.ParseIP("127.0.0.1")}},
 	})
+
 	d.SetDialer(dialFn(func(ctx context.Context, network, address string) (net.Conn, error) {
-		startOnce.Do(func() { close(dialStarted) })
+		startOnce.Do(func() {
+			close(dialStarted)
+		})
+
 		<-ctx.Done()
-		cancelOnce.Do(func() { close(dialCanceled) })
+
+		cancelOnce.Do(func() {
+			close(dialCanceled)
+		})
+
 		return nil, ctx.Err()
 	}))
 
 	now := time.Now()
+
 	env := &queue.Envelope{
 		ID: "hang-q", Username: "user", Sender: "sender@example.com",
 		Recipients: []queue.Recipient{{
@@ -789,21 +956,27 @@ func TestRunQueueErrorCancelsAttemptsBeforeWait(t *testing.T) {
 		}},
 		Created: now, NextAttempt: now,
 	}
+
 	body := []byte("From: sender@example.com\r\nTo: r@ex.com\r\nSubject: t\r\n\r\nHi\r\n")
+
 	err = q.Add(env, body)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	sentinel := errors.New("queue next failed")
+
 	var calls atomic.Int32
+
 	realNext := q.Next
+
 	d.next = func(ctx context.Context) (*queue.Envelope, error) {
 		if calls.Add(1) == 1 {
 			return realNext(ctx)
 		}
 
 		<-dialStarted
+
 		return nil, sentinel
 	}
 
@@ -811,7 +984,10 @@ func TestRunQueueErrorCancelsAttemptsBeforeWait(t *testing.T) {
 	defer cancel()
 
 	done := make(chan error, 1)
-	go func() { done <- d.Run(ctx) }()
+
+	go func() {
+		done <- d.Run(ctx)
+	}()
 
 	select {
 	case err := <-done:
@@ -827,6 +1003,7 @@ func TestRunQueueErrorCancelsAttemptsBeforeWait(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		cancel()
 		<-done
+
 		t.Fatal("Run hung after queue error; cancel must run before wg.Wait")
 	}
 }

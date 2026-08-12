@@ -11,7 +11,9 @@ import (
 // on the filesystem that contains path.
 func FreeBytes(path string) (int64, error) {
 	var st syscall.Statfs_t
-	if err := syscall.Statfs(path, &st); err != nil {
+
+	err := syscall.Statfs(path, &st)
+	if err != nil {
 		return 0, fmt.Errorf("statfs %s: %w", path, err)
 	}
 

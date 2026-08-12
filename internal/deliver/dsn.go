@@ -48,8 +48,10 @@ func (d *Deliverer) ensureDSN(envelope *queue.Envelope) error {
 		}
 
 		signed := make([]byte, 0, len(sig)+len(msg))
+
 		signed = append(signed, sig...)
 		signed = append(signed, msg...)
+
 		msg = signed
 	}
 
@@ -62,16 +64,18 @@ func (d *Deliverer) ensureDSN(envelope *queue.Envelope) error {
 
 	// EightBit is required only when transmitted bytes contain high-bit octets,
 	// not merely because a part declares an 8bit transfer encoding.
-	eightBit := false
+	var eightBit bool
 
 	for _, b := range msg {
 		if b >= 0x80 {
 			eightBit = true
+
 			break
 		}
 	}
 
 	now := time.Now()
+
 	dsnEnv := &queue.Envelope{
 		ID:       dsnID,
 		Username: generatedDSNOwner,
@@ -102,6 +106,7 @@ func readDSNOriginal(r io.ReadCloser) (original []byte, err error) {
 			err = closeErr
 		}
 	}()
+
 	original, err = io.ReadAll(io.LimitReader(r, dsnOriginalLimit+1))
 	if err != nil {
 		return nil, err
@@ -147,20 +152,25 @@ func buildDSN(hostname string, env *queue.Envelope, original []byte) ([]byte, er
 
 	now := time.Now().UTC()
 	arrival := env.Created.UTC()
+
 	global := dsnReportUTF8(env)
+
 	reportType := "delivery-status"
 	statusMediaType := "message/delivery-status"
 	addressType := "rfc822"
 	originalMediaType := "message/rfc822"
+
 	if global {
 		reportType = "global-delivery-status"
 		statusMediaType = "message/global-delivery-status"
 		addressType = "utf-8"
 		originalMediaType = "message/global"
 	}
+
 	msgID := fmt.Sprintf("<%s@%s>", dsnEnvelopeID(env.ID, env.Incarnation, env.DSNGeneration), hostname)
 
 	var human bytes.Buffer
+
 	fmt.Fprintf(&human, "This is the mail system at host %s.\r\n\r\n", hostname)
 	human.WriteString("I'm sorry to have to inform you that your message could not\r\n")
 	human.WriteString("be delivered to one or more recipients.\r\n\r\n")
@@ -170,6 +180,7 @@ func buildDSN(hostname string, env *queue.Envelope, original []byte) ([]byte, er
 	}
 
 	var report bytes.Buffer
+
 	fmt.Fprintf(&report, "Reporting-MTA: dns; %s\r\n", hostname)
 	fmt.Fprintf(&report, "Arrival-Date: %s\r\n", arrival.Format(time.RFC1123Z))
 	fmt.Fprintf(&report, "X-Original-Envelope-ID: %s\r\n", env.ID)
@@ -198,6 +209,7 @@ func buildDSN(hostname string, env *queue.Envelope, original []byte) ([]byte, er
 	}
 
 	var out bytes.Buffer
+
 	fmt.Fprintf(&out, "From: Mail Delivery System <MAILER-DAEMON@%s>\r\n", hostname)
 	fmt.Fprintf(&out, "To: <%s>\r\n", env.Sender)
 	out.WriteString("Subject: Undelivered Mail Returned to Sender\r\n")
@@ -293,6 +305,7 @@ func randomBoundary() (string, error) {
 func sanitizeHeader(s string) string {
 	s = strings.ReplaceAll(s, "\r", " ")
 	s = strings.ReplaceAll(s, "\n", " ")
+
 	if len(s) > 200 {
 		s = s[:200]
 

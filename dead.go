@@ -75,6 +75,7 @@ func dead(configPath string, arguments []string) error {
 			DeadRetention:       config.Duration(cfg.Server.DeadRetention),
 			CorruptRetention:    config.Duration(cfg.Server.CorruptRetention),
 		})
+
 		if err != nil {
 			if errors.Is(err, disk.ErrLocked) {
 				return errors.New("outboxd is running and holds the queue lock; stop it before retrying dead-letter messages")
@@ -84,7 +85,9 @@ func dead(configPath string, arguments []string) error {
 		}
 
 		defer spool.Close()
+
 		spool.FreeDisk = disk.FreeBytes
+
 		return deadRetry(spool, arguments[1])
 	case "delete":
 		if len(arguments) != 2 {
@@ -97,6 +100,7 @@ func dead(configPath string, arguments []string) error {
 		}
 
 		defer spool.Close()
+
 		return spool.DeleteDead(arguments[1])
 	default:
 		return fmt.Errorf("unknown dead subcommand %q", arguments[0])
@@ -147,6 +151,7 @@ func corrupt(configPath string, arguments []string) error {
 		}
 
 		defer spool.Close()
+
 		return spool.DeleteCorrupt(arguments[1])
 	default:
 		return fmt.Errorf("unknown corrupt subcommand %q", arguments[0])
@@ -165,6 +170,7 @@ func openAdministrativeSpool(queueDir string, cfg *config.Config) (*queue.Queue,
 		DeadRetention:       config.Duration(cfg.Server.DeadRetention),
 		CorruptRetention:    config.Duration(cfg.Server.CorruptRetention),
 	})
+
 	if errors.Is(err, disk.ErrLocked) {
 		return nil, errors.New("outboxd is running and holds the queue lock; stop it before modifying stored queue entries")
 	}
@@ -184,6 +190,7 @@ func deadList(spool *queue.Queue) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+
 	fmt.Fprintln(w, "ID\tSENDER\tRECIPIENTS\tERROR")
 
 	for _, id := range ids {
@@ -206,12 +213,15 @@ func deadShow(spool *queue.Queue, id string) error {
 	}
 
 	enc := json.NewEncoder(os.Stdout)
+
 	enc.SetIndent("", "  ")
+
 	return enc.Encode(env)
 }
 
 func deadRetry(spool *queue.Queue, id string) error {
 	reportQueueIssues(os.Stderr, spool)
+
 	env, err := spool.ReviveDead(id)
 	if err != nil {
 		if env != nil {
@@ -222,6 +232,7 @@ func deadRetry(spool *queue.Queue, id string) error {
 	}
 
 	fmt.Printf("requeued %s\n", env.ID)
+
 	return nil
 }
 

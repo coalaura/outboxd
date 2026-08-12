@@ -129,7 +129,6 @@ func Write(cfg *config.Config, dkim string) (string, []byte, error) {
 	}
 
 	var buffer bytes.Buffer
-
 	buffer.Grow(4096)
 
 	fmt.Fprintf(&buffer, "DNS setup for %s (%s)\n", cfg.Server.Domain, time.Now().Format(time.RFC3339))
@@ -235,6 +234,7 @@ func spfOwnerNames(cfg *config.Config) []string {
 	hostname := strings.TrimSuffix(strings.ToLower(cfg.Server.Hostname), ".") + "."
 
 	var owners []string
+
 	add := func(name string) {
 		name = strings.TrimSuffix(strings.ToLower(name), ".") + "."
 		if name == "." {
@@ -302,11 +302,13 @@ func dmarc(cfg *config.Config) string {
 
 func external(reportURI, orgDomain string) []string {
 	var domains []string
+
 	orgDomain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(orgDomain), "."))
 
 	for uri := range strings.SplitSeq(reportURI, ",") {
 		uri = strings.TrimSpace(uri)
 		uri = trimDMARCSize(uri)
+
 		parsed, err := url.Parse(uri)
 		if err != nil {
 			continue
@@ -345,6 +347,7 @@ func trimDMARCSize(value string) string {
 	}
 
 	suffix := value[bang+1:]
+
 	unit := suffix[len(suffix)-1]
 	if unit == 'k' || unit == 'K' || unit == 'm' || unit == 'M' || unit == 'g' || unit == 'G' || unit == 't' || unit == 'T' {
 		suffix = suffix[:len(suffix)-1]

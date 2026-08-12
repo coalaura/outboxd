@@ -42,25 +42,6 @@ type Resolver interface {
 	LookupMX(ctx context.Context, name string) ([]*net.MX, error)
 }
 
-// DefaultResolver uses the process-wide resolver.
-type DefaultResolver struct{}
-
-func (DefaultResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
-	return net.DefaultResolver.LookupIPAddr(ctx, host)
-}
-
-func (DefaultResolver) LookupAddr(ctx context.Context, addr string) ([]string, error) {
-	return net.DefaultResolver.LookupAddr(ctx, addr)
-}
-
-func (DefaultResolver) LookupTXT(ctx context.Context, name string) ([]string, error) {
-	return net.DefaultResolver.LookupTXT(ctx, name)
-}
-
-func (DefaultResolver) LookupMX(ctx context.Context, name string) ([]*net.MX, error) {
-	return net.DefaultResolver.LookupMX(ctx, name)
-}
-
 // DKIMKey is the local DKIM public key material used to verify the published record.
 type DKIMKey struct {
 	// Selector is the DNS selector label.
@@ -84,6 +65,25 @@ type Options struct {
 	Now func() time.Time
 }
 
+// DefaultResolver uses the process-wide resolver.
+type DefaultResolver struct{}
+
+func (DefaultResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
+	return net.DefaultResolver.LookupIPAddr(ctx, host)
+}
+
+func (DefaultResolver) LookupAddr(ctx context.Context, addr string) ([]string, error) {
+	return net.DefaultResolver.LookupAddr(ctx, addr)
+}
+
+func (DefaultResolver) LookupTXT(ctx context.Context, name string) ([]string, error) {
+	return net.DefaultResolver.LookupTXT(ctx, name)
+}
+
+func (DefaultResolver) LookupMX(ctx context.Context, name string) ([]*net.MX, error) {
+	return net.DefaultResolver.LookupMX(ctx, name)
+}
+
 // Run executes deployment checks and returns every result.
 func Run(ctx context.Context, opts Options) []Result {
 	if opts.Resolver == nil {
@@ -95,15 +95,18 @@ func Run(ctx context.Context, opts Options) []Result {
 	}
 
 	cfg := opts.Config
+
 	r := opts.Resolver
 
 	var out []Result
+
 	out = append(out, checkHostnameAddrs(ctx, r, cfg)...)
 	out = append(out, checkFCrDNS(ctx, r, cfg)...)
 	out = append(out, checkSPF(ctx, r, cfg)...)
 	out = append(out, checkDKIM(ctx, r, cfg, opts.DKIM)...)
 	out = append(out, checkDMARC(ctx, r, cfg)...)
 	out = append(out, checkEnvelopeMX(ctx, r, cfg)...)
+
 	return out
 }
 
@@ -150,32 +153,46 @@ func checkHostnameAddrs(ctx context.Context, r Resolver, cfg *config.Config) []R
 
 	if cfg.DNS.PublicIPv4 != "" {
 		if !have4[cfg.DNS.PublicIPv4] {
-			rs = append(rs, Result{Name: name + "_a", Level: Fail,
-				Message: fmt.Sprintf("%s A records do not include configured public_ipv4 %s (have %v)", host, cfg.DNS.PublicIPv4, keys(have4))})
+			rs = append(rs, Result{
+				Name:    name + "_a",
+				Level:   Fail,
+				Message: fmt.Sprintf("%s A records do not include configured public_ipv4 %s (have %v)", host, cfg.DNS.PublicIPv4, keys(have4)),
+			})
 		} else {
-			rs = append(rs, Result{Name: name + "_a", Level: Pass,
-				Message: fmt.Sprintf("%s A includes %s", host, cfg.DNS.PublicIPv4)})
+			rs = append(rs, Result{
+				Name:    name + "_a",
+				Level:   Pass,
+				Message: fmt.Sprintf("%s A includes %s", host, cfg.DNS.PublicIPv4),
+			})
 		}
 	}
 
 	if cfg.DNS.PublicIPv6 != "" {
+		var found bool
+
 		want := net.ParseIP(cfg.DNS.PublicIPv6)
-		found := false
 		if want != nil {
 			for ip := range have6 {
 				if net.ParseIP(ip).Equal(want) {
 					found = true
+
 					break
 				}
 			}
 		}
 
 		if !found {
-			rs = append(rs, Result{Name: name + "_aaaa", Level: Fail,
-				Message: fmt.Sprintf("%s AAAA records do not include configured public_ipv6 %s", host, cfg.DNS.PublicIPv6)})
+			rs = append(rs, Result{
+				Name:    name + "_aaaa",
+				Level:   Fail,
+				Message: fmt.Sprintf("%s AAAA records do not include configured public_ipv6 %s", host, cfg.DNS.PublicIPv6),
+			})
 		} else {
-			rs = append(rs, Result{Name: name + "_aaaa", Level: Pass,
-				Message: fmt.Sprintf("%s AAAA includes %s", host, cfg.DNS.PublicIPv6)})
+			rs = append(rs, Result{
+				Name:    name + "_aaaa",
+				Level:   Pass,
+				Message: fmt.Sprintf("%s AAAA includes %s", host, cfg.DNS.PublicIPv6),
+			})
 		}
 	}
 
@@ -184,6 +201,7 @@ func checkHostnameAddrs(ctx context.Context, r Resolver, cfg *config.Config) []R
 
 func checkFCrDNS(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 	host := strings.ToLower(strings.TrimSuffix(cfg.Server.Hostname, "."))
+
 	var rs []Result
 
 	checkIP := func(ip string, label string) {
@@ -198,67 +216,98 @@ func checkFCrDNS(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 			return
 		}
 
-		matched := false
+		var matched bool
 
 		for _, n := range names {
 			n = strings.ToLower(strings.TrimSuffix(n, "."))
 			if n == host {
 				matched = true
+
 				break
 			}
 		}
 
 		if !matched {
-			rs = append(rs, Result{Name: name, Level: Fail,
-				Message: fmt.Sprintf("PTR for %s is %v, want %s", ip, names, host)})
+			rs = append(rs, Result{
+				Name:    name,
+				Level:   Fail,
+				Message: fmt.Sprintf("PTR for %s is %v, want %s", ip, names, host),
+			})
+
 			return
 		}
 
 		// Confirm forward match again from PTR target.
 		addrs, err := r.LookupIPAddr(ctx, host)
 		if err != nil {
-			rs = append(rs, Result{Name: name, Level: Fail, Message: fmt.Sprintf("forward lookup after PTR: %v", err)})
+			rs = append(rs, Result{
+				Name:    name,
+				Level:   Fail,
+				Message: fmt.Sprintf("forward lookup after PTR: %v", err),
+			})
+
 			return
 		}
 
 		want := net.ParseIP(ip)
-		ok := false
+
+		var ok bool
 
 		for _, a := range addrs {
 			if a.IP.Equal(want) {
 				ok = true
+
 				break
 			}
 		}
 
 		if !ok {
-			rs = append(rs, Result{Name: name, Level: Fail,
-				Message: fmt.Sprintf("FCrDNS broken: PTR is %s but A/AAAA does not include %s", host, ip)})
+			rs = append(rs, Result{
+				Name:    name,
+				Level:   Fail,
+				Message: fmt.Sprintf("FCrDNS broken: PTR is %s but A/AAAA does not include %s", host, ip),
+			})
+
 			return
 		}
 
-		rs = append(rs, Result{Name: name, Level: Pass, Message: fmt.Sprintf("FCrDNS ok for %s ↔ %s", ip, host)})
+		rs = append(rs, Result{
+			Name:    name,
+			Level:   Pass,
+			Message: fmt.Sprintf("FCrDNS ok for %s ↔ %s", ip, host),
+		})
 	}
 
 	checkIP(cfg.DNS.PublicIPv4, "v4")
 	checkIP(cfg.DNS.PublicIPv6, "v6")
 
 	if len(rs) == 0 {
-		rs = append(rs, Result{Name: "fcrdns", Level: Fail, Message: "no public IPs configured"})
+		rs = append(rs, Result{
+			Name:    "fcrdns",
+			Level:   Fail,
+			Message: "no public IPs configured",
+		})
 	}
 
 	return rs
 }
 
 func checkSPF(ctx context.Context, r Resolver, cfg *config.Config) []Result {
-	owners := requiredSPFOwners(cfg)
 	var rs []Result
+
+	owners := requiredSPFOwners(cfg)
 
 	for _, owner := range owners {
 		name := "spf_" + strings.TrimSuffix(owner, ".")
+
 		txts, err := r.LookupTXT(ctx, strings.TrimSuffix(owner, "."))
 		if err != nil {
-			rs = append(rs, Result{Name: name, Level: Fail, Message: fmt.Sprintf("TXT lookup %s: %v", owner, err)})
+			rs = append(rs, Result{
+				Name:    name,
+				Level:   Fail,
+				Message: fmt.Sprintf("TXT lookup %s: %v", owner, err),
+			})
+
 			continue
 		}
 
@@ -266,6 +315,7 @@ func checkSPF(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 
 		for _, t := range txts {
 			tt := strings.TrimSpace(t)
+
 			fields := strings.Fields(tt)
 			if len(fields) > 0 && strings.EqualFold(fields[0], "v=spf1") {
 				spf = append(spf, tt)
@@ -274,16 +324,29 @@ func checkSPF(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 
 		switch len(spf) {
 		case 0:
-			rs = append(rs, Result{Name: name, Level: Fail, Message: fmt.Sprintf("no SPF TXT at %s", owner)})
+			rs = append(rs, Result{
+				Name:    name,
+				Level:   Fail,
+				Message: fmt.Sprintf("no SPF TXT at %s", owner),
+			})
 		case 1:
 			want := normalizeSPF(cfg.ExpectedSPF())
 			if normalizeSPF(spf[0]) != want {
-				rs = append(rs, Result{Name: name, Level: Fail, Message: fmt.Sprintf("SPF at %s does not match configured policy: got %q, want %q", owner, spf[0], cfg.ExpectedSPF())})
+				rs = append(rs, Result{Name: name,
+					Level:   Fail,
+					Message: fmt.Sprintf("SPF at %s does not match configured policy: got %q, want %q", owner, spf[0], cfg.ExpectedSPF()),
+				})
 			} else {
-				rs = append(rs, Result{Name: name, Level: Pass, Message: fmt.Sprintf("SPF at %s matches configured policy", owner)})
+				rs = append(rs, Result{Name: name,
+					Level:   Pass,
+					Message: fmt.Sprintf("SPF at %s matches configured policy", owner),
+				})
 			}
 		default:
-			rs = append(rs, Result{Name: name, Level: Fail, Message: fmt.Sprintf("%d SPF TXT records at %s (must be exactly one)", len(spf), owner)})
+			rs = append(rs, Result{Name: name,
+				Level:   Fail,
+				Message: fmt.Sprintf("%d SPF TXT records at %s (must be exactly one)", len(spf), owner),
+			})
 		}
 	}
 
@@ -293,6 +356,7 @@ func checkSPF(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 func requiredSPFOwners(cfg *config.Config) []string {
 	domain := strings.ToLower(strings.TrimSuffix(cfg.Server.Domain, "."))
 	hostname := strings.ToLower(strings.TrimSuffix(cfg.Server.Hostname, "."))
+
 	set := map[string]struct{}{domain: {}}
 
 	for i := range cfg.Users {
@@ -300,6 +364,7 @@ func requiredSPFOwners(cfg *config.Config) []string {
 			sender = strings.TrimSpace(sender)
 			if strings.HasPrefix(sender, "*@") {
 				set[strings.ToLower(sender[2:])] = struct{}{}
+
 				continue
 			}
 
@@ -323,6 +388,7 @@ func requiredSPFOwners(cfg *config.Config) []string {
 	}
 
 	sort.Strings(owners)
+
 	return owners
 }
 
@@ -337,7 +403,11 @@ func checkDKIM(ctx context.Context, r Resolver, cfg *config.Config, key *DKIMKey
 
 	txts, err := r.LookupTXT(ctx, name)
 	if err != nil {
-		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("TXT lookup %s: %v", name, err)}}
+		return []Result{{
+			Name:    checkName,
+			Level:   Fail,
+			Message: fmt.Sprintf("TXT lookup %s: %v", name, err),
+		}}
 	}
 
 	var dkim []string
@@ -350,30 +420,52 @@ func checkDKIM(ctx context.Context, r Resolver, cfg *config.Config, key *DKIMKey
 	}
 
 	if len(dkim) == 0 {
-		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("no DKIM TXT at %s", name)}}
+		return []Result{{
+			Name:    checkName,
+			Level:   Fail,
+			Message: fmt.Sprintf("no DKIM TXT at %s", name),
+		}}
 	}
 
 	if len(dkim) > 1 {
-		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("multiple DKIM TXT at %s", name)}}
+		return []Result{{
+			Name:    checkName,
+			Level:   Fail,
+			Message: fmt.Sprintf("multiple DKIM TXT at %s", name),
+		}}
 	}
 
 	if key == nil || key.PublicKey == "" {
-		return []Result{{Name: checkName, Level: Warn,
-			Message: fmt.Sprintf("DKIM TXT present at %s (local key not provided for comparison)", name)}}
+		return []Result{{
+			Name:    checkName,
+			Level:   Warn,
+			Message: fmt.Sprintf("DKIM TXT present at %s (local key not provided for comparison)", name),
+		}}
 	}
 
 	pub, ok := dkimP(dkim[0])
 	if !ok {
-		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("DKIM TXT at %s missing p=", name)}}
+		return []Result{{
+			Name:    checkName,
+			Level:   Fail,
+			Message: fmt.Sprintf("DKIM TXT at %s missing p=", name),
+		}}
 	}
 
 	// Compare base64 payloads (ignore padding differences).
 	if normalizeB64(pub) != normalizeB64(key.PublicKey) {
-		return []Result{{Name: checkName, Level: Fail,
-			Message: fmt.Sprintf("DKIM p= at %s does not match the loaded private key", name)}}
+		return []Result{{
+			Name:    checkName,
+			Level:   Fail,
+			Message: fmt.Sprintf("DKIM p= at %s does not match the loaded private key", name),
+		}}
 	}
 
-	return []Result{{Name: checkName, Level: Pass, Message: fmt.Sprintf("DKIM selector %s matches loaded key", selector)}}
+	return []Result{{
+		Name:    checkName,
+		Level:   Pass,
+		Message: fmt.Sprintf("DKIM selector %s matches loaded key", selector),
+	}}
 }
 
 func checkDMARC(ctx context.Context, r Resolver, cfg *config.Config) []Result {
@@ -382,13 +474,18 @@ func checkDMARC(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 
 	txts, err := r.LookupTXT(ctx, name)
 	if err != nil {
-		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("TXT lookup %s: %v", name, err)}}
+		return []Result{{
+			Name:    checkName,
+			Level:   Fail,
+			Message: fmt.Sprintf("TXT lookup %s: %v", name, err),
+		}}
 	}
 
 	var found []string
 
 	for _, t := range txts {
 		tt := strings.TrimSpace(t)
+
 		first, _, _ := strings.Cut(tt, ";")
 		if strings.EqualFold(strings.TrimSpace(first), "v=DMARC1") {
 			found = append(found, tt)
@@ -396,16 +493,28 @@ func checkDMARC(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 	}
 
 	if len(found) == 0 {
-		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("no DMARC TXT at %s", name)}}
+		return []Result{{
+			Name:    checkName,
+			Level:   Fail,
+			Message: fmt.Sprintf("no DMARC TXT at %s", name),
+		}}
 	}
 
 	if len(found) > 1 {
-		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("multiple DMARC TXT at %s", name)}}
+		return []Result{{
+			Name:    checkName,
+			Level:   Fail,
+			Message: fmt.Sprintf("multiple DMARC TXT at %s", name),
+		}}
 	}
 
 	tags, err := parseDMARCTags(found[0])
 	if err != nil {
-		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("DMARC record invalid: %v", err)}}
+		return []Result{{
+			Name:    checkName,
+			Level:   Fail,
+			Message: fmt.Sprintf("DMARC record invalid: %v", err),
+		}}
 	}
 
 	p := strings.ToLower(tags["p"])
@@ -413,9 +522,17 @@ func checkDMARC(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 	switch p {
 	case "none", "quarantine", "reject":
 	case "":
-		return []Result{{Name: checkName, Level: Fail, Message: "DMARC record missing p="}}
+		return []Result{{
+			Name:    checkName,
+			Level:   Fail,
+			Message: "DMARC record missing p=",
+		}}
 	default:
-		return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("DMARC p=%q is not none/quarantine/reject", p)}}
+		return []Result{{
+			Name:    checkName,
+			Level:   Fail,
+			Message: fmt.Sprintf("DMARC p=%q is not none/quarantine/reject", p),
+		}}
 	}
 
 	want := strings.ToLower(cfg.DNS.DMARC)
@@ -425,6 +542,7 @@ func checkDMARC(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 
 	level := Pass
 	msg := fmt.Sprintf("DMARC p=%s", p)
+
 	if p != want {
 		level = Fail
 		msg = fmt.Sprintf("DMARC p=%s does not match config dmarc_policy=%s", p, want)
@@ -443,11 +561,19 @@ func checkDMARC(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 	} else {
 		err = config.ValidateDMARCReportURIList(rua)
 		if err != nil {
-			return []Result{{Name: checkName, Level: Fail, Message: fmt.Sprintf("DMARC rua invalid: %v", err)}}
+			return []Result{{
+				Name:    checkName,
+				Level:   Fail,
+				Message: fmt.Sprintf("DMARC rua invalid: %v", err),
+			}}
 		}
 	}
 
-	return []Result{{Name: checkName, Level: level, Message: msg}}
+	return []Result{{
+		Name:    checkName,
+		Level:   level,
+		Message: msg,
+	}}
 }
 
 func parseDMARCTags(record string) (map[string]string, error) {
@@ -466,6 +592,7 @@ func parseDMARCTags(record string) (map[string]string, error) {
 
 		key, value, ok := strings.Cut(part, "=")
 		key, value = strings.ToLower(strings.TrimSpace(key)), strings.TrimSpace(value)
+
 		if !ok || key == "" || value == "" || !asciiLetters(key) {
 			return nil, fmt.Errorf("malformed tag %q", part)
 		}
@@ -496,14 +623,16 @@ func asciiLetters(value string) bool {
 }
 
 func checkEnvelopeMX(ctx context.Context, r Resolver, cfg *config.Config) []Result {
-	domains := envelopeDomains(cfg)
 	var rs []Result
+
+	domains := envelopeDomains(cfg)
 
 	for _, d := range domains {
 		name := "envelope_mx_" + d
+
 		mxs, err := r.LookupMX(ctx, d)
 		if err == nil && len(mxs) > 0 {
-			null := 0
+			var null int
 
 			for _, mx := range mxs {
 				if mx != nil && strings.TrimSpace(mx.Host) == "." {
@@ -517,19 +646,33 @@ func checkEnvelopeMX(ctx context.Context, r Resolver, cfg *config.Config) []Resu
 					message = fmt.Sprintf("%s publishes an invalid null MX mixed with other MX records", d)
 				}
 
-				rs = append(rs, Result{Name: name, Level: Fail, Message: message})
+				rs = append(rs, Result{
+					Name:    name,
+					Level:   Fail,
+					Message: message,
+				})
+
 				continue
 			}
 
-			rs = append(rs, Result{Name: name, Level: Pass, Message: fmt.Sprintf("%s has MX", d)})
+			rs = append(rs, Result{
+				Name:    name,
+				Level:   Pass,
+				Message: fmt.Sprintf("%s has MX", d),
+			})
+
 			continue
 		}
 
 		// Implicit MX: A/AAAA on the domain apex (RFC 5321).
 		addrs, aerr := r.LookupIPAddr(ctx, d)
 		if aerr == nil && len(addrs) > 0 {
-			rs = append(rs, Result{Name: name, Level: Warn,
-				Message: fmt.Sprintf("%s has no MX; using A/AAAA implicit MX (ensure a mailbox accepts bounces)", d)})
+			rs = append(rs, Result{
+				Name:    name,
+				Level:   Warn,
+				Message: fmt.Sprintf("%s has no MX; using A/AAAA implicit MX (ensure a mailbox accepts bounces)", d),
+			})
+
 			continue
 		}
 
@@ -538,7 +681,11 @@ func checkEnvelopeMX(ctx context.Context, r Resolver, cfg *config.Config) []Resu
 			msg = fmt.Sprintf("%s MX lookup failed (%v) and no A/AAAA", d, err)
 		}
 
-		rs = append(rs, Result{Name: name, Level: Fail, Message: msg})
+		rs = append(rs, Result{
+			Name:    name,
+			Level:   Fail,
+			Message: msg,
+		})
 	}
 
 	return rs
@@ -554,6 +701,7 @@ func envelopeDomains(cfg *config.Config) []string {
 			sender = strings.TrimSpace(sender)
 			if strings.HasPrefix(sender, "*@") {
 				set[strings.ToLower(strings.TrimSuffix(sender[2:], "."))] = struct{}{}
+
 				continue
 			}
 
@@ -573,6 +721,7 @@ func envelopeDomains(cfg *config.Config) []string {
 	}
 
 	sort.Strings(out)
+
 	return out
 }
 
@@ -584,6 +733,7 @@ func keys(m map[string]bool) []string {
 	}
 
 	sort.Strings(out)
+
 	return out
 }
 
@@ -593,6 +743,7 @@ func collapseSpaces(s string) string {
 
 func dkimP(record string) (string, bool) {
 	tags := parseTags(record)
+
 	p, ok := tags["p"]
 	return p, ok
 }
@@ -619,6 +770,7 @@ func parseTags(record string) map[string]string {
 
 func normalizeB64(s string) string {
 	s = collapseSpaces(s)
+
 	raw, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
 		raw, err = base64.RawStdEncoding.DecodeString(s)

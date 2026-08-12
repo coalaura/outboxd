@@ -27,6 +27,7 @@ type servingCertificateCase struct {
 
 func ensureWithDir(t *testing.T, dir, mode string) (*Keeper, bool, error) {
 	t.Helper()
+
 	k := &Keeper{
 		certificateFile: filepath.Join(dir, "server.crt"),
 		privateKeyFile:  filepath.Join(dir, "server.key"),
@@ -34,6 +35,7 @@ func ensureWithDir(t *testing.T, dir, mode string) (*Keeper, bool, error) {
 		hostname:        "mail.test.example",
 		mode:            mode,
 	}
+
 	created, err := k.ensureFiles()
 	if err != nil {
 		return nil, false, err
@@ -49,6 +51,7 @@ func ensureWithDir(t *testing.T, dir, mode string) (*Keeper, bool, error) {
 
 func TestSelfSignedLeafNotCA(t *testing.T) {
 	dir := t.TempDir()
+
 	k, created, err := ensureWithDir(t, dir, "self_signed")
 	if err != nil {
 		t.Fatal(err)
@@ -75,7 +78,7 @@ func TestSelfSignedLeafNotCA(t *testing.T) {
 		t.Fatal("must have DigitalSignature")
 	}
 
-	found := false
+	var found bool
 
 	for _, u := range leaf.ExtKeyUsage {
 		if u == x509.ExtKeyUsageServerAuth {
@@ -98,9 +101,11 @@ func TestPartialPairSelfSignedPreservesConfiguredFile(t *testing.T) {
 
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
+
 			path := filepath.Join(dir, name)
 			body := []byte("operator bytes must remain")
 			mode := os.FileMode(0644)
+
 			if name == "server.key" {
 				mode = 0600
 			}
@@ -139,18 +144,21 @@ func TestPartialPairSelfSignedPreservesConfiguredFile(t *testing.T) {
 
 func TestSelfSignedGenerationRecoversMarkedPartialPair(t *testing.T) {
 	source := t.TempDir()
+
 	err := writeSelfSigned(source, "mail.test.example")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	dir := t.TempDir()
+
 	k := &Keeper{
 		certificateFile: filepath.Join(dir, "server.crt"),
 		privateKeyFile:  filepath.Join(dir, "server.key"),
 		hostname:        "mail.test.example",
 		mode:            "self_signed",
 	}
+
 	key, err := os.ReadFile(filepath.Join(source, "server.key"))
 	if err != nil {
 		t.Fatal(err)
@@ -186,9 +194,7 @@ func TestSelfSignedGenerationRecoversMarkedPartialPair(t *testing.T) {
 	}
 
 	for _, path := range []string{k.generationMarker(), k.certificateStage(), k.privateKeyStage()} {
-
-		_, err = os.Stat(path)
-		if !os.IsNotExist(err) {
+		if _, err = os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("generation artifact remains at %s: %v", path, err)
 		}
 	}
@@ -196,12 +202,14 @@ func TestSelfSignedGenerationRecoversMarkedPartialPair(t *testing.T) {
 
 func TestSelfSignedGenerationRecoversMarkerWithSingleStage(t *testing.T) {
 	dir := t.TempDir()
+
 	k := &Keeper{
 		certificateFile: filepath.Join(dir, "server.crt"),
 		privateKeyFile:  filepath.Join(dir, "server.key"),
 		hostname:        "mail.test.example",
 		mode:            "self_signed",
 	}
+
 	err := os.WriteFile(k.generationMarker(), []byte(generationMarkerText), 0600)
 	if err != nil {
 		t.Fatal(err)
@@ -222,9 +230,7 @@ func TestSelfSignedGenerationRecoversMarkerWithSingleStage(t *testing.T) {
 	}
 
 	for _, path := range []string{k.generationMarker(), k.certificateStage(), k.privateKeyStage()} {
-
-		_, err = os.Stat(path)
-		if !os.IsNotExist(err) {
+		if _, err = os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("generation artifact remains at %s: %v", path, err)
 		}
 	}
@@ -232,12 +238,14 @@ func TestSelfSignedGenerationRecoversMarkerWithSingleStage(t *testing.T) {
 
 func TestSelfSignedGenerationReplacesInvalidStagedPair(t *testing.T) {
 	dir := t.TempDir()
+
 	k := &Keeper{
 		certificateFile: filepath.Join(dir, "server.crt"),
 		privateKeyFile:  filepath.Join(dir, "server.key"),
 		hostname:        "mail.test.example",
 		mode:            "self_signed",
 	}
+
 	err := os.WriteFile(k.generationMarker(), []byte(generationMarkerText), 0600)
 	if err != nil {
 		t.Fatal(err)
@@ -265,18 +273,21 @@ func TestSelfSignedGenerationReplacesInvalidStagedPair(t *testing.T) {
 
 func TestSelfSignedRecoveryPreservesFinalFileWithIncompleteMarker(t *testing.T) {
 	dir := t.TempDir()
+
 	k := &Keeper{
 		certificateFile: filepath.Join(dir, "server.crt"),
 		privateKeyFile:  filepath.Join(dir, "server.key"),
 		hostname:        "mail.test.example",
 		mode:            "self_signed",
 	}
+
 	err := os.WriteFile(k.generationMarker(), []byte(generationMarkerText), 0600)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	body := []byte("operator certificate")
+
 	err = os.WriteFile(k.certificateFile, body, 0644)
 	if err != nil {
 		t.Fatal(err)
@@ -295,19 +306,20 @@ func TestSelfSignedRecoveryPreservesFinalFileWithIncompleteMarker(t *testing.T) 
 
 func TestSelfSignedPathsConfinedToDataDirectory(t *testing.T) {
 	dir := t.TempDir()
+
 	cfg := config.Default()
+
 	cfg.Server.DataDirectory = filepath.Join(dir, "data")
 	cfg.TLS.CertificateFile = filepath.Join(dir, "outside.crt")
 	cfg.TLS.PrivateKeyFile = filepath.Join(dir, "outside.key")
+
 	_, _, err := Ensure(cfg)
 	if err == nil || !strings.Contains(err.Error(), "beneath server.data_directory") {
 		t.Fatalf("escaping generated paths accepted: %v", err)
 	}
 
 	for _, path := range []string{cfg.TLS.CertificateFile, cfg.TLS.PrivateKeyFile} {
-
-		_, err := os.Stat(path)
-		if !os.IsNotExist(err) {
+		if _, err = os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("escaping path created: %s (%v)", path, err)
 		}
 	}
@@ -315,18 +327,19 @@ func TestSelfSignedPathsConfinedToDataDirectory(t *testing.T) {
 
 func TestLoadDoesNotGenerateMissingSelfSignedPair(t *testing.T) {
 	dir := t.TempDir()
+
 	cfg := config.Default()
+
 	cfg.Server.Hostname = "mail.test.example"
 	cfg.Server.DataDirectory = dir
+
 	_, err := Load(cfg)
 	if err == nil {
 		t.Fatal("Load accepted missing certificate pair")
 	}
 
 	for _, name := range []string{"tls/server.crt", "tls/server.key"} {
-
-		_, err := os.Stat(filepath.Join(dir, filepath.FromSlash(name)))
-		if !os.IsNotExist(err) {
+		if _, err = os.Stat(filepath.Join(dir, filepath.FromSlash(name))); !os.IsNotExist(err) {
 			t.Fatalf("Load generated %s: %v", name, err)
 		}
 	}
@@ -335,6 +348,7 @@ func TestLoadDoesNotGenerateMissingSelfSignedPair(t *testing.T) {
 func TestFilesModeDoesNotOverwritePartial(t *testing.T) {
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "server.key")
+
 	err := os.WriteFile(keyPath, []byte("not-a-real-key"), 0600)
 	if err != nil {
 		t.Fatal(err)
@@ -354,6 +368,7 @@ func TestFilesModeDoesNotOverwritePartial(t *testing.T) {
 
 func TestValidateRejectsHostnameMismatch(t *testing.T) {
 	dir := t.TempDir()
+
 	err := writeSelfSigned(dir, "other.example")
 	if err != nil {
 		t.Fatal(err)
@@ -365,6 +380,7 @@ func TestValidateRejectsHostnameMismatch(t *testing.T) {
 		hostname:        "mail.test.example",
 		mode:            "files",
 	}
+
 	_, err = k.load()
 	if err == nil {
 		t.Fatal("expected hostname mismatch error")
@@ -394,6 +410,7 @@ func TestCheckRejectsInvalidServingCertificates(t *testing.T) {
 			name: "expired",
 			prep: func(t *testing.T, dir string) {
 				t.Helper()
+
 				writeTestPair(t, dir, "mail.test.example", time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour))
 			},
 			want: "expired",
@@ -421,6 +438,7 @@ func TestCheckRejectsInvalidServingCertificates(t *testing.T) {
 				}
 
 				replacement := t.TempDir()
+
 				err = writeSelfSigned(replacement, "mail.test.example")
 				if err != nil {
 					t.Fatal(err)
@@ -443,12 +461,16 @@ func TestCheckRejectsInvalidServingCertificates(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			dir := t.TempDir()
+
 			test.prep(t, dir)
+
 			cfg := config.Default()
+
 			cfg.Server.Hostname = "mail.test.example"
 			cfg.TLS.Mode = "files"
 			cfg.TLS.CertificateFile = filepath.Join(dir, "server.crt")
 			cfg.TLS.PrivateKeyFile = filepath.Join(dir, "server.key")
+
 			err := Check(cfg)
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("Check error=%v want %q", err, test.want)
@@ -459,12 +481,16 @@ func TestCheckRejectsInvalidServingCertificates(t *testing.T) {
 
 func TestCheckVerifiesTrustChainWithInjectedRoots(t *testing.T) {
 	dir := t.TempDir()
+
 	roots := writeTestChain(t, dir)
+
 	cfg := config.Default()
+
 	cfg.Server.Hostname = "mail.test.example"
 	cfg.TLS.Mode = "files"
 	cfg.TLS.CertificateFile = filepath.Join(dir, "server.crt")
 	cfg.TLS.PrivateKeyFile = filepath.Join(dir, "server.key")
+
 	err := CheckWithRoots(cfg, roots)
 	if err != nil {
 		t.Fatalf("trusted chain rejected: %v", err)
@@ -481,6 +507,7 @@ func TestCheckVerifiesTrustChainWithInjectedRoots(t *testing.T) {
 	}
 
 	leaf, _ := pem.Decode(chain)
+
 	err = os.WriteFile(filepath.Join(dir, "server.crt"), pem.EncodeToMemory(leaf), 0644)
 	if err != nil {
 		t.Fatal(err)
@@ -494,7 +521,9 @@ func TestCheckVerifiesTrustChainWithInjectedRoots(t *testing.T) {
 
 func writeTestChain(t *testing.T, dir string) *x509.CertPool {
 	t.Helper()
+
 	now := time.Now()
+
 	newKey := func() *ecdsa.PrivateKey {
 		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if err != nil {
@@ -503,8 +532,21 @@ func writeTestChain(t *testing.T, dir string) *x509.CertPool {
 
 		return key
 	}
-	rootKey, intermediateKey, leafKey := newKey(), newKey(), newKey()
-	root := &x509.Certificate{SerialNumber: big.NewInt(10), Subject: pkix.Name{CommonName: "test root"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+
+	rootKey := newKey()
+	intermediateKey := newKey()
+	leafKey := newKey()
+
+	root := &x509.Certificate{
+		SerialNumber:          big.NewInt(10),
+		Subject:               pkix.Name{CommonName: "test root"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+
 	rootDER, err := x509.CreateCertificate(rand.Reader, root, root, &rootKey.PublicKey, rootKey)
 	if err != nil {
 		t.Fatal(err)
@@ -515,7 +557,16 @@ func writeTestChain(t *testing.T, dir string) *x509.CertPool {
 		t.Fatal(err)
 	}
 
-	intermediate := &x509.Certificate{SerialNumber: big.NewInt(11), Subject: pkix.Name{CommonName: "test intermediate"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	intermediate := &x509.Certificate{
+		SerialNumber:          big.NewInt(11),
+		Subject:               pkix.Name{CommonName: "test intermediate"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+
 	intermediateDER, err := x509.CreateCertificate(rand.Reader, intermediate, rootCert, &intermediateKey.PublicKey, rootKey)
 	if err != nil {
 		t.Fatal(err)
@@ -526,14 +577,24 @@ func writeTestChain(t *testing.T, dir string) *x509.CertPool {
 		t.Fatal(err)
 	}
 
-	leaf := &x509.Certificate{SerialNumber: big.NewInt(12), DNSNames: []string{"mail.test.example"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	leaf := &x509.Certificate{
+		SerialNumber: big.NewInt(12),
+		DNSNames:     []string{"mail.test.example"},
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+
 	leafDER, err := x509.CreateCertificate(rand.Reader, leaf, intermediateCert, &leafKey.PublicKey, intermediateKey)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
+
 	certPEM = append(certPEM, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: intermediateDER})...)
+
 	keyDER, err := x509.MarshalPKCS8PrivateKey(leafKey)
 	if err != nil {
 		t.Fatal(err)
@@ -550,15 +611,17 @@ func writeTestChain(t *testing.T, dir string) *x509.CertPool {
 	}
 
 	roots := x509.NewCertPool()
+
 	roots.AddCert(rootCert)
+
 	return roots
 }
 
 func TestCertificateReadLimit(t *testing.T) {
 	for _, name := range []string{"server.crt", "server.key"} {
-
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
+
 			err := writeSelfSigned(dir, "mail.test.example")
 			if err != nil {
 				t.Fatal(err)
@@ -566,6 +629,7 @@ func TestCertificateReadLimit(t *testing.T) {
 
 			maximum := maxPrivateKeyBytes
 			mode := os.FileMode(0600)
+
 			if name == "server.crt" {
 				maximum = maxCertificateBytes
 				mode = 0644
@@ -577,6 +641,7 @@ func TestCertificateReadLimit(t *testing.T) {
 			}
 
 			k := &Keeper{certificateFile: filepath.Join(dir, "server.crt"), privateKeyFile: filepath.Join(dir, "server.key"), mode: "files"}
+
 			_, err = k.load()
 			if err == nil || !strings.Contains(err.Error(), "read limit") {
 				t.Fatalf("oversized %s error=%v", name, err)
@@ -587,6 +652,7 @@ func TestCertificateReadLimit(t *testing.T) {
 
 func writeTestPair(t *testing.T, dir, hostname string, notBefore, notAfter time.Time) {
 	t.Helper()
+
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -600,6 +666,7 @@ func writeTestPair(t *testing.T, dir, hostname string, notBefore, notAfter time.
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
+
 	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
 	if err != nil {
 		t.Fatal(err)
@@ -623,6 +690,7 @@ func writeTestPair(t *testing.T, dir, hostname string, notBefore, notAfter time.
 
 func TestHotReloadKeepsLastValid(t *testing.T) {
 	dir := t.TempDir()
+
 	k, _, err := ensureWithDir(t, dir, "self_signed")
 	if err != nil {
 		t.Fatal(err)
@@ -642,6 +710,7 @@ func TestHotReloadKeepsLastValid(t *testing.T) {
 
 	// Touch mtime so modified() sees a change.
 	future := time.Now().Add(time.Second)
+
 	_ = os.Chtimes(filepath.Join(dir, "server.crt"), future, future)
 	_ = os.Chtimes(filepath.Join(dir, "server.key"), future, future)
 
@@ -662,6 +731,7 @@ func TestHotReloadKeepsLastValid(t *testing.T) {
 
 		a, _ := x509.ParseCertificate(cert.Certificate[0])
 		b, _ := x509.ParseCertificate(good.Certificate[0])
+
 		if a.SerialNumber.Cmp(b.SerialNumber) != 0 {
 			t.Fatal("did not keep last valid certificate")
 		}
@@ -679,6 +749,7 @@ func TestHotReloadKeepsLastValid(t *testing.T) {
 
 func TestHotReloadDetectsEqualMtimeReplacement(t *testing.T) {
 	dir := t.TempDir()
+
 	k, _, err := ensureWithDir(t, dir, "self_signed")
 	if err != nil {
 		t.Fatal(err)
@@ -686,6 +757,7 @@ func TestHotReloadDetectsEqualMtimeReplacement(t *testing.T) {
 
 	oldLeaf, _ := x509.ParseCertificate(k.certificate.Certificate[0])
 	replacement := t.TempDir()
+
 	err = writeSelfSigned(replacement, "mail.test.example")
 	if err != nil {
 		t.Fatal(err)
@@ -694,7 +766,6 @@ func TestHotReloadDetectsEqualMtimeReplacement(t *testing.T) {
 	stamp := time.Now().Add(-24 * time.Hour)
 
 	for _, name := range []string{"server.crt", "server.key"} {
-
 		body, err := os.ReadFile(filepath.Join(replacement, name))
 		if err != nil {
 			t.Fatal(err)
@@ -714,6 +785,7 @@ func TestHotReloadDetectsEqualMtimeReplacement(t *testing.T) {
 	k.mu.Lock()
 	k.checked = time.Time{}
 	k.mu.Unlock()
+
 	loaded, err := k.get(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -727,6 +799,7 @@ func TestHotReloadDetectsEqualMtimeReplacement(t *testing.T) {
 
 func TestHotReloadDetectsKeyOnlyReplacement(t *testing.T) {
 	dir := t.TempDir()
+
 	k, _, err := ensureWithDir(t, dir, "self_signed")
 	if err != nil {
 		t.Fatal(err)
@@ -734,6 +807,7 @@ func TestHotReloadDetectsKeyOnlyReplacement(t *testing.T) {
 
 	old := k.certificate
 	replacement := t.TempDir()
+
 	err = writeSelfSigned(replacement, "mail.test.example")
 	if err != nil {
 		t.Fatal(err)
@@ -750,16 +824,22 @@ func TestHotReloadDetectsKeyOnlyReplacement(t *testing.T) {
 	}
 
 	stamp := time.Now().Add(-48 * time.Hour)
+
 	err = os.Chtimes(filepath.Join(dir, "server.key"), stamp, stamp)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	var reported error
-	k.SetReloadErrorHandler(func(err error) { reported = err })
+
+	k.SetReloadErrorHandler(func(err error) {
+		reported = err
+	})
+
 	k.mu.Lock()
 	k.checked = time.Time{}
 	k.mu.Unlock()
+
 	loaded, err := k.get(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -772,15 +852,18 @@ func TestHotReloadDetectsKeyOnlyReplacement(t *testing.T) {
 
 func TestReloadErrorHandlerCanInspectKeeper(t *testing.T) {
 	dir := t.TempDir()
+
 	k, _, err := ensureWithDir(t, dir, "self_signed")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	called := make(chan struct{})
+
 	k.SetReloadErrorHandler(func(error) {
 		_ = k.Status()
 		_ = k.LastError()
+
 		close(called)
 	})
 
@@ -812,18 +895,21 @@ func TestExpiredRetainedCertificateIsNotServed(t *testing.T) {
 	}
 
 	now := time.Now()
+
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		NotBefore:    now.Add(-2 * time.Hour),
 		NotAfter:     now.Add(-time.Hour),
 		DNSNames:     []string{"mail.test.example"},
 	}
+
 	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	k := &Keeper{certificate: &tls.Certificate{Certificate: [][]byte{der}}, checked: now}
+
 	certificate, err := k.get(nil)
 	if err == nil || certificate != nil {
 		t.Fatalf("expired retained certificate served: certificate=%v err=%v", certificate != nil, err)
@@ -832,6 +918,7 @@ func TestExpiredRetainedCertificateIsNotServed(t *testing.T) {
 
 func TestConfigHasNoCipherSuites(t *testing.T) {
 	dir := t.TempDir()
+
 	k, _, err := ensureWithDir(t, dir, "self_signed")
 	if err != nil {
 		t.Fatal(err)
@@ -854,16 +941,19 @@ func writeSelfSigned(dir, hostname string) error {
 		hostname:        hostname,
 		mode:            "self_signed",
 	}
+
 	return k.generate(hostname)
 }
 
 func TestGenerateTemplateFields(t *testing.T) {
 	// Direct unit of generate via ensure.
 	dir := t.TempDir()
+
 	k := &Keeper{
 		certificateFile: filepath.Join(dir, "c.crt"),
 		privateKeyFile:  filepath.Join(dir, "c.key"),
 	}
+
 	err := k.generate("hn.example")
 	if err != nil {
 		t.Fatal(err)
@@ -875,6 +965,7 @@ func TestGenerateTemplateFields(t *testing.T) {
 	}
 
 	block, _ := pem.Decode(body)
+
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
 		t.Fatal(err)

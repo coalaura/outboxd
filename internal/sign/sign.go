@@ -160,6 +160,7 @@ func ensureKey(path string) (*rsa.PrivateKey, bool, error) {
 			}
 
 			parsed, parseErr := parseKey(body)
+
 			return parsed, false, parseErr
 		}
 

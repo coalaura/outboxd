@@ -13,12 +13,14 @@ func dns(configPath string) error {
 	if err != nil {
 		return err
 	}
+
 	defer ownership.Close()
 
 	spoolOwnership, err := lockSpool(cfg)
 	if err != nil {
 		return err
 	}
+
 	defer spoolOwnership.Close()
 
 	signer, err := sign.Load(cfg)
@@ -32,6 +34,5 @@ func dns(configPath string) error {
 	}
 
 	_, err = os.Stdout.Write(body)
-
 	return err
 }

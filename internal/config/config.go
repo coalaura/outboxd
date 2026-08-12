@@ -45,6 +45,7 @@ type Config struct {
 	Users    []User   `yaml:"users"`
 }
 
+// gost:preserve-layout
 type Server struct {
 	Hostname                  string `yaml:"hostname"`
 	Domain                    string `yaml:"domain"`
@@ -90,6 +91,7 @@ type DKIM struct {
 	Headers        []string `yaml:"headers"`
 }
 
+// gost:preserve-layout
 type Delivery struct {
 	// TLSMode: opportunistic | required | opportunistic_insecure
 	TLSMode        string `yaml:"tls_mode"`
@@ -280,6 +282,7 @@ func ResolveConfigPath(flagPath string) string {
 // LoadFile loads configuration from path.
 func LoadFile(path string) (*Config, error) {
 	cfg := Default()
+
 	cfg.initializeRuntime()
 
 	abs, err := filepath.Abs(path)
@@ -333,7 +336,7 @@ func isYAMLEOF(err error) bool {
 }
 
 func rejectMultiDoc(raw []byte) error {
-	count := 0
+	var count int
 
 	for line := range bytes.SplitSeq(raw, []byte("\n")) {
 		if bytes.Equal(bytes.TrimSpace(line), []byte("---")) {
@@ -370,7 +373,9 @@ func EnsurePath(path string) (*Config, bool, error) {
 	}
 
 	cfg = Default()
+
 	cfg.initializeRuntime()
+
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, false, err
@@ -378,6 +383,7 @@ func EnsurePath(path string) (*Config, bool, error) {
 
 	cfg.path = abs
 	cfg.baseDir = filepath.Dir(abs)
+
 	cfg.applyDefaults()
 
 	err = cfg.Init()
@@ -389,6 +395,7 @@ func EnsurePath(path string) (*Config, bool, error) {
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
 			cfg, err = LoadFile(path)
+
 			return cfg, false, err
 		}
 
@@ -503,10 +510,14 @@ func (cfg *Config) canonicalize() {
 }
 
 // Path returns the absolute config file path.
-func (cfg *Config) Path() string { return cfg.path }
+func (cfg *Config) Path() string {
+	return cfg.path
+}
 
 // BaseDir returns the directory containing the config file.
-func (cfg *Config) BaseDir() string { return cfg.baseDir }
+func (cfg *Config) BaseDir() string {
+	return cfg.baseDir
+}
 
 // AddUser appends a user and atomically rewrites the config after Validate.
 func (cfg *Config) AddUser(user User) error {
@@ -544,6 +555,7 @@ func (cfg *Config) AddUser(user User) error {
 	}
 
 	latest.Users = append(latest.Users, user)
+
 	err = latest.Init()
 	if err != nil {
 		return err
@@ -555,6 +567,7 @@ func (cfg *Config) AddUser(user User) error {
 	}
 
 	cfg.adopt(latest)
+
 	return nil
 }
 
@@ -578,6 +591,7 @@ func lockConfig(path string) (*disk.FileLock, error) {
 func (cfg *Config) adopt(other *Config) {
 	cfg.dataMu.Lock()
 	defer cfg.dataMu.Unlock()
+
 	cfg.Server, cfg.TLS, cfg.DKIM, cfg.Delivery, cfg.DNS = other.Server, other.TLS, other.DKIM, other.Delivery, other.DNS
 	cfg.Users = slices.Clone(other.Users)
 	cfg.userLookup = make(map[string]*User, len(cfg.Users))
@@ -601,6 +615,7 @@ func (cfg *Config) Save() error {
 
 	cfg.fileMu.Lock()
 	defer cfg.fileMu.Unlock()
+
 	return disk.Write(path, body, 0600)
 }
 
@@ -770,9 +785,11 @@ func (cfg *Config) Validate() error {
 		return fmt.Errorf("dkim.private_key_file: %w", err)
 	}
 
-	hasFromHeader := false
-	hasSenderHeader := false
-	seenDKIMHeaders := make(map[string]struct{}, len(cfg.DKIM.Headers))
+	var (
+		hasFromHeader   bool
+		hasSenderHeader bool
+		seenDKIMHeaders = make(map[string]struct{}, len(cfg.DKIM.Headers))
+	)
 
 	for _, header := range cfg.DKIM.Headers {
 		err = validateHeaderName(header)
@@ -781,15 +798,18 @@ func (cfg *Config) Validate() error {
 		}
 
 		canon := strings.ToLower(header)
+
 		_, ok := seenDKIMHeaders[canon]
 		if ok {
 			return fmt.Errorf("dkim.headers: duplicate %q", header)
 		}
 
 		seenDKIMHeaders[canon] = struct{}{}
-		if canon == "from" {
+
+		switch canon {
+		case "from":
 			hasFromHeader = true
-		} else if canon == "sender" {
+		case "sender":
 			hasSenderHeader = true
 		}
 	}
@@ -823,6 +843,7 @@ func (cfg *Config) Validate() error {
 	if cfg.Delivery.DomainConcurrency <= 0 || cfg.Delivery.DomainConcurrency > MaxDomainConcurrency || cfg.Delivery.GlobalConcurrency <= 0 || cfg.Delivery.GlobalConcurrency > MaxGlobalConcurrency || cfg.Delivery.UserConcurrency <= 0 || cfg.Delivery.UserConcurrency > MaxUserConcurrency || cfg.Delivery.DomainConcurrency > cfg.Delivery.GlobalConcurrency {
 		return errors.New("delivery concurrency limits are invalid or exceed supported bounds")
 	}
+
 	if cfg.Delivery.MaxMXCandidates <= 0 || cfg.Delivery.MaxMXCandidates > MaxMXCandidates || cfg.Delivery.MaxIPCandidatesPerMX <= 0 || cfg.Delivery.MaxIPCandidatesPerMX > MaxIPCandidatesPerMX {
 		return errors.New("delivery candidate limits are invalid or exceed supported bounds")
 	}
@@ -930,6 +951,7 @@ func (cfg *Config) Validate() error {
 		}
 
 		username := canonicalUsername(user.Username)
+
 		_, exists := usernames[username]
 		if exists {
 			return fmt.Errorf("duplicate username %q", user.Username)
@@ -979,6 +1001,7 @@ func (u *User) Validate() error {
 			}
 
 			canonicalSender := "*@" + strings.ToLower(domain)
+
 			_, exists := senders[canonicalSender]
 			if exists {
 				return fmt.Errorf("user %q has duplicate sender %q", u.Username, sender)
@@ -986,6 +1009,7 @@ func (u *User) Validate() error {
 
 			senders[canonicalSender] = struct{}{}
 			u.AllowedSenders[i] = canonicalSender
+
 			continue
 		}
 
@@ -996,6 +1020,7 @@ func (u *User) Validate() error {
 
 		at := strings.LastIndexByte(address, '@')
 		canonicalSender := address[:at] + "@" + strings.ToLower(address[at+1:])
+
 		_, exists := senders[canonicalSender]
 		if exists {
 			return fmt.Errorf("user %q has duplicate sender %q", u.Username, sender)
@@ -1383,6 +1408,7 @@ func validateReportURI(uri string, dmarc bool) error {
 		}
 
 		domain := addr.Address[strings.LastIndexByte(addr.Address, '@')+1:]
+
 		err = validateDomain("report mailbox domain", strings.ToLower(domain))
 		if err != nil {
 			return fmt.Errorf("invalid mailto URI %q", uri)
@@ -1419,6 +1445,7 @@ var reportSizeRE = regexp.MustCompile(`(?i)![0-9]+[kmgt]?$`)
 // ExpectedSPF returns the effective policy emitted by DNS generation.
 func (cfg *Config) ExpectedSPF() string {
 	var b strings.Builder
+
 	b.WriteString("v=spf1")
 
 	if cfg.DNS.PublicIPv4 != "" {
@@ -1437,5 +1464,6 @@ func (cfg *Config) ExpectedSPF() string {
 	}
 
 	b.WriteString(" -all")
+
 	return b.String()
 }

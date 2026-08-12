@@ -110,6 +110,7 @@ func (s *session) Mail(from string, opts *smtp.MailOptions) error {
 	s.recipients = s.recipients[:0]
 	s.smtpUTF8 = utf8Wanted
 	s.body = smtp.Body7Bit
+
 	if opts != nil {
 		if opts.Body != "" {
 			s.body = opts.Body
@@ -174,14 +175,18 @@ func (s *session) Data(r io.Reader) error {
 	// go-smtp starts Data on the first BDAT chunk. Its per-command deadline can
 	// be renewed by later commands, so independently bound the whole Data call.
 	ctx, cancel := context.WithTimeout(context.Background(), s.server.dataTimeout())
+
 	conn := s.conn.Conn()
+
 	closed := make(chan struct{})
+
 	// Reset clears this callback only after go-smtp writes the final DATA/BDAT
 	// response, so response delivery remains bounded by the same deadline.
 	stop := context.AfterFunc(ctx, func() {
 		_ = conn.Close()
 		close(closed)
 	})
+
 	s.dataDeadlineMu.Lock()
 	s.dataDeadlineCtx = ctx
 	s.dataDeadlineCancel = cancel
@@ -217,8 +222,11 @@ func (s *session) Data(r io.Reader) error {
 	}
 
 	maxBytes := s.server.cfg.Server.MaxMessageBytes
-	if err := allowDataTerminator(r, maxBytes); err != nil {
+
+	err := allowDataTerminator(r, maxBytes)
+	if err != nil {
 		s.server.log.Printf("go-smtp DATA reader compatibility failure: %v\n", err)
+
 		return errTemporaryFailure
 	}
 
@@ -238,8 +246,10 @@ func (s *session) Data(r io.Reader) error {
 	if err != nil {
 		if ctx.Err() != nil {
 			s.waitDataDeadlineClose()
+
 			return errTemporaryFailure
 		}
+
 		if errors.Is(err, message.ErrOversized) || errors.Is(err, smtp.ErrDataTooLarge) {
 			return &smtp.SMTPError{
 				Code:         552,
@@ -293,19 +303,23 @@ func (s *session) Data(r io.Reader) error {
 
 	if err := ctx.Err(); err != nil {
 		s.waitDataDeadlineClose()
+
 		return errTemporaryFailure
 	}
+
 	signature, err := s.server.signMessage(ctx, prepared.Data)
 	if err != nil {
 		if ctx.Err() != nil {
 			s.waitDataDeadlineClose()
 		}
+
 		s.server.log.Printf("dkim signing failed: %v\n", err)
 
 		return errTemporaryFailure
 	}
 
 	data := make([]byte, 0, len(signature)+len(prepared.Data))
+
 	data = append(data, signature...)
 	data = append(data, prepared.Data...)
 
@@ -346,19 +360,25 @@ func (s *session) Data(r io.Reader) error {
 
 	if err := ctx.Err(); err != nil {
 		s.waitDataDeadlineClose()
+
 		return errTemporaryFailure
 	}
+
 	err = s.server.queueAdd(ctx, envelope, data)
 	if err == nil {
 		if ctx.Err() != nil {
 			s.waitDataDeadlineClose()
 		}
+
 		s.server.log.Printf("queued %s from %s for %d recipient(s)\n", envelope.ID, s.sender, len(envelope.Recipients))
+
 		return nil
 	}
+
 	if ctx.Err() != nil {
 		s.waitDataDeadlineClose()
 	}
+
 	s.server.log.Printf("failed to queue message: %v\n", err)
 
 	if errors.Is(err, queue.ErrQueueFull) || errors.Is(err, queue.ErrInsufficientDisk) {
@@ -372,6 +392,7 @@ func (s *session) waitDataDeadlineClose() {
 	s.dataDeadlineMu.Lock()
 	done := s.dataDeadlineDone
 	s.dataDeadlineMu.Unlock()
+
 	if done != nil {
 		<-done
 	}
@@ -385,11 +406,13 @@ func (s *session) clearDataDeadline() {
 	cancel := s.dataDeadlineCancel
 	stop := s.dataDeadlineStop
 	done := s.dataDeadlineDone
+
 	s.dataDeadlineCtx = nil
 	s.dataDeadlineCancel = nil
 	s.dataDeadlineStop = nil
 	s.dataDeadlineDone = nil
 	s.dataDeadlineMu.Unlock()
+
 	if stop == nil {
 		return
 	}
@@ -401,6 +424,7 @@ func (s *session) clearDataDeadline() {
 		// Do not let response cleanup suppress a deadline that raced with Stop.
 		_ = s.conn.Conn().Close()
 	}
+
 	cancel()
 }
 
@@ -425,6 +449,7 @@ func allowDataTerminator(r io.Reader, maxBytes int64) error {
 	}
 
 	elem := typ.Elem()
+
 	wantFields := []struct {
 		name string
 		typ  reflect.Type
@@ -434,6 +459,7 @@ func allowDataTerminator(r io.Reader, maxBytes int64) error {
 		{"limited", reflect.TypeFor[bool]()},
 		{"n", reflect.TypeFor[int64]()},
 	}
+
 	if elem.NumField() != len(wantFields) {
 		return errors.New("unsupported go-smtp DATA reader layout")
 	}
@@ -448,11 +474,13 @@ func allowDataTerminator(r io.Reader, maxBytes int64) error {
 	reader := reflect.ValueOf(r).Elem()
 	limited := reader.FieldByName("limited")
 	value := reader.FieldByName("n")
+
 	if !limited.Bool() || !value.CanAddr() || value.Int() != maxBytes {
 		return errors.New("unsupported go-smtp DATA reader state")
 	}
 
 	reflect.NewAt(value.Type(), unsafe.Pointer(value.UnsafeAddr())).Elem().SetInt(incrementLimit(maxBytes))
+
 	return nil
 }
 
@@ -461,11 +489,13 @@ func allowDataTerminator(r io.Reader, maxBytes int64) error {
 // consuming an attacker-controlled body.
 func (s *session) abortData(err error) error {
 	_ = s.conn.Close()
+
 	return err
 }
 
 func (s *session) Reset() {
 	s.clearDataDeadline()
+
 	s.sender = ""
 	s.recipients = s.recipients[:0]
 	s.smtpUTF8 = false
@@ -474,6 +504,7 @@ func (s *session) Reset() {
 
 func (s *session) Logout() error {
 	s.clearDataDeadline()
+
 	return nil
 }
 
@@ -482,6 +513,7 @@ func (s *session) authenticate(username, password string) error {
 
 	if !s.server.acquireHashSlot() {
 		s.server.log.Printf("authentication busy from %s\n", ip)
+
 		return errAuthBusy
 	}
 
@@ -496,6 +528,7 @@ func (s *session) authenticate(username, password string) error {
 	user, ok := s.server.cfg.User(username)
 	if !ok || !user.Enabled {
 		passwd.Waste()
+
 		s.server.authLimit.failed(ip, username)
 
 		return smtp.ErrAuthFailed
@@ -513,10 +546,13 @@ func (s *session) authenticate(username, password string) error {
 	}
 
 	s.server.authLimit.succeeded(ip, username)
+
 	s.user = user
+
 	if s.authDeadline != nil {
 		s.authDeadline.clear()
 	}
+
 	s.server.log.Printf("authenticated user %q from %q\n", user.Username, ip)
 
 	return nil

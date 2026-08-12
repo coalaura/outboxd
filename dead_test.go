@@ -21,21 +21,25 @@ func TestReportQueueIssuesEscapesTerminalControls(t *testing.T) {
 		Corrupt:  []error{errors.New("bad\nentry")},
 		Warnings: []error{errors.New("warn\tentry")},
 	}
+
 	var out bytes.Buffer
+
 	reportQueueIssues(&out, spool)
+
 	got := out.String()
+
 	if strings.Contains(got, "bad\nentry") || strings.Contains(got, "warn\tentry") {
 		t.Fatalf("terminal controls were not escaped: %q", got)
 	}
 
-	if !strings.Contains(got, `corrupt queue entry: bad\x0aentry`) ||
-		!strings.Contains(got, `queue maintenance warning: warn\x09entry`) {
+	if !strings.Contains(got, `corrupt queue entry: bad\x0aentry`) || !strings.Contains(got, `queue maintenance warning: warn\x09entry`) {
 		t.Fatalf("unexpected report: %q", got)
 	}
 }
 
 func TestAdministrativeCommandsRequireExactArity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yml")
+
 	_, _, err := config.EnsurePath(path)
 	if err != nil {
 		t.Fatal(err)

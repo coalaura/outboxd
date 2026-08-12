@@ -37,6 +37,7 @@ func ReadCheckedFile(path string, private, allowSymlink bool, maximum int64) ([]
 	}
 
 	defer file.Close()
+
 	body, err := io.ReadAll(io.LimitReader(file, maximum+1))
 	if err != nil {
 		return nil, err
@@ -64,15 +65,22 @@ func openChecked(path string, allowSymlink bool) (*os.File, error) {
 		return nil, err
 	}
 
-	handle, err := windows.CreateFile(name, windows.GENERIC_READ,
+	handle, err := windows.CreateFile(
+		name,
+		windows.GENERIC_READ,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		nil, windows.OPEN_EXISTING,
-		windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		0,
+	)
+
 	if err != nil {
 		return nil, err
 	}
 
 	tag := windowsFileAttributeTag{}
+
 	err = windows.GetFileInformationByHandleEx(handle, windows.FileAttributeTagInfo, (*byte)(unsafe.Pointer(&tag)), uint32(unsafe.Sizeof(tag)))
 	if err != nil {
 		windows.CloseHandle(handle)
@@ -81,6 +89,7 @@ func openChecked(path string, allowSymlink bool) (*os.File, error) {
 
 	if tag.attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 		windows.CloseHandle(handle)
+
 		return nil, fmt.Errorf("%q must not be a symlink or reparse point", path)
 	}
 
@@ -91,11 +100,13 @@ func validateOpenedFile(path string, file *os.File) (*os.File, error) {
 	info, err := file.Stat()
 	if err != nil {
 		file.Close()
+
 		return nil, err
 	}
 
 	if !info.Mode().IsRegular() {
 		file.Close()
+
 		return nil, fmt.Errorf("%q must open as a regular file", path)
 	}
 

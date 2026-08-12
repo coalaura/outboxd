@@ -117,6 +117,7 @@ func PrepareContext(ctx context.Context, r io.Reader, opts Options) (*Message, e
 	if len(raw) == 0 {
 		return nil, errEmpty
 	}
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -135,6 +136,7 @@ func PrepareContext(ctx context.Context, r io.Reader, opts Options) (*Message, e
 	if err != nil {
 		return nil, err
 	}
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -145,6 +147,7 @@ func PrepareContext(ctx context.Context, r io.Reader, opts Options) (*Message, e
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+
 		present[field.name]++
 	}
 
@@ -215,7 +218,6 @@ func PrepareContext(ctx context.Context, r io.Reader, opts Options) (*Message, e
 	identifier := messageID(identifierDomain)
 
 	var out bytes.Buffer
-
 	out.Grow(len(data) + 512)
 
 	fmt.Fprintf(&out, "Received: from %s", traceValue(opts.Helo))
@@ -227,7 +229,9 @@ func PrepareContext(ctx context.Context, r io.Reader, opts Options) (*Message, e
 	fmt.Fprintf(
 		&out,
 		"\r\n\tby %s with %s id %s;\r\n\t%s\r\n",
-		opts.Hostname, protocol(opts.TLS), strings.Trim(identifier, "<>"),
+		opts.Hostname,
+		protocol(opts.TLS),
+		strings.Trim(identifier, "<>"),
 		time.Now().Format(time.RFC1123Z),
 	)
 
@@ -235,16 +239,19 @@ func PrepareContext(ctx context.Context, r io.Reader, opts Options) (*Message, e
 	dateField, ok := firstField(fields, "date")
 	if !ok || !validDate(dateField.text()) {
 		fmt.Fprintf(&out, "Date: %s\r\n", time.Now().Format(time.RFC1123Z))
+
 		present["date"] = 1
 	}
 
 	// Message-ID: inject when missing or unusable.
 	msgID := identifier
+
 	idField, ok := firstField(fields, "message-id")
 	if ok && validMessageID(idField.text()) {
 		msgID = strings.TrimSpace(idField.text())
 	} else {
 		fmt.Fprintf(&out, "Message-ID: %s\r\n", identifier)
+
 		present["message-id"] = 1
 	}
 
@@ -269,8 +276,11 @@ func PrepareContext(ctx context.Context, r io.Reader, opts Options) (*Message, e
 		out.WriteString("MIME-Version: 1.0\r\n")
 	}
 
-	rewriteDate := false
-	rewriteMsgID := false
+	var (
+		rewriteDate  bool
+		rewriteMsgID bool
+	)
+
 	df, ok := firstField(fields, "date")
 	if ok && !validDate(df.text()) {
 		rewriteDate = true
@@ -322,6 +332,7 @@ func (r contextReader) Read(p []byte) (int, error) {
 	if err := r.ctx.Err(); err != nil {
 		return 0, err
 	}
+
 	return r.reader.Read(p)
 }
 
@@ -352,6 +363,7 @@ func validMessageID(value string) bool {
 	}
 
 	inner := value[1 : len(value)-1]
+
 	at := strings.LastIndexByte(inner, '@')
 	if at <= 0 || at == len(inner)-1 {
 		return false
@@ -378,6 +390,7 @@ func preserveLocalPartCase(headerText, parsed string) string {
 
 	// Pull the raw addr-spec from the header if present.
 	raw := headerText
+
 	i := strings.LastIndex(headerText, "<")
 	if i >= 0 {
 		j := strings.LastIndex(headerText, ">")
@@ -387,6 +400,7 @@ func preserveLocalPartCase(headerText, parsed string) string {
 	}
 
 	raw = strings.TrimSpace(raw)
+
 	rat := strings.LastIndexByte(raw, '@')
 	if rat < 0 {
 		return parsed
@@ -435,6 +449,7 @@ func normalize(ctx context.Context, raw []byte) ([]byte, error) {
 				return nil, err
 			}
 		}
+
 		switch raw[i] {
 		case '\r':
 			if i+1 < len(raw) && raw[i+1] == '\n' {
@@ -442,15 +457,16 @@ func normalize(ctx context.Context, raw []byte) ([]byte, error) {
 			}
 
 			out = append(out, crlf...)
+
 			length = 0
 		case '\n':
 			out = append(out, crlf...)
+
 			length = 0
 		default:
 			out = append(out, raw[i])
 
 			length++
-
 			if length > maxLineLength {
 				return nil, errLongLine
 			}
@@ -483,6 +499,7 @@ func scan(ctx context.Context, header []byte) ([]field, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+
 		end := bytes.Index(header[offset:], crlf)
 		if end < 0 {
 			return nil, errMalformed
@@ -583,7 +600,6 @@ func containsHeaderControls(b []byte) bool {
 
 func traceValue(value string) string {
 	var builder strings.Builder
-
 	builder.Grow(min(len(value), maxTraceLength))
 
 	for _, char := range value {

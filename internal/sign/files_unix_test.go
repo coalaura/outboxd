@@ -12,14 +12,18 @@ import (
 
 func TestLoadRejectsAccessibleAndSymlinkedKeyUnix(t *testing.T) {
 	dir := t.TempDir()
+
 	cfg := config.Default()
+
 	cfg.Server.DataDirectory = dir
+
 	_, _, err := Ensure(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	path, _ := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
+
 	err = os.Chmod(path, 0640)
 	if err != nil {
 		t.Fatal(err)
@@ -36,6 +40,7 @@ func TestLoadRejectsAccessibleAndSymlinkedKeyUnix(t *testing.T) {
 	}
 
 	real := filepath.Join(dir, "real.key")
+
 	err = os.Rename(path, real)
 	if err != nil {
 		t.Fatal(err)
@@ -54,8 +59,10 @@ func TestLoadRejectsAccessibleAndSymlinkedKeyUnix(t *testing.T) {
 
 func TestLoadRejectsSymlinkedParentUnix(t *testing.T) {
 	dir := t.TempDir()
+
 	real := filepath.Join(dir, "real")
 	data := filepath.Join(dir, "data")
+
 	err := os.MkdirAll(real, 0700)
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +74,9 @@ func TestLoadRejectsSymlinkedParentUnix(t *testing.T) {
 	}
 
 	cfg := config.Default()
+
 	cfg.Server.DataDirectory = real
+
 	_, _, err = Ensure(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -79,6 +88,7 @@ func TestLoadRejectsSymlinkedParentUnix(t *testing.T) {
 	}
 
 	cfg.Server.DataDirectory = data
+
 	_, err = Load(cfg)
 	if err == nil {
 		t.Fatal("Load accepted a DKIM key beneath a symlinked parent")

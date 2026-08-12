@@ -17,12 +17,17 @@ func resetHooks(t *testing.T) {
 
 func TestMkdirDurableSyncsEveryNewParent(t *testing.T) {
 	resetHooks(t)
+
 	base := t.TempDir()
+
 	a := filepath.Join(base, "a")
 	b := filepath.Join(a, "b")
+
 	var synced []string
+
 	SetHooks(Hooks{AfterSyncDir: func(path string) error {
 		synced = append(synced, filepath.Clean(path))
+
 		return nil
 	}})
 
@@ -48,8 +53,11 @@ func TestMkdirDurableSyncsEveryNewParent(t *testing.T) {
 
 func TestMkdirDurablePropagatesParentSyncFailure(t *testing.T) {
 	resetHooks(t)
+
 	base := t.TempDir()
+
 	wantErr := errors.New("sync parent")
+
 	SetHooks(Hooks{BeforeSyncDir: func(path string) error {
 		if filepath.Clean(path) == filepath.Clean(base) {
 			return wantErr
@@ -57,6 +65,7 @@ func TestMkdirDurablePropagatesParentSyncFailure(t *testing.T) {
 
 		return nil
 	}})
+
 	err := MkdirDurable(filepath.Join(base, "a", "b"))
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("MkdirDurable error=%v want %v", err, wantErr)
@@ -70,7 +79,9 @@ func TestMkdirDurablePropagatesParentSyncFailure(t *testing.T) {
 
 func TestAllocatedBytesDoesNotFollowSymlinks(t *testing.T) {
 	root := t.TempDir()
+
 	external := filepath.Join(t.TempDir(), "external")
+
 	err := os.Mkdir(external, 0700)
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +110,9 @@ func TestAllocatedBytesDoesNotFollowSymlinks(t *testing.T) {
 func TestValidatePathRejectsSymlinkComponent(t *testing.T) {
 	root := t.TempDir()
 	external := t.TempDir()
+
 	link := filepath.Join(root, "link")
+
 	err := os.Symlink(external, link)
 	if err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
@@ -125,9 +138,12 @@ func TestAllocationSizeUsesConservativeUnit(t *testing.T) {
 
 func TestRenameSyncsDestinationBeforeSource(t *testing.T) {
 	resetHooks(t)
+
 	root := t.TempDir()
+
 	srcDir := filepath.Join(root, "src")
 	dstDir := filepath.Join(root, "dst")
+
 	err := os.Mkdir(srcDir, 0700)
 	if err != nil {
 		t.Fatal(err)
@@ -140,14 +156,17 @@ func TestRenameSyncsDestinationBeforeSource(t *testing.T) {
 
 	src := filepath.Join(srcDir, "entry")
 	dst := filepath.Join(dstDir, "entry")
+
 	err = os.WriteFile(src, []byte("x"), 0600)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	var synced []string
+
 	SetHooks(Hooks{AfterSyncDir: func(path string) error {
 		synced = append(synced, filepath.Clean(path))
+
 		return nil
 	}})
 
@@ -164,15 +183,20 @@ func TestRenameSyncsDestinationBeforeSource(t *testing.T) {
 
 func TestWriteReplacesFileAndReportsParentSyncFailure(t *testing.T) {
 	resetHooks(t)
+
 	root := t.TempDir()
+
 	path := filepath.Join(root, "meta.json")
+
 	err := os.WriteFile(path, []byte("old"), 0600)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	wantErr := errors.New("sync replacement parent")
-	renamed := false
+
+	var renamed bool
+
 	SetHooks(Hooks{
 		AfterRename: func(_, newpath string) error {
 			if filepath.Clean(newpath) == filepath.Clean(path) {
@@ -189,6 +213,7 @@ func TestWriteReplacesFileAndReportsParentSyncFailure(t *testing.T) {
 			return nil
 		},
 	})
+
 	err = Write(path, []byte("new complete metadata"), 0600)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("Write error=%v want %v", err, wantErr)
