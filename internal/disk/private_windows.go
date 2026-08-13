@@ -144,10 +144,6 @@ func protectPrivateFile(path string) error {
 	return windowsacl.Protect(path, false)
 }
 
-func protectPrivateDirectory(path string) error {
-	return windowsacl.Protect(path, true)
-}
-
 func createPrivateFile(path string, flag int, mode os.FileMode) (*os.File, error) {
 	attributes, err := windowsacl.SecurityAttributes(false)
 	if err != nil {

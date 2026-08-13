@@ -278,10 +278,7 @@ func (q *Queue) AddContext(ctx context.Context, envelope *Envelope, data []byte)
 
 		// Quarantine intentionally retains the failed entry. If quarantine itself
 		// failed, the entry may remain in either namespace and must still be charged.
-		commitPhysicalBytes := persistent
-		if commitPhysicalBytes > physicalHeld {
-			commitPhysicalBytes = physicalHeld
-		}
+		commitPhysicalBytes := min(persistent, physicalHeld)
 
 		q.mu.Lock()
 		q.commitPhysicalLocked(commitPhysicalBytes)

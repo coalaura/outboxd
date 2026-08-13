@@ -150,9 +150,7 @@ func smtpCode(err error) int {
 }
 
 func smtpEnhancedCode(err error) string {
-	var se *SMTPError
-
-	if errors.As(err, &se) {
+	if se, ok := errors.AsType[*SMTPError](err); ok {
 		return se.EnhancedCode
 	}
 

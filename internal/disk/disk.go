@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 )
 
@@ -232,27 +233,27 @@ func MkdirDurable(path string) error {
 		return nil
 	}
 
-	for i := len(missing) - 1; i >= 0; i-- {
-		created, err := mkdirDurableComponent(missing[i])
+	for _, path := range slices.Backward(missing) {
+		created, err := mkdirDurableComponent(path)
 		if err != nil {
 			if !os.IsExist(err) {
 				return err
 			}
 
-			info, statErr := os.Stat(missing[i])
+			info, statErr := os.Stat(path)
 			if statErr != nil {
 				return statErr
 			}
 
 			if !info.IsDir() {
-				return &os.PathError{Op: "mkdir", Path: missing[i], Err: os.ErrExist}
+				return &os.PathError{Op: "mkdir", Path: path, Err: os.ErrExist}
 			}
 		}
 
-		err = Sync(filepath.Dir(missing[i]))
+		err = Sync(filepath.Dir(path))
 		if err != nil {
 			if created {
-				_ = os.Remove(missing[i])
+				_ = os.Remove(path)
 			}
 
 			return err

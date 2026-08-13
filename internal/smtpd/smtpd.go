@@ -254,13 +254,7 @@ func burstDefault(hourly int) int {
 		return 1
 	}
 
-	b := max(hourly/60, 1)
-
-	if b > hourly {
-		b = hourly
-	}
-
-	return b
+	return min(max(hourly/60, 1), hourly)
 }
 
 // address normalizes an SMTP mailbox while preserving local-part case.

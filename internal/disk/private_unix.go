@@ -20,10 +20,6 @@ func protectPrivateFile(string) error {
 	return nil
 }
 
-func protectPrivateDirectory(string) error {
-	return nil
-}
-
 func createPrivateFile(path string, flag int, mode os.FileMode) (*os.File, error) {
 	return os.OpenFile(path, flag, mode)
 }

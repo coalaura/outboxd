@@ -74,9 +74,7 @@ func IsStoragePressure(err error) bool {
 		return true
 	}
 
-	var errno syscall.Errno
-
-	if errors.As(err, &errno) {
+	if errno, ok := errors.AsType[syscall.Errno](err); ok {
 		// ENOSPC/EDQUOT on common Unix platforms and ERROR_DISK_FULL on Windows.
 		return errno == 28 || errno == 122 || errno == 112
 	}
@@ -89,9 +87,7 @@ func acceptanceUnknown(cause error) error {
 }
 
 func definiteAcceptanceCause(err error) error {
-	var unknown *acceptanceUnknownError
-
-	if errors.As(err, &unknown) {
+	if unknown, ok := errors.AsType[*acceptanceUnknownError](err); ok {
 		return unknown.cause
 	}
 
