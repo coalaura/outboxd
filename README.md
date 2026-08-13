@@ -199,6 +199,7 @@ The spool must be private to the outboxd service account. Do not place symlinks,
 ```text
 outboxd [-config path] serve                 # default when no command is given
 outboxd [-config path] provision             # create config, data/spool and DKIM key
+outboxd [-config path] config update         # add current defaults to an existing config
 outboxd [-config path] user add <user> [sender...]
 outboxd [-config path] dns                   # write and print DNS instructions
 outboxd [-config path] check                 # verify local configuration and DNS
@@ -212,6 +213,8 @@ outboxd [-config path] corrupt delete <name>
 ```
 
 Use `OUTBOXD_CONFIG` instead of `-config` to select a config path.
+
+After replacing the binary, run `config update` to atomically rewrite an existing configuration in the current documented format. Configured values are retained and fields omitted by older versions receive current defaults. The command requires an existing valid configuration, does not provision keys or other assets and requires a daemon restart before the updated startup configuration takes effect. The canonical rewrite replaces custom YAML formatting and comments with outboxd's generated documentation.
 
 ## Security Notes
 

@@ -67,7 +67,7 @@ type DKIM struct {
 }
 
 type OpenPGP struct {
-	Identities []OpenPGPIdentity `yaml:"identities,omitempty"`
+	Identities []OpenPGPIdentity `yaml:"identities"`
 }
 
 type OpenPGPIdentity struct {

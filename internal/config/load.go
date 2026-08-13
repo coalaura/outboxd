@@ -134,6 +134,39 @@ func EnsurePath(path string) (*Config, bool, error) {
 	return cfg, true, nil
 }
 
+// UpdateFile atomically rewrites an existing config with current defaults.
+func UpdateFile(path string) (*Config, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// Confirm the config exists before creating its mutation lock file.
+	_, err = LoadFile(abs)
+	if err != nil {
+		return nil, err
+	}
+
+	lock, err := lockConfig(abs + ".lock")
+	if err != nil {
+		return nil, err
+	}
+
+	defer lock.Close()
+
+	latest, err := LoadFile(abs)
+	if err != nil {
+		return nil, fmt.Errorf("reload config under mutation lock: %w", err)
+	}
+
+	err = latest.Save()
+	if err != nil {
+		return nil, err
+	}
+
+	return latest, nil
+}
+
 func isYAMLEOF(err error) bool {
 	return err != nil && (errors.Is(err, io.EOF) || strings.Contains(err.Error(), "EOF"))
 }

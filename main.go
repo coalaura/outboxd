@@ -45,6 +45,8 @@ func main() {
 	}
 
 	switch args[0] {
+	case "config":
+		log.MustExit(configCommand(configPath, args[1:]))
 	case "user":
 		log.MustExit(user(configPath, args[1:]))
 	case "dns":
@@ -84,8 +86,25 @@ func main() {
 
 		log.MustExit(serve(configPath))
 	default:
-		log.MustExit(fmt.Errorf("unknown command %q, expected version, user, provision, dns, check, dead, corrupt, or serve (default)", args[0]))
+		log.MustExit(fmt.Errorf("unknown command %q, expected version, config, user, provision, dns, check, dead, corrupt, or serve (default)", args[0]))
 	}
+}
+
+func configCommand(configPath string, args []string) error {
+	if len(args) != 1 || args[0] != "update" {
+		return errors.New("usage: outboxd config update")
+	}
+
+	path := config.ResolveConfigPath(configPath)
+
+	updated, err := config.UpdateFile(path)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stdout, "Updated config at %q with current defaults. Configuration changes require an outboxd restart.\n", updated.Path())
+
+	return nil
 }
 
 func printVersion(w io.Writer) {

@@ -70,6 +70,112 @@ func TestParseGlobalVersionFlagPreservesCommands(t *testing.T) {
 	}
 }
 
+func TestConfigUpdatePreservesValuesAndAddsDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+
+	hash, err := passwd.Hash("test-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := "# operator comment\n" +
+		"server:\n  hostname: mail.example.com\n  domain: example.com\n  data_directory: ./state\n" +
+		"tls:\n  mode: files\n  certificate_file: cert.pem\n  private_key_file: key.pem\n  minimum_version: \"1.3\"\n" +
+		"dkim:\n  selector: outbound\n  private_key_file: dkim.key\n  headers: [From]\n" +
+		"delivery:\n  tls_mode: required\n" +
+		"dns:\n  dmarc_policy: reject\n  public_ipv4: 203.0.113.10\n" +
+		"users:\n  - username: alice\n    password_hash: \"" + hash + "\"\n" +
+		"    allowed_senders: [\"alice@example.com\"]\n    enabled: true\n"
+
+	err = os.WriteFile(path, []byte(body), 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = configCommand(path, []string{"update"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := config.LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if updated.Server.Hostname != "mail.example.com" || updated.Server.DataDirectory != "./state" {
+		t.Fatalf("server values changed: %+v", updated.Server)
+	}
+
+	if updated.TLS.Mode != "files" || updated.TLS.MinimumVersion != "1.3" || updated.DKIM.Selector != "outbound" {
+		t.Fatalf("signing or TLS values changed: tls=%+v dkim=%+v", updated.TLS, updated.DKIM)
+	}
+
+	if updated.DNS.DMARC != "reject" || updated.Server.MaxConnections != config.Default().Server.MaxConnections {
+		t.Fatalf("configured/default values not retained: dns=%+v server=%+v", updated.DNS, updated.Server)
+	}
+
+	rewritten, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, field := range []string{"reply_rejection:", "max_connections:", "openpgp:", "identities: []"} {
+		if !bytes.Contains(rewritten, []byte(field)) {
+			t.Fatalf("updated config missing %q", field)
+		}
+	}
+}
+
+func TestConfigUpdateRequiresExistingValidConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+
+	err := configCommand(path, []string{"update"})
+	if err == nil {
+		t.Fatal("config update created a missing config")
+	}
+
+	for _, candidate := range []string{path, path + ".lock"} {
+		if _, statErr := os.Stat(candidate); !os.IsNotExist(statErr) {
+			t.Fatalf("config update created %s: %v", candidate, statErr)
+		}
+	}
+
+	err = os.WriteFile(path, []byte("unknown: true\n"), 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = configCommand(path, []string{"update"})
+	if err == nil {
+		t.Fatal("config update accepted invalid config")
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(after, before) {
+		t.Fatal("failed config update rewrote the config")
+	}
+}
+
+func TestConfigCommandRequiresExactArguments(t *testing.T) {
+	for _, args := range [][]string{nil, {"update", "extra"}, {"unknown"}} {
+		err := configCommand("unused.yml", args)
+		if err == nil || err.Error() != "usage: outboxd config update" {
+			t.Fatalf("args=%q error=%v", args, err)
+		}
+	}
+}
+
 func TestServeDataDirectoryResolvedAgainstConfig(t *testing.T) {
 	// Relative data_directory must resolve next to the config file, not CWD.
 	cfgDir := t.TempDir()

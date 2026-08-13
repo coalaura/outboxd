@@ -139,6 +139,13 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.users": {yaml.HeadComment("\n# SMTP users; password_hash must contain an Argon2id hash, never plaintext; {ARGON2ID}-prefixed hashes are accepted for migration")},
 	}
 
+	if len(cfg.OpenPGP.Identities) == 0 {
+		delete(comments, "$.openpgp.identities[*].sender")
+		delete(comments, "$.openpgp.identities[*].signing_key")
+		delete(comments, "$.openpgp.identities[*].passphrase_file")
+		delete(comments, "$.openpgp.identities[*].signing")
+	}
+
 	cfg.dataMu.RLock()
 	err := yaml.NewEncoder(&buffer, yaml.WithComment(comments), yaml.Indent(2)).Encode(cfg)
 	cfg.dataMu.RUnlock()
