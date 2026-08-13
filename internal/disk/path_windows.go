@@ -25,3 +25,7 @@ func isLinkOrReparse(path string, info os.FileInfo) (bool, error) {
 
 	return attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0, nil
 }
+
+func allowNamespaceLink(string) (bool, error) {
+	return false, nil
+}

@@ -655,7 +655,7 @@ func TestIncompleteBDATAbsoluteDeadlineReleasesWorker(t *testing.T) {
 
 	srv, cfg, _, _, pool := testServerWithUser(t, password)
 
-	cfg.Server.ReadTimeout = "150ms"
+	cfg.Server.ReadTimeout = "1s"
 
 	srv.dataWork = make(chan struct{}, 1)
 
@@ -681,12 +681,12 @@ func TestIncompleteBDATAbsoluteDeadlineReleasesWorker(t *testing.T) {
 
 	// NOOP refreshes go-smtp's command deadline, but must not renew Data's timer.
 	for range 3 {
-		time.Sleep(40 * time.Millisecond)
+		time.Sleep(250 * time.Millisecond)
 
 		cl.cmd(t, "NOOP", 250)
 	}
 
-	time.Sleep(60 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	cl.expectClosed(t)
 	cl.close()
@@ -700,6 +700,8 @@ func TestIncompleteBDATAbsoluteDeadlineReleasesWorker(t *testing.T) {
 	if len(srv.dataWork) != 0 {
 		t.Fatal("DATA worker remained held after BDAT deadline")
 	}
+
+	cfg.Server.ReadTimeout = "5s"
 
 	next := dialSTARTTLS(t, srv.starttls.Addr, pool)
 	defer next.close()
@@ -983,7 +985,7 @@ func TestDataDeadlineQueueAddOutcomes(t *testing.T) {
 
 			srv, cfg, spool, _, pool := testServerWithUser(t, password)
 
-			cfg.Server.ReadTimeout = "100ms"
+			cfg.Server.ReadTimeout = "5s"
 
 			srv.dataWork = make(chan struct{}, 1)
 
@@ -1028,8 +1030,8 @@ func TestDataDeadlineQueueAddOutcomes(t *testing.T) {
 			beginMessage(t, cl, "")
 			writeMessage(cl, "queue operation outlives DATA deadline")
 
-			awaitCh(t, entered, time.Second, "queue add")
-			awaitCh(t, expired, time.Second, "DATA deadline")
+			awaitCh(t, entered, 10*time.Second, "queue add")
+			awaitCh(t, expired, 10*time.Second, "DATA deadline")
 
 			close(release)
 

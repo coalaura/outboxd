@@ -168,6 +168,15 @@ func ValidatePath(path string) error {
 			}
 
 			if linked {
+				allowed, allowErr := allowNamespaceLink(current)
+				if allowErr != nil {
+					return allowErr
+				}
+
+				if allowed {
+					continue
+				}
+
 				return &os.PathError{Op: "validate spool namespace", Path: current, Err: errors.New("symbolic link or reparse point is not allowed")}
 			}
 		} else if !errors.Is(statErr, os.ErrNotExist) {
