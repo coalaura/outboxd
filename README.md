@@ -43,7 +43,7 @@ Inspect the release page rather than guessing a checksum. The archive's top-leve
 
 ### Build from source
 
-Go 1.26.5 or newer is required. Build the binary, assemble the same payload, and run the same setup script:
+Go 1.26.5 or newer is required. Build the binary, assemble the same payload and run the same setup script:
 
 ```bash
 git clone https://github.com/coalaura/outboxd.git
@@ -58,11 +58,11 @@ sudo install -o root -g root -m 0755 conf/setup.sh conf/uninstall.sh /opt/outbox
 sudo /opt/outboxd/conf/setup.sh
 ```
 
-`setup.sh` must run as root. It creates or reuses the `outboxd` system account, prepares `/var/lib/outboxd` with mode `0700`, installs copies of the sysusers and systemd files, reloads systemd, and enables the service. It is safe to rerun after replacing `/opt/outboxd`; it does not recursively change payload or state ownership.
+`setup.sh` must run as root. It creates or reuses the `outboxd` system account, prepares `/var/lib/outboxd` with mode `0700`, installs copies of the sysusers and systemd files, reloads systemd and enables the service. It is safe to rerun after replacing `/opt/outboxd`; it does not recursively change payload or state ownership.
 
 ## Quick Start
 
-Run administrative commands as the service account so generated configuration, keys, and queue state keep the correct ownership. Create the initial configuration:
+Run administrative commands as the service account so generated configuration, keys and queue state keep the correct ownership. Create the initial configuration:
 
 ```bash
 sudo -u outboxd /opt/outboxd/outboxd -config /var/lib/outboxd/config.yml provision
@@ -152,7 +152,7 @@ Signing produces RFC 3156 `multipart/signed` data before DKIM is applied. The ex
 
 Certificate deployment is intentionally left to the operator so outboxd can be used with any certificate authority or existing automation. The `outboxd` service account must be able to read both configured files. On Unix, the private key must have no group or other permission bits; use mode `0600` and ownership that permits the service account to read it. Do not weaken the key permissions to make an external certificate directory accessible. Copying or deploying certificate material into a private location such as `/var/lib/outboxd/tls` is one compatible approach, but outboxd does not prescribe or install that automation.
 
-outboxd checks the configured certificate and key during TLS handshakes, rate-limited to avoid filesystem reads on every connection. A valid changed pair is loaded automatically; no signal, systemd reload, or restart is needed. If a transient read or validation failure occurs while files are replaced, outboxd continues serving the previously loaded certificate while it remains valid and retries on a later handshake. Once the old certificate expires, an invalid replacement cannot be used and affected TLS handshakes fail.
+outboxd checks the configured certificate and key during TLS handshakes, rate-limited to avoid filesystem reads on every connection. A valid changed pair is loaded automatically; no signal, systemd reload or restart is needed. If a transient read or validation failure occurs while files are replaced, outboxd continues serving the previously loaded certificate while it remains valid and retries on a later handshake. Once the old certificate expires, an invalid replacement cannot be used and affected TLS handshakes fail.
 
 ## DNS Checklist
 
@@ -175,7 +175,7 @@ Operator-managed TLS files may be outside `data_directory`, subject to service s
 
 Configuration, users, DKIM and OpenPGP keys, queue limits and delivery policy are loaded at startup. Restart outboxd after changing them. TLS certificate and key contents are the only runtime-reloaded files.
 
-To remove the installed systemd and sysusers files, run `sudo /opt/outboxd/conf/uninstall.sh`. It deliberately preserves `/opt/outboxd`, `/var/lib/outboxd`, and the `outboxd` account so private state retains its owner. Remove preserved state and then the account manually only when permanently decommissioning the service.
+To remove the installed systemd and sysusers files, run `sudo /opt/outboxd/conf/uninstall.sh`. It deliberately preserves `/opt/outboxd`, `/var/lib/outboxd` and the `outboxd` account so private state retains its owner. Remove preserved state and then the account manually only when permanently decommissioning the service.
 
 Useful limits include:
 
@@ -216,7 +216,7 @@ Use `OUTBOXD_CONFIG` instead of `-config` to select a config path.
 ## Security Notes
 
 - Use `tls.mode: files` with a publicly trusted certificate in production. `self_signed` is development-only and requires an explicit opt-in.
-- Keep the config, DKIM key, OpenPGP keys and passphrase files, and data directory readable and writable only by the service account. On Windows, configure the service account and ACLs yourself.
+- Keep the config, DKIM key, OpenPGP keys and passphrase files and data directory readable and writable only by the service account. On Windows, configure the service account and ACLs yourself.
 - Outbound delivery defaults to verified, required TLS. Do not enable plaintext or insecure TLS unless the compatibility tradeoff is deliberate.
 - outboxd does not accept inbound message data and does not implement inbound mail storage, DANE, MTA-STS or DNSSEC validation.
 - A private local filesystem with reliable rename/sync behavior is required for the queue durability guarantees.
