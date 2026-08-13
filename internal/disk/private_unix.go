@@ -2,13 +2,39 @@
 
 package disk
 
-import "os"
+import (
+	"fmt"
+	"os"
+)
 
 func EnsurePrivateRoot(path string) error {
-	return MkdirDurable(path)
+	err := ValidatePath(path)
+	if err != nil {
+		return err
+	}
+
+	err = MkdirDurable(path)
+	if err != nil {
+		return err
+	}
+
+	return ValidatePrivateDirectory(path)
 }
 
-func ValidatePrivateDirectory(string) error {
+func ValidatePrivateDirectory(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+
+	if !info.IsDir() {
+		return fmt.Errorf("private directory %q is not a directory", path)
+	}
+
+	if info.Mode().Perm()&0077 != 0 {
+		return fmt.Errorf("private directory %q permissions %04o allow group or other access", path, info.Mode().Perm())
+	}
+
 	return nil
 }
 

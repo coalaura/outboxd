@@ -98,12 +98,8 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.dkim.private_key_file": {yaml.HeadComment(" create-once signing key provisioned explicitly with 'outboxd provision'")},
 		"$.dkim.headers":          {yaml.HeadComment(" message headers included in the DKIM signature; From is mandatory")},
 
-		"$.openpgp":                               {yaml.HeadComment("\n# optional RFC 3156 OpenPGP/MIME signing; configured identities are required-signing")},
-		"$.openpgp.identities":                    {yaml.HeadComment(" exact From identities and their operator-managed private keys")},
-		"$.openpgp.identities[*].sender":          {yaml.HeadComment(" exact header From mailbox; local-part matching is case-sensitive")},
-		"$.openpgp.identities[*].signing_key":     {yaml.HeadComment(" armored or binary private key; relative paths resolve below data_directory")},
-		"$.openpgp.identities[*].passphrase_file": {yaml.HeadComment(" optional private file containing the encrypted key passphrase")},
-		"$.openpgp.identities[*].signing":         {yaml.HeadComment(` must be "required"; signing failure rejects submission`)},
+		"$.openpgp":            {yaml.HeadComment("\n# optional RFC 3156 OpenPGP/MIME signing; configured identities are required-signing")},
+		"$.openpgp.identities": {yaml.HeadComment(" exact From identities and their generated or operator-managed private keys; sender local parts are case-sensitive, relative paths resolve below data_directory, and signing must be required")},
 
 		"$.delivery":                                  {yaml.HeadComment("\n# outbound SMTP delivery and retry policy")},
 		"$.delivery.tls_mode":                         {yaml.HeadComment(` destination TLS policy (chosen before connect; never verified-then-insecure fallback): "opportunistic" (verify STARTTLS when offered; plaintext only if allow_plaintext), "required" (STARTTLS required, verified), "opportunistic_insecure" (STARTTLS without cert verification — legacy/dev only)`)},
@@ -137,13 +133,6 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.dns.output_file":      {yaml.HeadComment(" generated DNS instructions; relative paths are below data_directory")},
 
 		"$.users": {yaml.HeadComment("\n# SMTP users; password_hash must contain an Argon2id hash, never plaintext; migration hashes must use m=19456,t=2,p=1, a 16-byte salt, and a 32-byte output")},
-	}
-
-	if len(cfg.OpenPGP.Identities) == 0 {
-		delete(comments, "$.openpgp.identities[*].sender")
-		delete(comments, "$.openpgp.identities[*].signing_key")
-		delete(comments, "$.openpgp.identities[*].passphrase_file")
-		delete(comments, "$.openpgp.identities[*].signing")
 	}
 
 	cfg.dataMu.RLock()

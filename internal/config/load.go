@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/coalaura/outboxd/internal/disk"
 	"github.com/goccy/go-yaml"
 )
 
@@ -165,6 +166,35 @@ func UpdateFile(path string) (*Config, error) {
 	}
 
 	return latest, nil
+}
+
+// LockForMutation requires an existing valid config, takes its cross-process
+// mutation lock and reloads the owned snapshot.
+func LockForMutation(path string) (*Config, *disk.FileLock, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Do not create a lock file for a missing or already invalid config.
+	_, err = LoadFile(abs)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	lock, err := lockConfig(abs + ".lock")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	latest, err := LoadFile(abs)
+	if err != nil {
+		_ = lock.Close()
+
+		return nil, nil, fmt.Errorf("reload config under mutation lock: %w", err)
+	}
+
+	return latest, lock, nil
 }
 
 func isYAMLEOF(err error) bool {

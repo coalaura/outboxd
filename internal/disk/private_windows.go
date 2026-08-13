@@ -112,6 +112,24 @@ func ValidatePrivateTree(root string) error {
 }
 
 func validatePrivateDirectory(path string, requireProtected bool) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+
+	linked, err := isLinkOrReparse(path, info)
+	if err != nil {
+		return err
+	}
+
+	if linked {
+		return fmt.Errorf("private directory %q must not be a reparse point", path)
+	}
+
+	if !info.IsDir() {
+		return fmt.Errorf("private directory %q is not a directory", path)
+	}
+
 	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return err
