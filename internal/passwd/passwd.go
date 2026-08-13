@@ -22,6 +22,13 @@ const (
 
 	// Bound the entire PHC string before field work.
 	maxPHCLength = 512
+
+	migrationPrefix     = "{ARGON2ID}"
+	maxMigrationMemory  = 128 * 1024
+	maxMigrationTime    = 5
+	maxMigrationThreads = 8
+	maxMigrationSalt    = 64
+	maxMigrationKey     = 64
 )
 
 var (
@@ -60,7 +67,7 @@ func Hash(password string) (string, error) {
 	), nil
 }
 
-// Verify compares a password against a PHC formatted Argon2id hash.
+// Verify compares a password against an outboxd or {ARGON2ID}-prefixed hash.
 func Verify(hash, password string) (bool, error) {
 	p, err := parsePHC(hash)
 	if err != nil {
@@ -84,8 +91,9 @@ func maxEncodedLen(n int) int {
 	return encoding.EncodedLen(n)
 }
 
-// ValidatePHC checks an Argon2id PHC string without deriving a key, enforcing
-// bounds so hostile parameters cannot exhaust memory at authentication time.
+// ValidatePHC checks an outboxd or {ARGON2ID}-prefixed Argon2id PHC string
+// without deriving a key, enforcing bounds so hostile parameters cannot
+// exhaust resources at authentication time.
 func ValidatePHC(hash string) error {
 	_, err := parsePHC(hash)
 	return err
@@ -94,6 +102,14 @@ func ValidatePHC(hash string) error {
 func parsePHC(hash string) (*PHCParams, error) {
 	if hash == "" || len(hash) > maxPHCLength {
 		return nil, ErrInvalidHash
+	}
+
+	var migration bool
+
+	if len(hash) >= len(migrationPrefix) && strings.EqualFold(hash[:len(migrationPrefix)], migrationPrefix) {
+		migration = true
+
+		hash = hash[len(migrationPrefix):]
 	}
 
 	parts := strings.Split(hash, "$")
@@ -106,35 +122,72 @@ func parsePHC(hash string) (*PHCParams, error) {
 		return nil, ErrInvalidHash
 	}
 
+	maxSalt := saltLength
+	maxKey := keyLength
+
+	if migration {
+		maxSalt = maxMigrationSalt
+		maxKey = maxMigrationKey
+	}
+
 	// Bound encoded salt/key before any base64 decode work.
-	if len(parts[4]) > maxEncodedLen(saltLength) {
+	if len(parts[4]) > maxEncodedLen(maxSalt) {
 		return nil, fmt.Errorf("%w: salt size", ErrInvalidHash)
 	}
 
-	if len(parts[5]) > maxEncodedLen(keyLength) {
+	if len(parts[5]) > maxEncodedLen(maxKey) {
 		return nil, fmt.Errorf("%w: output size", ErrInvalidHash)
 	}
 
-	canonical := fmt.Sprintf("m=%d,t=%d,p=%d", hashMemory, hashTime, hashThreads)
-	if parts[3] != canonical {
-		return nil, fmt.Errorf("%w: non-canonical parameters", ErrInvalidHash)
+	memory, iterations, threads, err := parseParams(parts[3], migration)
+	if err != nil {
+		return nil, err
 	}
 
 	salt, err := encoding.DecodeString(parts[4])
-	if err != nil || len(salt) != saltLength {
+	if err != nil || len(salt) == 0 || len(salt) > maxSalt || (!migration && len(salt) != saltLength) {
 		return nil, fmt.Errorf("%w: salt size", ErrInvalidHash)
 	}
 
 	expected, err := encoding.DecodeString(parts[5])
-	if err != nil || len(expected) != keyLength {
+	if err != nil || len(expected) == 0 || len(expected) > maxKey || (!migration && len(expected) != keyLength) {
 		return nil, fmt.Errorf("%w: output size", ErrInvalidHash)
 	}
 
 	return &PHCParams{
-		Memory:     hashMemory,
-		Iterations: hashTime,
-		Threads:    hashThreads,
+		Memory:     memory,
+		Iterations: iterations,
+		Threads:    threads,
 		Salt:       salt,
 		Key:        expected,
 	}, nil
+}
+
+func parseParams(value string, migration bool) (uint32, uint32, uint8, error) {
+	canonical := fmt.Sprintf("m=%d,t=%d,p=%d", hashMemory, hashTime, hashThreads)
+
+	if !migration {
+		if value != canonical {
+			return 0, 0, 0, fmt.Errorf("%w: non-canonical parameters", ErrInvalidHash)
+		}
+
+		return hashMemory, hashTime, hashThreads, nil
+	}
+
+	var (
+		memory     uint32
+		iterations uint32
+		threads    uint8
+	)
+
+	n, err := fmt.Sscanf(value, "m=%d,t=%d,p=%d", &memory, &iterations, &threads)
+	if err != nil || n != 3 || value != fmt.Sprintf("m=%d,t=%d,p=%d", memory, iterations, threads) {
+		return 0, 0, 0, fmt.Errorf("%w: parameters", ErrInvalidHash)
+	}
+
+	if memory < 8*uint32(threads) || memory > maxMigrationMemory || iterations == 0 || iterations > maxMigrationTime || threads == 0 || threads > maxMigrationThreads {
+		return 0, 0, 0, fmt.Errorf("%w: parameters out of bounds", ErrInvalidHash)
+	}
+
+	return memory, iterations, threads, nil
 }

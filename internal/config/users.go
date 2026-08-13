@@ -94,7 +94,10 @@ func (u *User) Validate() error {
 		return fmt.Errorf("invalid username %q", u.Username)
 	}
 
-	if !strings.HasPrefix(u.PasswordHash, "$argon2id$") {
+	migrationPrefix := "{ARGON2ID}$argon2id$"
+	isMigrationHash := len(u.PasswordHash) >= len(migrationPrefix) && strings.EqualFold(u.PasswordHash[:len(migrationPrefix)], migrationPrefix)
+
+	if !strings.HasPrefix(u.PasswordHash, "$argon2id$") && !isMigrationHash {
 		return fmt.Errorf("user %q must have an Argon2id password hash", u.Username)
 	}
 

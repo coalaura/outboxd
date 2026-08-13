@@ -42,6 +42,70 @@ func TestHashAndVerify(t *testing.T) {
 	}
 }
 
+func TestVerifyPrefixedArgon2id(t *testing.T) {
+	password := "migration-password"
+	salt := []byte("1234567890abcdef")
+
+	memory := uint32(32)
+	iterations := uint32(1)
+	threads := uint8(2)
+
+	key := argon2.IDKey([]byte(password), salt, iterations, memory, threads, keyLength)
+
+	hash := fmt.Sprintf("{ARGON2ID}$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s", argon2.Version, memory, iterations, threads, encoding.EncodeToString(salt), encoding.EncodeToString(key))
+
+	err := ValidatePHC(hash)
+	if err != nil {
+		t.Fatalf("ValidatePHC rejected prefixed hash: %v", err)
+	}
+
+	ok, err := Verify(hash, password)
+	if err != nil || !ok {
+		t.Fatalf("Verify failed: ok=%v err=%v", ok, err)
+	}
+
+	ok, err = Verify(hash, "wrong-password")
+	if err != nil || ok {
+		t.Fatalf("Verify with wrong password: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestValidatePrefixedArgon2idBounds(t *testing.T) {
+	salt := encoding.EncodeToString(make([]byte, saltLength))
+	key := encoding.EncodeToString(make([]byte, keyLength))
+
+	for _, params := range []string{
+		"m=0,t=1,p=1",
+		"m=7,t=1,p=1",
+		"m=131073,t=1,p=1",
+		"m=8,t=0,p=1",
+		"m=8,t=6,p=1",
+		"m=8,t=1,p=0",
+		"m=72,t=1,p=9",
+		"m=32,t=1,p=1,x=1",
+		"t=1,m=32,p=1",
+	} {
+		hash := fmt.Sprintf("{ARGON2ID}$argon2id$v=%d$%s$%s$%s", argon2.Version, params, salt, key)
+
+		err := ValidatePHC(hash)
+		if err == nil {
+			t.Fatalf("unsafe or malformed parameters %q accepted", params)
+		}
+	}
+
+	typical := fmt.Sprintf("{ARGON2ID}$argon2id$v=%d$m=65536,t=3,p=1$%s$%s", argon2.Version, salt, key)
+
+	err := ValidatePHC(typical)
+	if err != nil {
+		t.Fatalf("typical migration parameters rejected: %v", err)
+	}
+
+	err = ValidatePHC("{ARGON2I}$argon2i$v=19$m=32,t=1,p=1$" + salt + "$" + key)
+	if err == nil {
+		t.Fatal("unsupported prefixed scheme accepted")
+	}
+}
+
 func TestValidatePHCBounds(t *testing.T) {
 	salt := encoding.EncodeToString(make([]byte, 16))
 	key := encoding.EncodeToString(make([]byte, 32))

@@ -904,6 +904,27 @@ func TestValidatePHCViaUser(t *testing.T) {
 	}
 }
 
+func TestValidatePrefixedPHCViaUser(t *testing.T) {
+	cfg := Default()
+
+	cfg.Server.Hostname = "mail.example.com"
+	cfg.Server.Domain = "example.com"
+
+	cfg.initializeRuntime()
+
+	hash := validUserPHC(t)
+
+	cfg.Users = []User{{
+		Username: "a", PasswordHash: "{ARGON2ID}" + hash,
+		AllowedSenders: []string{"a@example.com"}, Enabled: true,
+	}}
+
+	err := cfg.Validate()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDKIMHeadersRequireSender(t *testing.T) {
 	cfg := Default()
 

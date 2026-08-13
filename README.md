@@ -106,6 +106,8 @@ sudo -u outboxd /opt/outboxd/outboxd -config /var/lib/outboxd/config.yml user ad
 printf '%s\n' 'a-long-password' | sudo -u outboxd /opt/outboxd/outboxd -config /var/lib/outboxd/config.yml user add alice alice@example.com
 ```
 
+The user command always stores a native Argon2id hash. For migration, a `password_hash` copied into the configuration may instead use the Dovecot-style `{ARGON2ID}$argon2id$...` form. Only Argon2id is supported and imported parameters are subject to resource limits. Restart outboxd after editing users.
+
 Generate the DNS instructions while the daemon is stopped:
 
 ```bash

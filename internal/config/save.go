@@ -117,7 +117,7 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.dns.spf_includes":     {yaml.HeadComment(" additional SPF include: domains for other legitimate senders")},
 		"$.dns.output_file":      {yaml.HeadComment(" generated DNS instructions; relative paths are below data_directory")},
 
-		"$.users": {yaml.HeadComment("\n# SMTP users; password_hash must contain an Argon2id hash, never plaintext")},
+		"$.users": {yaml.HeadComment("\n# SMTP users; password_hash must contain an Argon2id hash, never plaintext; {ARGON2ID}-prefixed hashes are accepted for migration")},
 	}
 
 	cfg.dataMu.RLock()
