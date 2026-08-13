@@ -26,6 +26,12 @@ type enhancedCodeCase struct {
 	want    string
 }
 
+type dataLengthMismatchCase struct {
+	name string
+	body string
+	want error
+}
+
 type domainErrorResolver struct{}
 
 type resolverFuncs struct {
@@ -394,11 +400,7 @@ func TestDataCopyErrorAbortsWithoutTerminator(t *testing.T) {
 }
 
 func TestDataLengthMismatchAbortsWithoutTerminator(t *testing.T) {
-	for _, tt := range []struct {
-		name string
-		body string
-		want error
-	}{
+	for _, tt := range []dataLengthMismatchCase{
 		{name: "short", body: "four", want: errBodyTooShort},
 		{name: "long", body: "sixsix", want: errBodyTooLong},
 	} {

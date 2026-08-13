@@ -15,6 +15,11 @@ import (
 	"github.com/coalaura/outboxd/internal/sign"
 )
 
+type versionInput struct {
+	flag bool
+	args []string
+}
+
 func TestVersionCLI(t *testing.T) {
 	original := Version
 	Version = "v1.2.3"
@@ -23,10 +28,7 @@ func TestVersionCLI(t *testing.T) {
 		Version = original
 	})
 
-	for name, input := range map[string]struct {
-		flag bool
-		args []string
-	}{
+	for name, input := range map[string]versionInput{
 		"flag":    {flag: true},
 		"command": {args: []string{"version"}},
 	} {

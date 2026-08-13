@@ -33,6 +33,17 @@ type submissionMessageSizeCase struct {
 	code int
 }
 
+type originatorHeaderCase struct {
+	name   string
+	header string
+}
+
+type dataDeadlineQueueAddCase struct {
+	name     string
+	err      error
+	accepted bool
+}
+
 type captureLog struct {
 	mu   sync.Mutex
 	text strings.Builder
@@ -843,10 +854,7 @@ func TestOriginatorAuthorization(t *testing.T) {
 	cl.cmd(t, "MAIL FROM:<Alice.Sender@TEST.EXAMPLE>", 250)
 	cl.cmd(t, "RSET", 250)
 
-	for _, tt := range []struct {
-		name   string
-		header string
-	}{
+	for _, tt := range []originatorHeaderCase{
 		{"case-mismatched From", "From: alice.sender@test.example\r\n"},
 		{"unauthorized Sender", "Sender: attacker@test.example\r\n"},
 		{"case-mismatched Sender", "Sender: ALICE@test.example\r\n"},
@@ -966,11 +974,7 @@ func TestPreAuthAbsoluteLifetimeAndAuthClearsDeadline(t *testing.T) {
 }
 
 func TestDataDeadlineQueueAddOutcomes(t *testing.T) {
-	for _, tt := range []struct {
-		name     string
-		err      error
-		accepted bool
-	}{
+	for _, tt := range []dataDeadlineQueueAddCase{
 		{"durably accepted before deadline return", nil, true},
 		{"precommit error after deadline", errors.New("injected queue failure"), false},
 	} {

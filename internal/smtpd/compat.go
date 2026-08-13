@@ -8,6 +8,11 @@ import (
 	"unsafe"
 )
 
+type dataReaderField struct {
+	name string
+	typ  reflect.Type
+}
+
 // go-smtp v0.24.0 counts only emitted message bytes, then needs one further
 // byte of budget to consume DATA's dot terminator. Keep the public server limit
 // exact and extend only that private per-command reader. A dependency layout
@@ -30,10 +35,7 @@ func allowDataTerminator(r io.Reader, maxBytes int64) error {
 
 	elem := typ.Elem()
 
-	wantFields := []struct {
-		name string
-		typ  reflect.Type
-	}{
+	wantFields := []dataReaderField{
 		{"r", reflect.TypeFor[*bufio.Reader]()},
 		{"state", reflect.TypeFor[int]()},
 		{"limited", reflect.TypeFor[bool]()},

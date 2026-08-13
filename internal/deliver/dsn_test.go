@@ -24,6 +24,12 @@ type limitedDSNReader struct {
 	closed bool
 }
 
+type terminalSourceRecoveryCase struct {
+	name       string
+	recipients []queue.Recipient
+	wantDead   bool
+}
+
 func (r *limitedDSNReader) Read(p []byte) (int, error) {
 	n, err := r.Reader.Read(p)
 
@@ -537,11 +543,7 @@ func TestCompletedDSNDoesNotRegenerateBeforeSourceTransition(t *testing.T) {
 }
 
 func TestTerminalSourceRecoveryAfterDSNPublication(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		recipients []queue.Recipient
-		wantDead   bool
-	}{
+	for _, tc := range []terminalSourceRecoveryCase{
 		{
 			name: "partial_success_finishes",
 			recipients: []queue.Recipient{

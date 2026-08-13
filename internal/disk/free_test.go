@@ -5,14 +5,16 @@ import (
 	"testing"
 )
 
+type availableBytesCase struct {
+	name      string
+	blocks    uint64
+	blockSize int64
+	want      int64
+	wantErr   bool
+}
+
 func TestAvailableBytes(t *testing.T) {
-	tests := []struct {
-		name      string
-		blocks    uint64
-		blockSize int64
-		want      int64
-		wantErr   bool
-	}{
+	tests := []availableBytesCase{
 		{name: "zero", blocks: 0, blockSize: 4096},
 		{name: "product", blocks: 3, blockSize: 4096, want: 12288},
 		{name: "largest exact product", blocks: math.MaxInt64, blockSize: 1, want: math.MaxInt64},

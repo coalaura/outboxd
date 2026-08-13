@@ -20,6 +20,31 @@ type resourceBoundaryCase struct {
 	set  func(*Config)
 }
 
+type rateBoundaryCase struct {
+	name string
+	max  int
+	set  func(*Config, int)
+	zero bool
+}
+
+type intBoundaryCase struct {
+	name  string
+	value int
+	valid bool
+}
+
+type durationSettingCase struct {
+	name string
+	max  time.Duration
+	set  func(*Config, string)
+}
+
+type stringBoundaryCase struct {
+	name  string
+	value string
+	valid bool
+}
+
 func writeYAML(t *testing.T, dir, name, body string) string {
 	t.Helper()
 
@@ -367,12 +392,7 @@ func TestResourceBoundaries(t *testing.T) {
 func TestRateAndBurstBoundaries(t *testing.T) {
 	maxInt := int(^uint(0) >> 1)
 
-	tests := []struct {
-		name string
-		max  int
-		set  func(*Config, int)
-		zero bool
-	}{
+	tests := []rateBoundaryCase{
 		{"message rate", MaxMessagesPerHour, func(c *Config, value int) {
 			c.Server.MaxMessagesPerHour = value
 		}, false},
@@ -390,11 +410,7 @@ func TestRateAndBurstBoundaries(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		for _, boundary := range []struct {
-			name  string
-			value int
-			valid bool
-		}{
+		for _, boundary := range []intBoundaryCase{
 			{"negative", -1, false},
 			{"zero", 0, tt.zero},
 			{"maximum", tt.max, true},
@@ -416,11 +432,7 @@ func TestRateAndBurstBoundaries(t *testing.T) {
 }
 
 func TestDeliveryAttemptBoundaries(t *testing.T) {
-	for _, tt := range []struct {
-		name  string
-		value int
-		valid bool
-	}{
+	for _, tt := range []intBoundaryCase{
 		{"negative", -1, false},
 		{"zero", 0, false},
 		{"maximum", MaxDeliveryAttempts, true},
@@ -441,11 +453,7 @@ func TestDeliveryAttemptBoundaries(t *testing.T) {
 }
 
 func TestDurationBoundaries(t *testing.T) {
-	tests := []struct {
-		name string
-		max  time.Duration
-		set  func(*Config, string)
-	}{
+	tests := []durationSettingCase{
 		{"server read", MaxSMTPReadTimeout, func(c *Config, value string) {
 			c.Server.ReadTimeout = value
 		}},
@@ -488,11 +496,7 @@ func TestDurationBoundaries(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		for _, boundary := range []struct {
-			name  string
-			value string
-			valid bool
-		}{
+		for _, boundary := range []stringBoundaryCase{
 			{"negative", "-1ns", false},
 			{"zero", "0s", false},
 			{"maximum", tt.max.String(), true},

@@ -59,6 +59,11 @@ type queueEntrySizeCase struct {
 	size int
 }
 
+type metadataFaultCase struct {
+	name  string
+	hooks func(string) disk.Hooks
+}
+
 func clearHooks(t *testing.T) {
 	t.Helper()
 
@@ -5419,10 +5424,7 @@ func TestRetryMetadataReplacementReleasesAdmissionHold(t *testing.T) {
 }
 
 func TestRetryAndBuryMetadataFaultsDoNotGrowCachedUsage(t *testing.T) {
-	faults := []struct {
-		name  string
-		hooks func(string) disk.Hooks
-	}{
+	faults := []metadataFaultCase{
 		{
 			name: "after_temp_sync",
 			hooks: func(_ string) disk.Hooks {
