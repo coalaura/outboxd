@@ -15,6 +15,7 @@ import (
 	pgp "github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
+	"github.com/ProtonMail/go-crypto/openpgp/s2k"
 	"github.com/coalaura/outboxd/internal/config"
 )
 
@@ -155,6 +156,57 @@ func TestCanonicalizeUsesDefaultContentType(t *testing.T) {
 
 	if !isSevenBit(canonical) || !bytes.Contains(canonical, []byte("h=C3=A9llo")) {
 		t.Fatalf("unexpected canonical entity:\n%s", canonical)
+	}
+}
+
+func TestCanonicalizeValidatesContentTransferEncodingBeforeFastPaths(t *testing.T) {
+	tests := []struct {
+		name   string
+		entity string
+		want   string
+	}{
+		{name: "leaf unsupported seven bit", entity: "Content-Transfer-Encoding: x-unknown\r\n\r\nhello\r\n", want: "unsupported MIME"},
+		{name: "leaf empty", entity: "Content-Transfer-Encoding:\r\n\r\nhello\r\n", want: "Encoding is empty"},
+		{name: "leaf duplicate", entity: "Content-Transfer-Encoding: 7bit\r\nContent-Transfer-Encoding: 8bit\r\n\r\nhello\r\n", want: "duplicate Content-Transfer-Encoding"},
+		{name: "multipart encoded", entity: "Content-Type: multipart/mixed; boundary=x\r\nContent-Transfer-Encoding: base64\r\n\r\n--x--\r\n", want: "unsupported multipart MIME"},
+		{name: "multipart duplicate", entity: "Content-Type: multipart/mixed; boundary=x\r\nContent-Transfer-Encoding: 7bit\r\nContent-Transfer-Encoding: 7bit\r\n\r\n--x--\r\n", want: "duplicate Content-Transfer-Encoding"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := canonicalizeEntity([]byte(test.entity), config.MaxMessageBytes)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("canonicalizeEntity() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestCanonicalizeContentTransferEncodingMatrix(t *testing.T) {
+	for _, encoding := range []string{"", "7bit", "8bit", "binary", "base64", "quoted-printable"} {
+		head := ""
+
+		if encoding != "" {
+			head = "Content-Transfer-Encoding: " + encoding + "\r\n"
+		}
+
+		_, err := canonicalizeEntity([]byte(head+"\r\nhello\r\n"), config.MaxMessageBytes)
+		if err != nil {
+			t.Errorf("leaf encoding %q rejected: %v", encoding, err)
+		}
+	}
+
+	for _, encoding := range []string{"", "7bit", "8bit", "binary"} {
+		head := "Content-Type: multipart/mixed; boundary=x\r\n"
+
+		if encoding != "" {
+			head += "Content-Transfer-Encoding: " + encoding + "\r\n"
+		}
+
+		_, err := canonicalizeEntity([]byte(head+"\r\n--x--\r\n"), config.MaxMessageBytes)
+		if err != nil {
+			t.Errorf("multipart encoding %q rejected: %v", encoding, err)
+		}
 	}
 }
 
@@ -308,5 +360,29 @@ func TestLoadEncryptedKeyPassphraseFile(t *testing.T) {
 	_, err = Load(cfg)
 	if err == nil || !strings.Contains(err.Error(), "decrypt") {
 		t.Fatalf("wrong-passphrase Load() error = %v", err)
+	}
+}
+
+func TestValidatePrivateComponentsRejectsMixedEncryption(t *testing.T) {
+	encrypted, err := pgp.NewEntity("Alice", "", "alice@example.com", &packet.Config{Algorithm: packet.PubKeyAlgoEdDSA})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = encrypted.EncryptPrivateKeys([]byte("passphrase"), &packet.Config{S2KConfig: &s2k.Config{S2KMode: s2k.SaltedS2K, PassphraseIsHighEntropy: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	plain, err := pgp.NewEntity("Bob", "", "bob@example.com", &packet.Config{Algorithm: packet.PubKeyAlgoEdDSA})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encrypted.Subkeys[0].PrivateKey = plain.Subkeys[0].PrivateKey
+
+	_, err = validatePrivateComponents(encrypted, true)
+	if err == nil || !strings.Contains(err.Error(), "mixed encrypted and unencrypted") {
+		t.Fatalf("validatePrivateComponents() error = %v", err)
 	}
 }

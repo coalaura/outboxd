@@ -18,7 +18,8 @@ StandardError=journal
 StandardInput=null
 
 # systemd creates /var/lib/outboxd for the service account. It contains the
-# private config, DKIM key, spool, and any generated development TLS assets.
+# private config, DKIM and OpenPGP keys/passphrases, spool, generated DNS output,
+# and any generated development TLS assets.
 StateDirectory=outboxd
 StateDirectoryMode=0700
 

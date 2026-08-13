@@ -156,18 +156,27 @@ func (q *Queue) DeleteCorrupt(name string) error {
 }
 
 func (q *Queue) recordQuarantineFailure(id, path string, cause, quarantineErr error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
 	q.blocked[id] = struct{}{}
 
 	q.Corrupt = append(q.Corrupt, fmt.Errorf("QUARANTINE FAILED; BLOCKED %s at %s: %v (relocation: %w)", id, path, cause, quarantineErr))
 }
 
 func (q *Queue) recordBlocked(id, path string, cause error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
 	q.blocked[id] = struct{}{}
 
 	q.Corrupt = append(q.Corrupt, fmt.Errorf("BLOCKED %s at %s: %w", id, path, cause))
 }
 
 func (q *Queue) recordTransientBlocked(id, path string, cause error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
 	q.blocked[id] = struct{}{}
 
 	q.Warnings = append(q.Warnings, fmt.Errorf("TRANSIENTLY BLOCKED %s at %s: %w", id, path, cause))

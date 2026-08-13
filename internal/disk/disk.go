@@ -272,7 +272,8 @@ func MkdirDurable(path string) error {
 	return nil
 }
 
-// RemoveAll recursively removes path through the test fault seam.
+// RemoveAll recursively removes path without following links, reparses, or
+// crossing a mount boundary, through the test fault seam.
 func RemoveAll(path string) error {
 	h := currentHooks()
 
@@ -283,7 +284,7 @@ func RemoveAll(path string) error {
 		}
 	}
 
-	return os.RemoveAll(path)
+	return removeAllSecure(path)
 }
 
 // Temp creates a temporary file inside the target directory of path.

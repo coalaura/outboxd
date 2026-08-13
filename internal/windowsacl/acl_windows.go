@@ -121,9 +121,14 @@ func ValidateHandle(handle windows.Handle, path string, managed bool, requirePro
 
 	system, _ := windows.StringToSid("S-1-5-18")
 	administrators, _ := windows.StringToSid("S-1-5-32-544")
+
 	owner, _, err := sd.Owner()
 	if err != nil {
 		return fmt.Errorf("read owner for %q: %w", path, err)
+	}
+
+	if managed && !approvedOwner(owner, user, system, administrators) {
+		return fmt.Errorf("%q has unexpected owner %s", path, owner.String())
 	}
 
 	for i := uint16(0); i < dacl.AceCount; i++ {
@@ -163,6 +168,10 @@ func ValidateHandle(handle windows.Handle, path string, managed bool, requirePro
 	}
 
 	return nil
+}
+
+func approvedOwner(owner, user, system, administrators *windows.SID) bool {
+	return owner.Equals(user) || owner.Equals(system) || owner.Equals(administrators)
 }
 
 func currentUserSID() (*windows.SID, error) {

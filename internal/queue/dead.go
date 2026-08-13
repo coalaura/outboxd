@@ -210,11 +210,14 @@ func (q *Queue) ReviveDead(id string) (*Envelope, error) {
 		return nil, err
 	}
 
-	owned := true
+	var (
+		owned       = true
+		linkedDSNID string
+	)
 
 	defer func() {
 		if owned {
-			q.endTransition(id)
+			q.endTransitions(id, linkedDSNID)
 		}
 	}()
 
@@ -247,6 +250,11 @@ func (q *Queue) ReviveDead(id string) (*Envelope, error) {
 	}
 
 	env, err := q.loadDir(src, id)
+	if err != nil {
+		return nil, err
+	}
+
+	linkedDSNID, err = q.claimLinkedDeadDSN(env)
 	if err != nil {
 		return nil, err
 	}
@@ -431,6 +439,11 @@ func (q *Queue) ReviveDead(id string) (*Envelope, error) {
 	delete(q.transitioning, id)
 	delete(q.requeues, id)
 
+	if linkedDSNID != "" {
+		delete(q.transitioning, linkedDSNID)
+		delete(q.requeues, linkedDSNID)
+	}
+
 	q.scheduleLocked(env)
 	q.mu.Unlock()
 
@@ -444,4 +457,37 @@ func (q *Queue) ReviveDead(id string) (*Envelope, error) {
 	}
 
 	return env, moveErr
+}
+
+func (q *Queue) claimLinkedDeadDSN(env *Envelope) (string, error) {
+	if env.DSNSourceID != "" || env.DSNID == "" {
+		return "", nil
+	}
+
+	dsnID := env.DSNID
+
+	err := q.beginTransition(dsnID)
+	if err != nil {
+		return "", fmt.Errorf("inspect linked DSN %s: %w", dsnID, err)
+	}
+
+	for _, namespace := range []string{q.dsn, q.ready, q.dead} {
+		path := filepath.Join(namespace, dsnID)
+
+		err = disk.CheckRead(path)
+		if err != nil {
+			return dsnID, fmt.Errorf("inspect linked DSN %s: %w", dsnID, err)
+		}
+
+		_, err = os.Lstat(path)
+		if err == nil {
+			return dsnID, fmt.Errorf("%w: linked DSN %s still exists", ErrIDConflict, dsnID)
+		}
+
+		if !errors.Is(err, os.ErrNotExist) {
+			return dsnID, fmt.Errorf("inspect linked DSN %s: %w", dsnID, err)
+		}
+	}
+
+	return dsnID, nil
 }

@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/coalaura/outboxd/internal/disk"
 )
 
 type trackedReader struct {
@@ -130,9 +132,24 @@ func (q *Queue) ReadBody(id string) ([]byte, error) {
 		return nil, err
 	}
 
-	ready := filepath.Join(q.ready, id)
+	var (
+		env  *Envelope
+		file *os.File
+	)
 
-	env, file, err := q.openAcceptedBody(ready, id)
+	if q.readOnly {
+		dir, openErr := q.openReadOnlyEntry(q.ready, id)
+		if openErr == nil {
+			env, file, err = q.openAcceptedBodyHandle(dir, id)
+
+			dir.Close()
+		} else {
+			err = openErr
+		}
+	} else {
+		env, file, err = q.openAcceptedBody(filepath.Join(q.ready, id), id)
+	}
+
 	if err == nil {
 		defer file.Close()
 
@@ -145,9 +162,19 @@ func (q *Queue) ReadBody(id string) ([]byte, error) {
 		return nil, err
 	}
 
-	dead := filepath.Join(q.dead, id)
+	if q.readOnly {
+		dir, openErr := q.openReadOnlyEntry(q.dead, id)
+		if openErr == nil {
+			env, file, err = q.openAcceptedBodyHandle(dir, id)
 
-	env, file, err = q.openAcceptedBody(dead, id)
+			dir.Close()
+		} else {
+			err = openErr
+		}
+	} else {
+		env, file, err = q.openAcceptedBody(filepath.Join(q.dead, id), id)
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -210,6 +237,37 @@ func (q *Queue) openAcceptedBody(dir, expectID string) (*Envelope, *os.File, err
 
 	file, err := q.openBody(filepath.Join(dir, bodyName), env.Size, env.BodyDigest)
 	if err != nil {
+		return nil, nil, err
+	}
+
+	return env, file, nil
+}
+
+func (q *Queue) openAcceptedBodyHandle(dir *os.File, expectID string) (*Envelope, *os.File, error) {
+	env, err := loadAcceptedMetadataHandle(dir, expectID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	file, info, err := disk.OpenRegularAt(dir, bodyName)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if info.Size() != env.Size {
+		file.Close()
+
+		return nil, nil, corruptionf("body size mismatch: metadata=%d actual=%d", env.Size, info.Size())
+	}
+
+	if q.afterBodyOpen != nil {
+		q.afterBodyOpen()
+	}
+
+	err = verifyBodyHandle(file, env.Size, env.BodyDigest)
+	if err != nil {
+		file.Close()
+
 		return nil, nil, err
 	}
 

@@ -127,6 +127,8 @@ func (s *Signer) Record() string {
 func ensureKey(path string) (*rsa.PrivateKey, bool, error) {
 	body, err := config.ReadCheckedFile(path, true, false, maxPrivateKeyBytes)
 	if err == nil {
+		defer clear(body)
+
 		key, err := parseKey(body)
 
 		return key, false, err
@@ -146,10 +148,16 @@ func ensureKey(path string) (*rsa.PrivateKey, bool, error) {
 		return nil, false, err
 	}
 
-	err = disk.WriteExclusive(path, pem.EncodeToMemory(&pem.Block{
+	defer clear(encoded)
+
+	keyPEM := pem.EncodeToMemory(&pem.Block{
 		Type:  "PRIVATE KEY",
 		Bytes: encoded,
-	}), 0600)
+	})
+
+	defer clear(keyPEM)
+
+	err = disk.WriteExclusive(path, keyPEM, 0600)
 
 	if err != nil {
 		// Another process may have won the create race; adopt their key.
@@ -158,6 +166,8 @@ func ensureKey(path string) (*rsa.PrivateKey, bool, error) {
 			if readErr != nil {
 				return nil, false, readErr
 			}
+
+			defer clear(body)
 
 			parsed, parseErr := parseKey(body)
 
@@ -175,6 +185,8 @@ func loadKey(path string) (*rsa.PrivateKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read dkim private key: %w", err)
 	}
+
+	defer clear(body)
 
 	key, err := parseKey(body)
 	if err != nil {

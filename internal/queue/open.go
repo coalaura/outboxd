@@ -70,12 +70,26 @@ func (q *Queue) finishClose() {
 	lock := q.lock
 	q.lock = nil
 
+	readyDir := q.readyDir
+	deadDir := q.deadDir
+
+	q.readyDir = nil
+	q.deadDir = nil
+
 	q.mu.Unlock()
 
 	var err error
 
 	if lock != nil {
 		err = lock.Close()
+	}
+
+	if readyDir != nil {
+		err = errors.Join(err, readyDir.Close())
+	}
+
+	if deadDir != nil {
+		err = errors.Join(err, deadDir.Close())
 	}
 
 	q.mu.Lock()
@@ -258,21 +272,59 @@ func OpenReadOnly(directory string) (*Queue, error) {
 		return nil, err
 	}
 
+	rootDir, err := disk.OpenDirectory(directory)
+	if err != nil {
+		return nil, err
+	}
+
+	defer rootDir.Close()
+
+	err = disk.ValidatePrivateDirectoryHandle(rootDir)
+	if err != nil {
+		return nil, err
+	}
+
 	dead := filepath.Join(directory, dirDead)
 	ready := filepath.Join(directory, dirReady)
 
-	for _, namespace := range []string{ready, dead} {
-		err = disk.ValidatePath(namespace)
+	var handles [2]*os.File
+
+	for i, namespace := range []string{ready, dead} {
+		handles[i], err = disk.OpenDirectoryAt(rootDir, filepath.Base(namespace))
 		if err != nil {
+			_, statErr := os.Lstat(namespace)
+			if errors.Is(statErr, os.ErrNotExist) {
+				continue
+			}
+		}
+
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+
+		if err != nil {
+			info, linkErr := os.Lstat(namespace)
+			if linkErr == nil && info.Mode()&os.ModeSymlink != 0 {
+				return nil, fmt.Errorf("validate spool namespace %s: symbolic link or reparse point is not allowed", namespace)
+			}
+
+			for _, handle := range handles {
+				if handle != nil {
+					handle.Close()
+				}
+			}
+
 			return nil, err
 		}
 
-		if _, err := os.Stat(namespace); err == nil {
-			err = disk.ValidatePrivateDirectory(namespace)
-			if err != nil {
-				return nil, err
+		err = disk.ValidatePrivateDirectoryHandle(handles[i])
+		if err != nil {
+			for _, handle := range handles {
+				if handle != nil {
+					handle.Close()
+				}
 			}
-		} else if !errors.Is(err, os.ErrNotExist) {
+
 			return nil, err
 		}
 	}
@@ -295,6 +347,8 @@ func OpenReadOnly(directory string) (*Queue, error) {
 		users:         make(map[string]userUsage),
 		closeDone:     make(chan struct{}),
 		readOnly:      true,
+		readyDir:      handles[0],
+		deadDir:       handles[1],
 	}
 
 	q.closeCond = sync.NewCond(&q.mu)

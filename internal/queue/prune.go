@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -49,6 +50,13 @@ func (q *Queue) pruneNamespace(namespace string, retention time.Duration, now ti
 		return 0, err
 	}
 
+	initialDead := make(map[string]struct{})
+	if namespace == q.dead {
+		for _, entry := range entries {
+			initialDead[entry.Name()] = struct{}{}
+		}
+	}
+
 	var (
 		count int
 		errs  []error
@@ -87,6 +95,53 @@ func (q *Queue) pruneNamespace(namespace string, retention time.Duration, now ti
 			if busy || blocked || ValidateID(entry.Name()) != nil {
 				continue
 			}
+
+			transitionErr := q.beginTransition(entry.Name())
+			if transitionErr != nil {
+				continue
+			}
+
+			envelope, loadErr := q.loadAcceptedDir(filepath.Join(namespace, entry.Name()), entry.Name())
+			if loadErr != nil {
+				q.endTransition(entry.Name())
+
+				errs = append(errs, fmt.Errorf("prune %s: %w", entry.Name(), loadErr))
+
+				continue
+			}
+
+			if envelope.DSNSourceID == "" && envelope.DSNID != "" {
+				if _, existed := initialDead[envelope.DSNID]; existed {
+					q.endTransition(entry.Name())
+
+					continue
+				}
+			}
+
+			linkedDSNID, linkErr := q.claimLinkedDeadDSN(envelope)
+			if linkErr != nil {
+				q.endTransitions(entry.Name(), linkedDSNID)
+
+				if !errors.Is(linkErr, ErrIDConflict) && !errors.Is(linkErr, ErrQueueBusy) {
+					errs = append(errs, fmt.Errorf("prune %s: %w", entry.Name(), linkErr))
+				}
+
+				continue
+			}
+
+			deleteErr := q.deleteStoredLocked(namespace, entry.Name(), prefix+sanitize(entry.Name()))
+
+			q.endTransitions(entry.Name(), linkedDSNID)
+
+			if deleteErr != nil {
+				errs = append(errs, fmt.Errorf("prune %s: %w", entry.Name(), deleteErr))
+
+				continue
+			}
+
+			count++
+
+			continue
 		}
 
 		deleteErr := q.deleteStoredLocked(namespace, entry.Name(), prefix+sanitize(entry.Name()))

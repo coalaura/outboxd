@@ -187,6 +187,9 @@ func (k *Keeper) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 		return k.finishReloadError(oldCertificate, err)
 	}
 
+	defer clear(certPEM)
+	defer clear(keyPEM)
+
 	if fingerprint == oldFingerprint {
 		if !certificateValid(oldCertificate, time.Now()) {
 			err := errors.New("loaded tls certificate is no longer valid")
@@ -237,6 +240,9 @@ func (k *Keeper) loadPair() (*tls.Certificate, [sha256.Size]byte, error) {
 		return nil, fingerprint, err
 	}
 
+	defer clear(certPEM)
+	defer clear(keyPEM)
+
 	certificate, err := k.parsePair(certPEM, keyPEM)
 	if err != nil {
 		return nil, fingerprint, err
@@ -271,6 +277,8 @@ func (k *Keeper) readPair() ([]byte, []byte, [sha256.Size]byte, error) {
 
 	keyPEM, err := config.ReadCheckedFile(k.privateKeyFile, true, allowSymlink, maxPrivateKeyBytes)
 	if err != nil {
+		clear(certPEM)
+
 		return nil, nil, fingerprint, fmt.Errorf("tls private key: %w", err)
 	}
 

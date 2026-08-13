@@ -101,12 +101,12 @@ func loadIdentity(cfg *config.Config, configured config.OpenPGPIdentity) (*ident
 		return nil, fmt.Errorf("read signing key: %w", err)
 	}
 
+	defer clear(keyData)
+
 	entities, err := pgp.ReadArmoredKeyRing(bytes.NewReader(keyData))
 	if err != nil {
 		entities, err = pgp.ReadKeyRing(bytes.NewReader(keyData))
 	}
-
-	clear(keyData)
 
 	if err != nil {
 		return nil, fmt.Errorf("parse signing key: %w", err)
@@ -123,30 +123,23 @@ func loadIdentity(cfg *config.Config, configured config.OpenPGPIdentity) (*ident
 		return nil, errors.New("no valid private signing key")
 	}
 
-	encrypted := key.PrivateKey.Encrypted
+	encrypted, err := validatePrivateComponents(entity, configured.PassphraseFile != "")
+	if err != nil {
+		return nil, err
+	}
 
-	if configured.PassphraseFile == "" {
-		if encrypted {
-			return nil, errors.New("signing key is encrypted but passphrase_file is not configured")
-		}
-	} else {
-		if !encrypted {
-			return nil, errors.New("passphrase_file is configured but the signing key is not encrypted")
-		}
-
+	if encrypted {
 		passphrase, err := readPassphrase(cfg, configured.PassphraseFile)
 		if err != nil {
 			return nil, err
 		}
 
+		defer clear(passphrase)
+
 		err = entity.DecryptPrivateKeys(passphrase)
 		if err != nil {
-			clear(passphrase)
-
 			return nil, fmt.Errorf("decrypt signing key: %w", err)
 		}
-
-		clear(passphrase)
 	}
 
 	if _, ok := entity.SigningKey(time.Now()); !ok {
@@ -165,6 +158,49 @@ func loadIdentity(cfg *config.Config, configured config.OpenPGPIdentity) (*ident
 	return &identity{entity: entity, gate: make(chan struct{}, 1)}, nil
 }
 
+func validatePrivateComponents(entity *pgp.Entity, passphraseConfigured bool) (bool, error) {
+	keys := make([]*packet.PrivateKey, 0, len(entity.Subkeys)+1)
+
+	keys = append(keys, entity.PrivateKey)
+
+	for i := range entity.Subkeys {
+		keys = append(keys, entity.Subkeys[i].PrivateKey)
+	}
+
+	var (
+		encrypted   bool
+		unencrypted bool
+	)
+
+	for _, key := range keys {
+		if key == nil || key.Dummy() {
+			continue
+		}
+
+		if !key.Encrypted {
+			unencrypted = true
+
+			continue
+		}
+
+		encrypted = true
+	}
+
+	if encrypted && unencrypted {
+		return false, errors.New("private key contains mixed encrypted and unencrypted components")
+	}
+
+	if passphraseConfigured != encrypted {
+		if encrypted {
+			return false, errors.New("signing key is encrypted but passphrase_file is not configured")
+		}
+
+		return false, errors.New("passphrase_file is configured but the signing key is not encrypted")
+	}
+
+	return encrypted, nil
+}
+
 func readPassphrase(cfg *config.Config, path string) ([]byte, error) {
 	resolved := cfg.ResolvePath(path)
 
@@ -180,18 +216,24 @@ func readPassphrase(cfg *config.Config, path string) ([]byte, error) {
 		return nil, fmt.Errorf("read passphrase file: %w", err)
 	}
 
-	value = bytes.TrimSuffix(value, []byte("\n"))
-	value = bytes.TrimSuffix(value, []byte("\r"))
+	trimmed := bytes.TrimSuffix(value, []byte("\n"))
+	trimmed = bytes.TrimSuffix(trimmed, []byte("\r"))
 
-	if len(value) == 0 {
+	clear(value[len(trimmed):])
+
+	if len(trimmed) == 0 {
+		clear(value)
+
 		return nil, errors.New("passphrase file is empty")
 	}
 
-	if bytes.ContainsAny(value, "\r\n\x00") {
+	if bytes.ContainsAny(trimmed, "\r\n\x00") {
+		clear(value)
+
 		return nil, errors.New("passphrase file must contain one non-empty line without NUL")
 	}
 
-	return value, nil
+	return trimmed, nil
 }
 
 func hasIdentity(entity *pgp.Entity, sender string) bool {
@@ -412,7 +454,14 @@ func canonicalizeEntityContext(ctx context.Context, data []byte, maximum int64, 
 		return nil, fmt.Errorf("parse MIME Content-Type: %w", err)
 	}
 
-	if strings.HasPrefix(strings.ToLower(mediaType), "multipart/") {
+	multipart := strings.HasPrefix(strings.ToLower(mediaType), "multipart/")
+
+	encoding, err := validateTransferEncoding(head, multipart)
+	if err != nil {
+		return nil, err
+	}
+
+	if multipart {
 		boundary := params["boundary"]
 		if boundary == "" {
 			return nil, errors.New("multipart MIME entity has no boundary")
@@ -436,7 +485,6 @@ func canonicalizeEntityContext(ctx context.Context, data []byte, maximum int64, 
 		return data, nil
 	}
 
-	encoding := strings.ToLower(strings.TrimSpace(headerValue(head, "content-transfer-encoding")))
 	if encoding == "base64" || encoding == "quoted-printable" {
 		return nil, fmt.Errorf("%s MIME body contains non-ASCII encoded data", encoding)
 	}
@@ -468,6 +516,47 @@ func canonicalizeEntityContext(ctx context.Context, data []byte, maximum int64, 
 	}
 
 	return joinEntity(head, encoded.Bytes()), nil
+}
+
+func validateTransferEncoding(head []byte, multipart bool) (string, error) {
+	fields, err := headerFields(head)
+	if err != nil {
+		return "", err
+	}
+
+	var (
+		encoding string
+		found    bool
+	)
+
+	for _, field := range fields {
+		if fieldName(field) != "content-transfer-encoding" {
+			continue
+		}
+
+		if found {
+			return "", errors.New("MIME entity has duplicate Content-Transfer-Encoding headers")
+		}
+
+		found = true
+
+		colon := bytes.IndexByte(field, ':')
+		encoding = strings.ToLower(strings.TrimSpace(strings.ReplaceAll(string(field[colon+1:]), "\r\n", " ")))
+	}
+
+	if found && encoding == "" {
+		return "", errors.New("MIME Content-Transfer-Encoding is empty")
+	}
+
+	if multipart {
+		if encoding != "" && encoding != "7bit" && encoding != "8bit" && encoding != "binary" {
+			return "", fmt.Errorf("unsupported multipart MIME content-transfer-encoding %q", encoding)
+		}
+	} else if encoding != "" && encoding != "7bit" && encoding != "8bit" && encoding != "binary" && encoding != "base64" && encoding != "quoted-printable" {
+		return "", fmt.Errorf("unsupported MIME content-transfer-encoding %q", encoding)
+	}
+
+	return encoding, nil
 }
 
 func canonicalizeMultipart(ctx context.Context, body []byte, boundary string, maximum int64, depth int) ([]byte, error) {

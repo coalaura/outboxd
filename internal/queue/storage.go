@@ -198,6 +198,31 @@ func (q *Queue) loadAcceptedDir(dir, expectID string) (*Envelope, error) {
 	return env, nil
 }
 
+func (q *Queue) loadAcceptedHandle(dir *os.File, expectID string) (*Envelope, error) {
+	env, err := loadAcceptedMetadataHandle(dir, expectID)
+	if err != nil {
+		return nil, err
+	}
+
+	file, info, err := disk.OpenRegularAt(dir, bodyName)
+	if err != nil {
+		return nil, fmt.Errorf("missing body: %w", err)
+	}
+
+	defer file.Close()
+
+	if info.Size() != env.Size {
+		return nil, corruptionf("body size mismatch: metadata=%d actual=%d", env.Size, info.Size())
+	}
+
+	err = verifyBodyHandle(file, env.Size, env.BodyDigest)
+	if err != nil {
+		return nil, err
+	}
+
+	return env, nil
+}
+
 func (q *Queue) removeTrash(path string) error {
 	removeErr := disk.RemoveAll(path)
 	syncErr := disk.Sync(q.trash)
@@ -244,9 +269,22 @@ func loadEnvelopeMetadata(dir, expectID string) (*Envelope, error) {
 		return nil, err
 	}
 
+	return decodeEnvelopeMetadata(raw, expectID)
+}
+
+func loadEnvelopeMetadataHandle(dir *os.File, expectID string) (*Envelope, error) {
+	raw, err := readBoundedRegularAt(dir, metaName, maxEnvelopeMetadata)
+	if err != nil {
+		return nil, err
+	}
+
+	return decodeEnvelopeMetadata(raw, expectID)
+}
+
+func decodeEnvelopeMetadata(raw []byte, expectID string) (*Envelope, error) {
 	env := new(Envelope)
 
-	err = json.Unmarshal(raw, env)
+	err := json.Unmarshal(raw, env)
 	if err != nil {
 		return nil, corruptionf("invalid json: %v", err)
 	}
@@ -319,6 +357,37 @@ func readBoundedRegular(path string, max int64) ([]byte, error) {
 	return raw, nil
 }
 
+func readBoundedRegularAt(dir *os.File, name string, max int64) ([]byte, error) {
+	path := filepath.Join(dir.Name(), name)
+
+	err := disk.CheckRead(path)
+	if err != nil {
+		return nil, err
+	}
+
+	file, info, err := disk.OpenRegularAt(dir, name)
+	if err != nil {
+		return nil, err
+	}
+
+	defer file.Close()
+
+	if info.Size() > max {
+		return nil, corruptionf("queue metadata exceeds %d bytes", max)
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(file, max+1))
+	if err != nil {
+		return nil, err
+	}
+
+	if int64(len(raw)) > max {
+		return nil, corruptionf("queue metadata exceeds %d bytes", max)
+	}
+
+	return raw, nil
+}
+
 func openRegular(path string) (*os.File, os.FileInfo, error) {
 	err := disk.CheckRead(path)
 	if err != nil {
@@ -374,6 +443,19 @@ func loadAcceptedMetadata(dir, expectID string) (*Envelope, error) {
 	}
 
 	return loadEnvelopeMetadata(dir, expectID)
+}
+
+func loadAcceptedMetadataHandle(dir *os.File, expectID string) (*Envelope, error) {
+	state, err := readBoundedRegularAt(dir, addStateName, maxAddStateBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	if string(state) != addAccepted {
+		return nil, corruptionf("queue entry is not accepted")
+	}
+
+	return loadEnvelopeMetadataHandle(dir, expectID)
 }
 
 func acceptedDir(dir string) error {

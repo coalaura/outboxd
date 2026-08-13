@@ -52,63 +52,17 @@ func ValidatePrivateDirectory(path string) error {
 	return validatePrivateDirectory(path, false)
 }
 
-// ValidatePrivateTree rejects unsafe pre-existing objects before queue
-// recovery can read, move, or remove them.
-func ValidatePrivateTree(root string) error {
-	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-
-		if path == root {
-			return nil
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-
-		linked, err := isLinkOrReparse(path, info)
-		if err != nil {
-			return err
-		}
-
-		if linked {
-			return fmt.Errorf("private spool object %q must not be a reparse point", path)
-		}
-
-		name, err := windows.UTF16PtrFromString(path)
-		if err != nil {
-			return err
-		}
-
-		flags := uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT)
-
-		if entry.IsDir() {
-			flags |= windows.FILE_FLAG_BACKUP_SEMANTICS
-		}
-
-		handle, err := windows.CreateFile(
-			name,
-			windows.READ_CONTROL,
-			windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-			nil,
-			windows.OPEN_EXISTING,
-			flags,
-			0,
-		)
-
-		if err != nil {
-			return err
-		}
-
-		err = windowsacl.ValidateHandle(handle, path, true, false)
-
-		windows.CloseHandle(handle)
-
+func ValidatePrivateDirectoryHandle(dir *os.File) error {
+	info, err := dir.Stat()
+	if err != nil {
 		return err
-	})
+	}
+
+	if !info.IsDir() {
+		return fmt.Errorf("private directory %q is not a directory", dir.Name())
+	}
+
+	return windowsacl.ValidateHandle(windows.Handle(dir.Fd()), dir.Name(), true, false)
 }
 
 func validatePrivateDirectory(path string, requireProtected bool) error {

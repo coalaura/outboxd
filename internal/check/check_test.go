@@ -2,6 +2,7 @@ package check
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -415,6 +416,30 @@ func TestReplyRejectionMXMustBeExclusive(t *testing.T) {
 	results := checkEnvelopeMX(context.Background(), r, cfg)
 	if len(results) != 1 || results[0].Level != Fail || !strings.Contains(results[0].Message, "exclusively") {
 		t.Fatalf("results=%+v", results)
+	}
+}
+
+func TestReplyRejectionMXMustBeExplicit(t *testing.T) {
+	cfg := baseCfg()
+
+	cfg.Users = nil
+	cfg.ReplyRejection.Enabled = true
+	cfg.ReplyRejection.Domains = []string{"example.com"}
+
+	for _, r := range []*fakeResolver{
+		{
+			mx:  map[string][]*net.MX{},
+			ips: map[string][]net.IPAddr{"example.com": {{IP: net.ParseIP("203.0.113.10")}}},
+		},
+		{
+			err: map[string]error{"mx:example.com": errors.New("temporary DNS failure")},
+			ips: map[string][]net.IPAddr{"example.com": {{IP: net.ParseIP("203.0.113.10")}}},
+		},
+	} {
+		results := checkEnvelopeMX(context.Background(), r, cfg)
+		if len(results) != 1 || results[0].Level != Fail || !strings.Contains(results[0].Message, "explicit MX") {
+			t.Fatalf("results=%+v", results)
+		}
 	}
 }
 

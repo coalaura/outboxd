@@ -122,13 +122,13 @@ func Create(configPath, username, sender string) (*CreatedKey, error) {
 	}
 
 	passBody := make([]byte, len(generated.passphrase)+1)
+	defer clear(passBody)
+
 	copy(passBody, generated.passphrase)
 
 	passBody[len(passBody)-1] = '\n'
 
 	err = disk.WriteExclusive(passPath, passBody, 0600)
-
-	clear(passBody)
 
 	if err != nil {
 		writeErr := fmt.Errorf("write OpenPGP passphrase file: %w", err)
@@ -195,6 +195,7 @@ func generateKey(sender string) (*generatedKey, error) {
 	}
 
 	passphrase := make([]byte, 32)
+	defer clear(passphrase)
 
 	_, err = rand.Read(passphrase)
 	if err != nil {
@@ -205,8 +206,6 @@ func generateKey(sender string) (*generatedKey, error) {
 
 	hex.Encode(encodedPassphrase, passphrase)
 
-	clear(passphrase)
-
 	encryptionConfig := *keyConfig
 
 	encryptionConfig.S2KConfig = &s2k.Config{
@@ -214,10 +213,16 @@ func generateKey(sender string) (*generatedKey, error) {
 		PassphraseIsHighEntropy: true,
 	}
 
+	var keepPassphrase bool
+
+	defer func() {
+		if !keepPassphrase {
+			clear(encodedPassphrase)
+		}
+	}()
+
 	err = entity.EncryptPrivateKeys(encodedPassphrase, &encryptionConfig)
 	if err != nil {
-		clear(encodedPassphrase)
-
 		return nil, fmt.Errorf("encrypt OpenPGP private key: %w", err)
 	}
 
@@ -225,15 +230,11 @@ func generateKey(sender string) (*generatedKey, error) {
 
 	armored, err := armor.Encode(&body, pgp.PrivateKeyType, nil)
 	if err != nil {
-		clear(encodedPassphrase)
-
 		return nil, fmt.Errorf("armor OpenPGP private key: %w", err)
 	}
 
 	err = entity.SerializePrivateWithoutSigning(armored, &encryptionConfig)
 	if err != nil {
-		clear(encodedPassphrase)
-
 		_ = armored.Close()
 
 		return nil, fmt.Errorf("serialize OpenPGP private key: %w", err)
@@ -241,16 +242,14 @@ func generateKey(sender string) (*generatedKey, error) {
 
 	err = armored.Close()
 	if err != nil {
-		clear(encodedPassphrase)
-
 		return nil, fmt.Errorf("finish OpenPGP private key armor: %w", err)
 	}
 
 	if body.Len() > maxKeyBytes {
-		clear(encodedPassphrase)
-
 		return nil, errors.New("generated OpenPGP private key exceeds size limit")
 	}
+
+	keepPassphrase = true
 
 	return &generatedKey{
 		armoredKey:  append([]byte(nil), body.Bytes()...),

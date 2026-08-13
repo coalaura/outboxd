@@ -1,6 +1,6 @@
 module github.com/coalaura/outboxd
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/ProtonMail/go-crypto v1.4.1
@@ -15,7 +15,7 @@ require (
 )
 
 require (
-	github.com/cloudflare/circl v1.6.2 // indirect
+	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/coalaura/atom v0.1.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	golang.org/x/term v0.45.0 // indirect

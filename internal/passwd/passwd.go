@@ -47,6 +47,7 @@ type PHCParams struct {
 // Hash derives an Argon2id hash in PHC string format.
 func Hash(password string) (string, error) {
 	salt := make([]byte, saltLength)
+	defer clear(salt)
 
 	_, err := rand.Read(salt)
 	if err != nil {
@@ -54,6 +55,7 @@ func Hash(password string) (string, error) {
 	}
 
 	key := argon2.IDKey([]byte(password), salt, hashTime, hashMemory, hashThreads, keyLength)
+	defer clear(key)
 
 	return fmt.Sprintf(
 		"$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
@@ -73,7 +75,11 @@ func Verify(hash, password string) (bool, error) {
 		return false, err
 	}
 
+	defer clear(p.Salt)
+	defer clear(p.Key)
+
 	key := argon2.IDKey([]byte(password), p.Salt, p.Iterations, p.Memory, p.Threads, uint32(len(p.Key)))
+	defer clear(key)
 
 	return subtle.ConstantTimeCompare(key, p.Key) == 1, nil
 }
@@ -94,7 +100,12 @@ func maxEncodedLen(n int) int {
 // without deriving a key, enforcing bounds so hostile parameters cannot
 // exhaust resources at authentication time.
 func ValidatePHC(hash string) error {
-	_, err := parsePHC(hash)
+	p, err := parsePHC(hash)
+	if p != nil {
+		clear(p.Salt)
+		clear(p.Key)
+	}
+
 	return err
 }
 
@@ -133,11 +144,16 @@ func parsePHC(hash string) (*PHCParams, error) {
 
 	salt, err := encoding.DecodeString(parts[4])
 	if err != nil || len(salt) != saltLength {
+		clear(salt)
+
 		return nil, fmt.Errorf("%w: salt size", ErrInvalidHash)
 	}
 
 	expected, err := encoding.DecodeString(parts[5])
 	if err != nil || len(expected) != keyLength {
+		clear(salt)
+		clear(expected)
+
 		return nil, fmt.Errorf("%w: output size", ErrInvalidHash)
 	}
 

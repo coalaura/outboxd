@@ -4,16 +4,17 @@
 
 | Version | Supported |
 | ------- | --------- |
-| 0.1.x   | ✅         |
-| < 0.1.0 | ❌         |
+| 0.2.x   | Yes       |
+| 0.1.x   | No        |
+| < 0.1.0 | No        |
 
-outboxd 0.1.0 is the first stable release. It is new software; review the documentation and security notes before deploying it in production.
+Only the current minor release series receives security updates. outboxd is new software; review the documentation and security notes before deploying it in production.
 
 Security reports affecting supported releases or the current `master` branch are welcome.
 
 ## Project Status
 
-outboxd 0.1.0 is the first stable release. The maintainer uses it for personal self-hosted services that need outgoing email, including GlitchTip error reporting and Beszel monitoring.
+outboxd 0.1.0 was the first stable release. The maintainer uses outboxd for personal self-hosted services that need outgoing email, including GlitchTip error reporting and Beszel monitoring.
 
 It is not currently deployed in large-scale infrastructure and is not backed by a company. This project does not provide an SLA or other support guarantee. Review the documentation and security notes before deploying it in production.
 

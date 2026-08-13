@@ -193,7 +193,7 @@ func (q *Queue) AddContext(ctx context.Context, envelope *Envelope, data []byte)
 
 	tmpDir := filepath.Join(q.tmp, envelope.ID)
 
-	err = os.RemoveAll(tmpDir)
+	err = disk.RemoveAll(tmpDir)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -208,7 +208,7 @@ func (q *Queue) AddContext(ctx context.Context, envelope *Envelope, data []byte)
 
 	defer func() {
 		if !success {
-			removeErr := os.RemoveAll(tmpDir)
+			removeErr := disk.RemoveAll(tmpDir)
 			syncErr := disk.Sync(q.tmp)
 
 			_, tmpErr := os.Lstat(tmpDir)

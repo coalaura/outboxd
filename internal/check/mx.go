@@ -68,6 +68,16 @@ func checkEnvelopeMX(ctx context.Context, r Resolver, cfg *config.Config) []Resu
 			continue
 		}
 
+		if rejectionDomain(cfg, d) {
+			rs = append(rs, Result{
+				Name:    name,
+				Level:   Fail,
+				Message: fmt.Sprintf("%s must publish one explicit MX routing exclusively to rejection host %s", d, cfg.Server.Hostname),
+			})
+
+			continue
+		}
+
 		// Implicit MX: A/AAAA on the domain apex (RFC 5321).
 		addrs, aerr := r.LookupIPAddr(ctx, d)
 		if aerr == nil && len(addrs) > 0 {

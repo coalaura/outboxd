@@ -1,10 +1,12 @@
 # outboxd
 
-outboxd is a small outbound mail server for straightforward, properly signed mail delivery. It accepts authenticated SMTP submission from configured users, optionally applies per-sender OpenPGP/MIME signatures, DKIM-signs messages, queues them durably and delivers them to recipient MX servers.
+outboxd is a single-binary outbound mail server for applications and services that need reliable, properly signed email delivery without painfully assembling and maintaining a multi-service mail stack.
 
-It is for sending mail. It is not an inbound mailbox server, IMAP server, spam filter or webmail application. An optional rejection-only SMTP endpoint can reject attempted replies without accepting their message data.
+It accepts authenticated SMTP submission from configured users, durably queues mail, delivers directly to recipient MX servers, DKIM-signs messages and can optionally even apply OpenPGP/MIME signatures per sender.
 
-The project was started after I spent way too long configuring Postfix, Dovecot and OpenDKIM to work together for a small sending service. The intended setup is one complete, understandable configuration file and one private data directory: set a hostname, sending domain and public IP, provision key material, add users, publish the generated DNS records, then start the daemon.
+It is for sending mail: transactional mail, notifications, error reporting and application delivery. It is not an inbound mailbox server, IMAP server, spam filter or webmail application. An optional rejection-only SMTP endpoint can reject attempted replies without accepting their message data.
+
+The intended setup is one complete, understandable configuration file and one private data directory: set a hostname, sending domain and public IP, provision key material, add users, publish the generated DNS records, then start the daemon.
 
 ## What You Need
 
@@ -43,7 +45,7 @@ Inspect the release page rather than guessing a checksum. The archive's top-leve
 
 ### Build from source
 
-Go 1.26.5 or newer is required. Build the binary, assemble the same payload and run the same setup script:
+Go 1.26.6 or newer is required. Build the binary, assemble the same payload and run the same setup script:
 
 ```bash
 git clone https://github.com/coalaura/outboxd.git
@@ -190,7 +192,9 @@ Useful limits include:
 
 ## Queue And Failures
 
-Mail is durably queued before outboxd reports SMTP acceptance. Delivery is at least once: if a crash or lost final SMTP response occurs after a recipient accepts DATA but before local completion is recorded, a message can be delivered again.
+Mail is durably queued before outboxd reports SMTP acceptance. If the process or host stops unexpectedly, queued mail is recovered and delivery resumes when the service returns.
+
+Delivery is at least once: if a crash or lost final SMTP response occurs after a recipient accepts `DATA` but before local completion is recorded, a message can be delivered again. Recipient acceptance cannot be guaranteed: recipient policy, invalid addresses, DNS, network failures and sending reputation remain outside outboxd's control.
 
 Permanent failures and exhausted retries move to the dead-letter area. Corrupt entries are isolated rather than stopping unrelated delivery. Retention pruning runs at daemon startup and periodically while serving.
 
@@ -203,6 +207,7 @@ outboxd [-config path] serve                 # default when no command is given
 outboxd [-config path] provision             # create config, data/spool and DKIM key
 outboxd [-config path] config update         # add current defaults to an existing config
 outboxd [-config path] user add <user> [sender...]
+outboxd [-config path] openpgp create <username> <sender>
 outboxd [-config path] dns                   # write and print DNS instructions
 outboxd [-config path] check                 # verify local configuration and DNS
 outboxd [-config path] queue list

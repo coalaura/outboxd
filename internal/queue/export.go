@@ -31,7 +31,22 @@ func (q *Queue) storedIDs(namespace string) ([]string, error) {
 	}
 
 	defer q.endOperation()
-	entries, err := os.ReadDir(namespace)
+
+	var entries []os.DirEntry
+
+	if q.readOnly {
+		dir, openErr := q.readOnlyNamespace(namespace)
+		if openErr != nil {
+			return nil, openErr
+		}
+
+		defer dir.Close()
+
+		entries, err = dir.ReadDir(-1)
+	} else {
+		entries, err = os.ReadDir(namespace)
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +76,19 @@ func (q *Queue) LoadReady(id string) (*Envelope, error) {
 
 // DeleteDead crash-safely moves a dead letter through trash before deletion.
 func (q *Queue) DeleteDead(id string) error {
-	err := ValidateID(id)
+	err := q.beginOperation()
+	if err != nil {
+		return err
+	}
+
+	defer q.endOperation()
+
+	err = q.rejectReadOnly()
+	if err != nil {
+		return err
+	}
+
+	err = ValidateID(id)
 	if err != nil {
 		return err
 	}
@@ -71,9 +98,30 @@ func (q *Queue) DeleteDead(id string) error {
 		return err
 	}
 
-	defer q.endTransition(id)
+	var linkedDSNID string
 
-	return q.deleteStored(q.dead, id, id)
+	defer func() {
+		q.endTransitions(id, linkedDSNID)
+	}()
+
+	err = q.startMutation()
+	if err != nil {
+		return err
+	}
+
+	defer q.finishMutation()
+
+	envelope, err := q.loadAcceptedDir(filepath.Join(q.dead, id), id)
+	if err != nil {
+		return err
+	}
+
+	linkedDSNID, err = q.claimLinkedDeadDSN(envelope)
+	if err != nil {
+		return err
+	}
+
+	return q.deleteStoredLocked(q.dead, id, id)
 }
 
 // LoadDead reads a dead-letter envelope by id.
@@ -92,6 +140,17 @@ func (q *Queue) loadStored(namespace, id string) (*Envelope, error) {
 	err = ValidateID(id)
 	if err != nil {
 		return nil, err
+	}
+
+	if q.readOnly {
+		dir, err := q.openReadOnlyEntry(namespace, id)
+		if err != nil {
+			return nil, err
+		}
+
+		defer dir.Close()
+
+		return q.loadAcceptedHandle(dir, id)
 	}
 
 	return q.loadAcceptedDir(filepath.Join(namespace, id), id)
@@ -120,9 +179,24 @@ func (q *Queue) exportStored(namespace, id string, w io.Writer) error {
 		return err
 	}
 
-	dir := filepath.Join(namespace, id)
+	var (
+		env *Envelope
+		f   *os.File
+	)
 
-	env, f, err := q.openAcceptedBody(dir, id)
+	if q.readOnly {
+		dir, openErr := q.openReadOnlyEntry(namespace, id)
+		if openErr != nil {
+			return openErr
+		}
+
+		defer dir.Close()
+
+		env, f, err = q.openAcceptedBodyHandle(dir, id)
+	} else {
+		env, f, err = q.openAcceptedBody(filepath.Join(namespace, id), id)
+	}
+
 	if err != nil {
 		return err
 	}
@@ -140,6 +214,29 @@ func (q *Queue) exportStored(namespace, id string, w io.Writer) error {
 
 	_, err = io.Copy(w, bytes.NewReader(body))
 	return err
+}
+
+func (q *Queue) readOnlyNamespace(namespace string) (*os.File, error) {
+	if namespace == q.ready && q.readyDir != nil {
+		return disk.DuplicateDirectory(q.readyDir)
+	}
+
+	if namespace == q.dead && q.deadDir != nil {
+		return disk.DuplicateDirectory(q.deadDir)
+	}
+
+	return nil, os.ErrNotExist
+}
+
+func (q *Queue) openReadOnlyEntry(namespace, id string) (*os.File, error) {
+	parent, err := q.readOnlyNamespace(namespace)
+	if err != nil {
+		return nil, err
+	}
+
+	defer parent.Close()
+
+	return disk.OpenDirectoryAt(parent, id)
 }
 
 // RetryReady makes an accepted ready entry immediately eligible for another

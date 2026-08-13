@@ -222,7 +222,7 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 		// protocol commit point and can be replaced by this retry.
 		stageBytes, _ := disk.AllocatedBytes(stageDir)
 
-		err = os.RemoveAll(stageDir)
+		err = disk.RemoveAll(stageDir)
 		if err != nil {
 			return err
 		}
@@ -283,7 +283,7 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 
 	defer func() {
 		if cleanup {
-			removeErr := os.RemoveAll(stageDir)
+			removeErr := disk.RemoveAll(stageDir)
 			syncErr := disk.Sync(q.dsn)
 
 			if removeErr != nil || syncErr != nil {

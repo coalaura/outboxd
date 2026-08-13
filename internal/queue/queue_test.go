@@ -3595,6 +3595,15 @@ func TestOpenReadOnlyAlongsideLocked(t *testing.T) {
 		t.Fatalf("DeadIDs=%v", ids)
 	}
 
+	ids, err = ro.DeadIDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(ids) != 1 || ids[0] != "dead1" {
+		t.Fatalf("second DeadIDs=%v", ids)
+	}
+
 	loaded, err := ro.LoadDead("dead1")
 	if err != nil {
 		t.Fatal(err)
@@ -3636,6 +3645,35 @@ func TestOpenReadOnlyRejectsLinkedDeadNamespace(t *testing.T) {
 	_, err = OpenReadOnly(root)
 	if err == nil || !strings.Contains(err.Error(), "symbolic link or reparse point") {
 		t.Fatalf("OpenReadOnly error=%v", err)
+	}
+}
+
+func TestOpenReadOnlyRetainsNamespaceHandle(t *testing.T) {
+	clearHooks(t)
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+	env := testEnv("retained-entry")
+	if err := q.Add(env, []byte("retained")); err != nil {
+		t.Fatal(err)
+	}
+	readOnly, err := OpenReadOnly(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readOnly.Close()
+	if err = q.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ready := filepath.Join(root, dirReady)
+	oldReady := filepath.Join(root, "old-ready")
+	if err = os.Rename(ready, oldReady); err != nil {
+		t.Skipf("rename open namespace unavailable: %v", err)
+	}
+	if err = os.Mkdir(ready, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = readOnly.LoadReady(env.ID); err != nil {
+		t.Fatalf("retained namespace entry unavailable: %v", err)
 	}
 }
 
@@ -6018,6 +6056,165 @@ func TestPruneAndExplicitDelete(t *testing.T) {
 	_, err = os.Stat(filepath.Join(q.dead, second.ID))
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("dead entry remains: %v", err)
+	}
+}
+
+func TestLinkedDeadSourceOperationsRequireCompletedDSN(t *testing.T) {
+	operations := []struct {
+		name string
+		run  func(*Queue, string) error
+	}{
+		{"revive", func(q *Queue, id string) error {
+			_, err := q.ReviveDead(id)
+			return err
+		}},
+		{"delete", func(q *Queue, id string) error {
+			return q.DeleteDead(id)
+		}},
+		{"prune", func(q *Queue, _ string) error {
+			_, _, err := q.Prune(time.Now())
+			return err
+		}},
+	}
+
+	states := []struct {
+		name      string
+		namespace string
+		uncertain bool
+		wantError bool
+	}{
+		{"staged", dirDSN, false, true},
+		{"ready", dirReady, false, true},
+		{"dead", dirDead, false, true},
+		{"inspection-uncertain", "", true, true},
+		{"completed", "", false, false},
+	}
+
+	for _, operation := range operations {
+		for _, state := range states {
+			t.Run(operation.name+"/"+state.name, func(t *testing.T) {
+				clearHooks(t)
+
+				root := t.TempDir()
+
+				q := mustOpen(t, root, Limits{DeadRetention: time.Hour})
+
+				source := testEnv("linked-dead-source")
+
+				dsn := testDSN(source)
+
+				dsn.DSNSourceRevision = source.Revision
+
+				source.DSNID = dsn.ID
+				source.Size = int64(len("source"))
+
+				writeQueueEntry(t, root, dirDead, source, []byte("source"))
+
+				old := time.Now().Add(-2 * time.Hour)
+
+				err := os.Chtimes(filepath.Join(root, dirDead, source.ID), old, old)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if state.namespace != "" {
+					dsn.Size = int64(len("dsn"))
+
+					writeQueueEntry(t, root, state.namespace, dsn, []byte("dsn"))
+				}
+
+				if state.uncertain {
+					wantErr := errors.New("inject linked DSN inspection failure")
+
+					disk.SetHooks(disk.Hooks{BeforeRead: func(path string) error {
+						if filepath.Clean(path) == filepath.Join(root, dirDSN, dsn.ID) {
+							return wantErr
+						}
+
+						return nil
+					}})
+				}
+
+				err = operation.run(q, source.ID)
+				if state.wantError && operation.name != "prune" && err == nil {
+					t.Fatal("operation succeeded with unresolved linked DSN")
+				}
+
+				if state.uncertain && err == nil {
+					t.Fatal("operation succeeded with uncertain linked DSN inspection")
+				}
+
+				if !state.wantError && err != nil {
+					t.Fatalf("operation after completed DSN: %v", err)
+				}
+
+				_, statErr := os.Stat(filepath.Join(root, dirDead, source.ID))
+				if state.wantError && statErr != nil {
+					t.Fatalf("linked source was removed: %v", statErr)
+				}
+
+				if !state.wantError && operation.name != "revive" && !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("completed source remains: %v", statErr)
+				}
+
+				if !state.wantError && operation.name == "revive" {
+					if _, err := os.Stat(filepath.Join(root, dirReady, source.ID)); err != nil {
+						t.Fatalf("completed source was not revived: %v", err)
+					}
+				}
+
+				err = q.beginTransitions(source.ID, dsn.ID)
+				if err != nil {
+					t.Fatalf("operation retained linked transitions: %v", err)
+				}
+
+				q.endTransitions(source.ID, dsn.ID)
+			})
+		}
+	}
+}
+
+func TestDeadGeneratedDSNDeletion(t *testing.T) {
+	for _, operation := range []string{"delete", "prune"} {
+		t.Run(operation, func(t *testing.T) {
+			clearHooks(t)
+
+			root := t.TempDir()
+
+			q := mustOpen(t, root, Limits{DeadRetention: time.Hour})
+
+			source := testEnv("generated-dead-dsn-source")
+
+			dsn := testDSN(source)
+
+			dsn.DSNSourceRevision = source.Revision
+			dsn.Size = int64(len("dsn"))
+
+			writeQueueEntry(t, root, dirDead, dsn, []byte("dsn"))
+
+			if operation == "delete" {
+				err := q.DeleteDead(dsn.ID)
+				if err != nil {
+					t.Fatalf("DeleteDead generated DSN: %v", err)
+				}
+			} else {
+				old := time.Now().Add(-2 * time.Hour)
+
+				err := os.Chtimes(filepath.Join(root, dirDead, dsn.ID), old, old)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				dead, _, err := q.Prune(time.Now())
+				if err != nil || dead != 1 {
+					t.Fatalf("Prune generated DSN dead=%d err=%v", dead, err)
+				}
+			}
+
+			if _, err := os.Stat(filepath.Join(root, dirDead, dsn.ID)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("generated DSN remains: %v", err)
+			}
+		})
 	}
 }
 

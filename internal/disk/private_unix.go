@@ -22,23 +22,30 @@ func EnsurePrivateRoot(path string) error {
 }
 
 func ValidatePrivateDirectory(path string) error {
-	info, err := os.Lstat(path)
+	dir, err := OpenDirectory(path)
+	if err != nil {
+		return err
+	}
+
+	defer dir.Close()
+
+	return ValidatePrivateDirectoryHandle(dir)
+}
+
+func ValidatePrivateDirectoryHandle(dir *os.File) error {
+	info, err := dir.Stat()
 	if err != nil {
 		return err
 	}
 
 	if !info.IsDir() {
-		return fmt.Errorf("private directory %q is not a directory", path)
+		return fmt.Errorf("private directory %q is not a directory", dir.Name())
 	}
 
 	if info.Mode().Perm()&0077 != 0 {
-		return fmt.Errorf("private directory %q permissions %04o allow group or other access", path, info.Mode().Perm())
+		return fmt.Errorf("private directory %q permissions %04o allow group or other access", dir.Name(), info.Mode().Perm())
 	}
 
-	return nil
-}
-
-func ValidatePrivateTree(string) error {
 	return nil
 }
 

@@ -3,10 +3,13 @@
 package config
 
 import (
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/coalaura/outboxd/internal/windowsacl"
 	"golang.org/x/sys/windows"
 )
 
@@ -50,5 +53,36 @@ func TestManagedConfigDACLCreationAndRejection(t *testing.T) {
 	_, err = LoadFile(path)
 	if err == nil || !strings.Contains(err.Error(), "unexpected principal") {
 		t.Fatalf("permissive config DACL error=%v", err)
+	}
+}
+
+func TestCheckGeneratedParentsRejectsJunction(t *testing.T) {
+	data := filepath.Join(t.TempDir(), "data")
+
+	err := os.Mkdir(data, 0700)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = windowsacl.Protect(data, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	external := t.TempDir()
+	junction := filepath.Join(data, "generated")
+
+	err = exec.Command("cmd", "/c", "mklink", "/J", junction, external).Run()
+	if err != nil {
+		t.Skipf("create directory junction: %v", err)
+	}
+
+	cfg := Config{}
+
+	cfg.Server.DataDirectory = data
+
+	err = cfg.CheckGeneratedParents(filepath.Join(junction, "key.pem"))
+	if err == nil || !strings.Contains(err.Error(), "reparse") {
+		t.Fatalf("junction error=%v", err)
 	}
 }

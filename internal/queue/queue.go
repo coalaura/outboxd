@@ -29,6 +29,7 @@ package queue
 import (
 	"fmt"
 	"math"
+	"os"
 	"sync"
 	"time"
 
@@ -79,6 +80,8 @@ type Queue struct {
 
 	// readOnly queues skip recovery/scheduling and reject mutations.
 	readOnly bool
+	readyDir *os.File
+	deadDir  *os.File
 
 	// Corrupt holds reportable quarantine events from Open.
 	Corrupt []error

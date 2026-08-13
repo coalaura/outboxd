@@ -3,12 +3,15 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"unsafe"
 
+	"github.com/coalaura/outboxd/internal/disk"
 	"github.com/coalaura/outboxd/internal/windowsacl"
 	"golang.org/x/sys/windows"
 )
@@ -122,53 +125,58 @@ func validateOpenedFile(path string, file *os.File, private, managed bool) (*os.
 func (cfg Config) CheckGeneratedParents(path string) error {
 	data, _ := filepath.Abs(filepath.Clean(cfg.ResolvedDataDir()))
 
-	err := validateManagedRoot(data)
+	err := disk.ValidatePath(data)
 	if err != nil {
 		return err
 	}
 
-	for current := filepath.Dir(path); ; current = filepath.Dir(current) {
-		info, err := os.Lstat(current)
-		if err == nil && info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("generated path parent %q is a symlink", current)
+	parent, err := filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+
+	relative, err := filepath.Rel(data, parent)
+	if err != nil || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("generated path escapes data directory")
+	}
+
+	dir, err := disk.OpenDirectory(data)
+	if err != nil {
+		return err
+	}
+
+	defer dir.Close()
+
+	err = windowsacl.ValidateHandle(windows.Handle(dir.Fd()), data, true, false)
+	if err != nil {
+		return err
+	}
+	if relative == "." {
+		return nil
+	}
+
+	for _, component := range strings.Split(relative, string(filepath.Separator)) {
+		child, openErr := disk.OpenDirectoryAt(dir, component)
+		if openErr != nil {
+			_, statErr := os.Lstat(filepath.Join(dir.Name(), component))
+			if errors.Is(statErr, os.ErrNotExist) {
+				return nil
+			}
+
+			return openErr
 		}
 
-		if err != nil && !os.IsNotExist(err) {
+		err = windowsacl.ValidateHandle(windows.Handle(child.Fd()), child.Name(), true, false)
+		if err != nil {
+			child.Close()
+
 			return err
 		}
 
-		if current == data {
-			return nil
-		}
+		dir.Close()
 
-		next := filepath.Dir(current)
-		if next == current {
-			return fmt.Errorf("generated path escapes data directory")
-		}
-	}
-}
-
-func validateManagedRoot(path string) error {
-	name, err := windows.UTF16PtrFromString(path)
-	if err != nil {
-		return err
+		dir = child
 	}
 
-	handle, err := windows.CreateFile(
-		name,
-		windows.READ_CONTROL,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		nil,
-		windows.OPEN_EXISTING,
-		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
-		0,
-	)
-
-	if err != nil {
-		return err
-	}
-
-	defer windows.CloseHandle(handle)
-
-	return windowsacl.ValidateHandle(handle, path, true, false)
+	return nil
 }
