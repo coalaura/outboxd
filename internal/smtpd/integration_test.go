@@ -22,6 +22,7 @@ import (
 
 	"github.com/coalaura/outboxd/internal/certs"
 	"github.com/coalaura/outboxd/internal/config"
+	"github.com/coalaura/outboxd/internal/openpgp"
 	"github.com/coalaura/outboxd/internal/passwd"
 	"github.com/coalaura/outboxd/internal/queue"
 	"github.com/coalaura/outboxd/internal/sign"
@@ -844,6 +845,49 @@ func TestOpenPGPFailureSkipsDKIMAndQueue(t *testing.T) {
 
 	if transformed.Load() != 1 || dkim.Load() != 0 || added.Load() != 0 || spool.Len() != 0 {
 		t.Fatalf("OpenPGP=%d DKIM=%d queue=%d spool=%d", transformed.Load(), dkim.Load(), added.Load(), spool.Len())
+	}
+}
+
+func TestOpenPGPExpansionFailureReturnsMessageTooLarge(t *testing.T) {
+	const password = "openpgp-size-password"
+
+	srv, _, spool, _, pool := testServerWithUser(t, password)
+
+	var (
+		dkim  atomic.Int32
+		added atomic.Int32
+	)
+
+	srv.openPGPSign = func(context.Context, string, []byte) ([]byte, bool, error) {
+		return nil, false, fmt.Errorf("signing expansion: %w", openpgp.ErrMessageTooLarge)
+	}
+
+	srv.signMessage = func(context.Context, []byte) (string, error) {
+		dkim.Add(1)
+
+		return "", nil
+	}
+
+	srv.queueAdd = func(context.Context, *queue.Envelope, []byte) error {
+		added.Add(1)
+
+		return nil
+	}
+
+	runTestSubmission(t, srv)
+
+	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
+	defer cl.close()
+
+	cl.authPlain(t, "alice", password)
+
+	beginMessage(t, cl, "")
+	writeMessage(cl, "must not be accepted oversized")
+
+	cl.readCode(t, 552)
+
+	if dkim.Load() != 0 || added.Load() != 0 || spool.Len() != 0 {
+		t.Fatalf("DKIM=%d queue=%d spool=%d", dkim.Load(), added.Load(), spool.Len())
 	}
 }
 

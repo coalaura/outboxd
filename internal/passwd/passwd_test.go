@@ -42,17 +42,26 @@ func TestHashAndVerify(t *testing.T) {
 	}
 }
 
+func TestWasteHashUsesAuditedProfile(t *testing.T) {
+	p, err := parsePHC(wasteHash)
+	if err != nil {
+		t.Fatalf("waste hash is invalid: %v", err)
+	}
+
+	if p.Memory != hashMemory || p.Iterations != hashTime || p.Threads != hashThreads || len(p.Salt) != saltLength || len(p.Key) != keyLength {
+		t.Fatalf("waste profile = m=%d,t=%d,p=%d,salt=%d,output=%d", p.Memory, p.Iterations, p.Threads, len(p.Salt), len(p.Key))
+	}
+
+	Waste("attacker-supplied-password")
+}
+
 func TestVerifyPrefixedArgon2id(t *testing.T) {
 	password := "migration-password"
 	salt := []byte("1234567890abcdef")
 
-	memory := uint32(32)
-	iterations := uint32(1)
-	threads := uint8(2)
+	key := argon2.IDKey([]byte(password), salt, hashTime, hashMemory, hashThreads, keyLength)
 
-	key := argon2.IDKey([]byte(password), salt, iterations, memory, threads, keyLength)
-
-	hash := fmt.Sprintf("{ARGON2ID}$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s", argon2.Version, memory, iterations, threads, encoding.EncodeToString(salt), encoding.EncodeToString(key))
+	hash := fmt.Sprintf("{ARGON2ID}$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s", argon2.Version, hashMemory, hashTime, hashThreads, encoding.EncodeToString(salt), encoding.EncodeToString(key))
 
 	err := ValidatePHC(hash)
 	if err != nil {
@@ -76,14 +85,14 @@ func TestValidatePrefixedArgon2idBounds(t *testing.T) {
 
 	for _, params := range []string{
 		"m=0,t=1,p=1",
-		"m=7,t=1,p=1",
-		"m=131073,t=1,p=1",
-		"m=8,t=0,p=1",
-		"m=8,t=6,p=1",
-		"m=8,t=1,p=0",
-		"m=72,t=1,p=9",
-		"m=32,t=1,p=1,x=1",
-		"t=1,m=32,p=1",
+		"m=8,t=1,p=1",
+		"m=19455,t=2,p=1",
+		"m=19457,t=2,p=1",
+		"m=19456,t=1,p=1",
+		"m=19456,t=3,p=1",
+		"m=19456,t=2,p=2",
+		"m=19456,t=2,p=1,x=1",
+		"t=2,m=19456,p=1",
 	} {
 		hash := fmt.Sprintf("{ARGON2ID}$argon2id$v=%d$%s$%s$%s", argon2.Version, params, salt, key)
 
@@ -93,16 +102,36 @@ func TestValidatePrefixedArgon2idBounds(t *testing.T) {
 		}
 	}
 
-	typical := fmt.Sprintf("{ARGON2ID}$argon2id$v=%d$m=65536,t=3,p=1$%s$%s", argon2.Version, salt, key)
+	typical := fmt.Sprintf("{ARGON2ID}$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s", argon2.Version, hashMemory, hashTime, hashThreads, salt, key)
 
 	err := ValidatePHC(typical)
 	if err != nil {
-		t.Fatalf("typical migration parameters rejected: %v", err)
+		t.Fatalf("audited migration parameters rejected: %v", err)
 	}
 
 	err = ValidatePHC("{ARGON2I}$argon2i$v=19$m=32,t=1,p=1$" + salt + "$" + key)
 	if err == nil {
 		t.Fatal("unsupported prefixed scheme accepted")
+	}
+}
+
+func TestValidatePrefixedArgon2idRequiresStrongSizes(t *testing.T) {
+	params := fmt.Sprintf("m=%d,t=%d,p=%d", hashMemory, hashTime, hashThreads)
+
+	for _, tc := range []phcCanonicalSizeCase{
+		{make([]byte, 1), make([]byte, keyLength)},
+		{make([]byte, saltLength), make([]byte, 1)},
+		{make([]byte, saltLength-1), make([]byte, keyLength)},
+		{make([]byte, saltLength), make([]byte, keyLength-1)},
+		{make([]byte, saltLength+1), make([]byte, keyLength)},
+		{make([]byte, saltLength), make([]byte, keyLength+1)},
+	} {
+		hash := fmt.Sprintf("{ARGON2ID}$argon2id$v=%d$%s$%s$%s", argon2.Version, params, encoding.EncodeToString(tc.salt), encoding.EncodeToString(tc.key))
+
+		err := ValidatePHC(hash)
+		if err == nil {
+			t.Fatalf("accepted migration salt=%d output=%d", len(tc.salt), len(tc.key))
+		}
 	}
 }
 

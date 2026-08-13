@@ -179,9 +179,113 @@ func TestDataIsNeverReachable(t *testing.T) {
 			t.Fatal(readErr)
 		}
 
-		if strings.HasPrefix(response, "354 ") || strings.HasPrefix(response, "250 2.0.0") {
+		if (strings.HasPrefix(command, "DATA") || strings.HasPrefix(command, "BDAT")) && (strings.HasPrefix(response, "354 ") || strings.HasPrefix(response, "250 2.0.0")) {
 			t.Fatalf("%q accepted message data: %q", strings.TrimSpace(command), strings.TrimSpace(response))
 		}
+	}
+}
+
+func TestRejectionProtocolHasNoDeliveryCapabilities(t *testing.T) {
+	srv, _, _ := testServer(t, "all")
+
+	conn, err := net.DialTimeout("tcp", srv.listener.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer conn.Close()
+
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	reader := bufio.NewReader(conn)
+
+	readResponse(t, reader, "220")
+
+	fmt.Fprint(conn, "EHLO sender.example\r\n")
+
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if response != "250 2.0.0 Hello sender.example\r\n" {
+		t.Fatalf("unexpected EHLO response %q", response)
+	}
+
+	fmt.Fprint(conn, "VRFY anything@example.com\r\n")
+
+	response, err = reader.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.HasPrefix(response, "500 ") || strings.Contains(response, "accept message") {
+		t.Fatalf("misleading VRFY response %q", response)
+	}
+}
+
+func TestRejectedRecipientsAreBoundedPerConnection(t *testing.T) {
+	srv, _, _ := testServer(t, "all")
+
+	conn, err := net.DialTimeout("tcp", srv.listener.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer conn.Close()
+
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	reader := bufio.NewReader(conn)
+
+	readResponse(t, reader, "220")
+
+	fmt.Fprint(conn, "EHLO sender.example\r\n")
+	readResponse(t, reader, "250")
+
+	fmt.Fprint(conn, "MAIL FROM:<sender@example.net>\r\n")
+	readResponse(t, reader, "250")
+
+	for i := 0; i < maxCommandsPerConnection-2; i++ {
+		fmt.Fprint(conn, "RCPT TO:<anything@example.com>\r\n")
+		readResponse(t, reader, "550")
+	}
+
+	fmt.Fprint(conn, "RCPT TO:<anything@example.com>\r\n")
+	readResponse(t, reader, "221")
+
+	_, err = fmt.Fprint(conn, "NOOP\r\n")
+	if err == nil {
+		_, err = reader.ReadString('\n')
+	}
+
+	if err == nil {
+		t.Fatal("connection remained open after rejected-recipient limit")
+	}
+}
+
+func TestOverlongCommandClosesConnection(t *testing.T) {
+	srv, _, _ := testServer(t, "all")
+
+	conn, err := net.DialTimeout("tcp", srv.listener.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer conn.Close()
+
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	reader := bufio.NewReader(conn)
+
+	readResponse(t, reader, "220")
+
+	fmt.Fprintf(conn, "NOOP %s\r\n", strings.Repeat("x", 8192))
+	readResponse(t, reader, "221")
+
+	_, err = reader.ReadString('\n')
+	if err == nil {
+		t.Fatal("connection remained open after an overlong command")
 	}
 }
 

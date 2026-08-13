@@ -160,6 +160,11 @@ func Write(cfg *config.Config, dkim string) (string, []byte, error) {
 	if cfg.ReplyRejection.Enabled {
 		fmt.Fprintf(&buffer, "- Inbound TCP port %s must be open for the optional rejection-only SMTP endpoint\n", listenPort(cfg.ReplyRejection.ListenAddr))
 		buffer.WriteString("- Generated MX records route attempted replies to permanent SMTP rejection; no inbound message is accepted or stored\n")
+
+		uncovered := uncoveredEnvelopeDomains(cfg)
+		if len(uncovered) > 0 {
+			fmt.Fprintf(&buffer, "- Envelope-sender domain(s) not covered by reply rejection (%s) need MX (or an A/AAAA implicit MX) pointing at a mailbox that accepts bounces and replies\n", strings.Join(uncovered, ", "))
+		}
 	} else {
 		buffer.WriteString("- Reply rejection is disabled: outboxd does not listen on public SMTP port 25 or generate MX records\n")
 		buffer.WriteString("- Do not publish an MX for this host unless a separate mailbox accepts mail elsewhere\n")
@@ -220,6 +225,52 @@ func Write(cfg *config.Config, dkim string) (string, []byte, error) {
 	body := buffer.Bytes()
 
 	return path, body, disk.Write(path, body, 0644)
+}
+
+func uncoveredEnvelopeDomains(cfg *config.Config) []string {
+	rejectionDomains := make(map[string]struct{}, len(cfg.ReplyRejection.Domains))
+
+	for _, domain := range cfg.ReplyRejection.Domains {
+		rejectionDomains[strings.ToLower(strings.TrimSuffix(domain, "."))] = struct{}{}
+	}
+
+	domains := make(map[string]struct{})
+
+	add := func(domain string) {
+		domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
+		if domain != "" {
+			domains[domain] = struct{}{}
+		}
+	}
+
+	add(cfg.Server.Domain)
+
+	for i := range cfg.Users {
+		for _, sender := range cfg.Users[i].AllowedSenders {
+			sender = strings.TrimSpace(sender)
+			if strings.HasPrefix(sender, "*@") {
+				add(sender[2:])
+
+				continue
+			}
+
+			if at := strings.LastIndexByte(sender, '@'); at >= 0 {
+				add(sender[at+1:])
+			}
+		}
+	}
+
+	uncovered := make([]string, 0, len(domains))
+
+	for domain := range domains {
+		if _, covered := rejectionDomains[domain]; !covered {
+			uncovered = append(uncovered, domain)
+		}
+	}
+
+	slices.Sort(uncovered)
+
+	return uncovered
 }
 
 func listenPort(addr string) string {

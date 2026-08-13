@@ -13,7 +13,6 @@ import (
 	"net/mail"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	pgp "github.com/ProtonMail/go-crypto/openpgp"
@@ -24,11 +23,15 @@ import (
 const (
 	maxKeyBytes        = 4 << 20
 	maxPassphraseBytes = 4 << 10
+	maxMultipartDepth  = 32
 )
+
+// ErrMessageTooLarge reports deterministic expansion beyond max_message_bytes.
+var ErrMessageTooLarge = errors.New("signed message exceeds configured maximum size")
 
 type identity struct {
 	entity *pgp.Entity
-	mu     sync.Mutex
+	gate   chan struct{}
 }
 
 // Signers is an immutable startup snapshot of configured signing identities.
@@ -40,11 +43,26 @@ type Signers struct {
 type limitedBuffer struct {
 	bytes.Buffer
 	maximum int64
+	ctx     context.Context
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader *bytes.Reader
+}
+
+type contextWriter struct {
+	ctx    context.Context
+	writer *bytes.Buffer
 }
 
 func (b *limitedBuffer) Write(data []byte) (int, error) {
+	if err := b.ctx.Err(); err != nil {
+		return 0, err
+	}
+
 	if int64(b.Len())+int64(len(data)) > b.maximum {
-		return 0, errors.New("signed message exceeds configured maximum size")
+		return 0, ErrMessageTooLarge
 	}
 
 	return b.Buffer.Write(data)
@@ -144,7 +162,7 @@ func loadIdentity(cfg *config.Config, configured config.OpenPGPIdentity) (*ident
 		return nil, fmt.Errorf("validate signing key: %w", err)
 	}
 
-	return &identity{entity: entity}, nil
+	return &identity{entity: entity, gate: make(chan struct{}, 1)}, nil
 }
 
 func readPassphrase(cfg *config.Config, path string) ([]byte, error) {
@@ -226,7 +244,7 @@ func (s *Signers) Sign(ctx context.Context, sender string, data []byte) ([]byte,
 		return nil, false, err
 	}
 
-	entity, err = canonicalizeEntity(entity, s.maximum)
+	entity, err = canonicalizeEntityContext(ctx, entity, s.maximum, 0)
 	if err != nil {
 		return nil, false, err
 	}
@@ -235,18 +253,27 @@ func (s *Signers) Sign(ctx context.Context, sender string, data []byte) ([]byte,
 		entity = append(entity, '\r', '\n')
 	}
 
-	configured.mu.Lock()
-	defer configured.mu.Unlock()
-
-	if err := ctx.Err(); err != nil {
-		return nil, false, err
+	select {
+	case configured.gate <- struct{}{}:
+		defer func() {
+			<-configured.gate
+		}()
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
 	}
 
 	var signature bytes.Buffer
 
-	err = pgp.ArmoredDetachSign(&signature, configured.entity, bytes.NewReader(entity), signingConfig())
+	err = pgp.ArmoredDetachSign(contextWriter{ctx: ctx, writer: &signature}, configured.entity, contextReader{ctx: ctx, reader: bytes.NewReader(entity)}, signingConfig())
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, false, ctx.Err()
+		}
+
 		return nil, false, fmt.Errorf("create detached signature: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
 	}
 
 	boundary, err := randomBoundary()
@@ -259,7 +286,7 @@ func (s *Signers) Sign(ctx context.Context, sender string, data []byte) ([]byte,
 	result := buildSignedMessage(outer, entity, armor, boundary)
 
 	if int64(len(result)) > s.maximum {
-		return nil, false, fmt.Errorf("signed message exceeds maximum size of %d bytes", s.maximum)
+		return nil, false, fmt.Errorf("%w: maximum is %d bytes", ErrMessageTooLarge, s.maximum)
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -339,23 +366,46 @@ func splitMessage(data []byte) ([]byte, []byte, error) {
 }
 
 func canonicalizeEntity(data []byte, maximum int64) ([]byte, error) {
+	return canonicalizeEntityContext(context.Background(), data, maximum, 0)
+}
+
+func canonicalizeEntityContext(ctx context.Context, data []byte, maximum int64, depth int) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	if depth > maxMultipartDepth {
+		return nil, fmt.Errorf("MIME multipart nesting exceeds maximum depth of %d", maxMultipartDepth)
+	}
+
 	if int64(len(data)) > maximum {
-		return nil, errors.New("MIME entity exceeds configured maximum size")
+		return nil, ErrMessageTooLarge
 	}
 
 	headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
-	if headerEnd < 0 {
+
+	var (
+		head []byte
+		body []byte
+	)
+
+	if headerEnd >= 0 {
+		head = data[:headerEnd+2]
+		body = data[headerEnd+4:]
+	} else if bytes.HasPrefix(data, []byte("\r\n")) {
+		body = data[2:]
+	} else {
 		return nil, errors.New("MIME entity has no header/body separator")
 	}
-
-	head := data[:headerEnd+2]
-	body := data[headerEnd+4:]
 
 	if !isSevenBit(head) {
 		return nil, errors.New("MIME entity headers are not 7-bit safe")
 	}
 
 	contentType := headerValue(head, "content-type")
+	if contentType == "" {
+		contentType = "text/plain; charset=us-ascii"
+	}
 
 	mediaType, params, err := mime.ParseMediaType(contentType)
 	if err != nil {
@@ -368,7 +418,7 @@ func canonicalizeEntity(data []byte, maximum int64) ([]byte, error) {
 			return nil, errors.New("multipart MIME entity has no boundary")
 		}
 
-		canonicalBody, err := canonicalizeMultipart(body, boundary, maximum-int64(len(head))-2)
+		canonicalBody, err := canonicalizeMultipart(ctx, body, boundary, maximum-int64(len(head))-2, depth)
 		if err != nil {
 			return nil, err
 		}
@@ -403,6 +453,7 @@ func canonicalizeEntity(data []byte, maximum int64) ([]byte, error) {
 	var encoded limitedBuffer
 
 	encoded.maximum = maximum - int64(len(head)) - 2
+	encoded.ctx = ctx
 
 	writer := quotedprintable.NewWriter(&encoded)
 
@@ -419,7 +470,7 @@ func canonicalizeEntity(data []byte, maximum int64) ([]byte, error) {
 	return joinEntity(head, encoded.Bytes()), nil
 }
 
-func canonicalizeMultipart(body []byte, boundary string, maximum int64) ([]byte, error) {
+func canonicalizeMultipart(ctx context.Context, body []byte, boundary string, maximum int64, depth int) ([]byte, error) {
 	marker := []byte("--" + boundary)
 
 	var result bytes.Buffer
@@ -427,6 +478,10 @@ func canonicalizeMultipart(body []byte, boundary string, maximum int64) ([]byte,
 	partStart := -1
 
 	for offset := 0; offset < len(body); {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		lineEnd := bytes.Index(body[offset:], []byte("\r\n"))
 		if lineEnd < 0 {
 			lineEnd = len(body) - offset
@@ -439,7 +494,7 @@ func canonicalizeMultipart(body []byte, boundary string, maximum int64) ([]byte,
 			if partStart >= 0 {
 				part := body[partStart:offset]
 
-				canonical, err := canonicalizeEntity(part, maximum-int64(result.Len()))
+				canonical, err := canonicalizeEntityContext(ctx, part, maximum-int64(result.Len()), depth+1)
 				if err != nil {
 					return nil, err
 				}
@@ -480,7 +535,7 @@ func canonicalizeMultipart(body []byte, boundary string, maximum int64) ([]byte,
 
 func appendLimited(result *bytes.Buffer, data []byte, maximum int64) error {
 	if int64(result.Len())+int64(len(data)) > maximum {
-		return errors.New("canonical MIME entity exceeds configured maximum size")
+		return ErrMessageTooLarge
 	}
 
 	result.Write(data)
@@ -579,4 +634,20 @@ func fieldName(field []byte) string {
 	}
 
 	return strings.ToLower(string(field[:colon]))
+}
+
+func (r contextReader) Read(data []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	return r.reader.Read(data)
+}
+
+func (w contextWriter) Write(data []byte) (int, error) {
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	return w.writer.Write(data)
 }

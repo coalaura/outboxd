@@ -120,7 +120,7 @@ func TestConfigUpdatePreservesValuesAndAddsDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, field := range []string{"reply_rejection:", "max_connections:", "openpgp:", "identities: []"} {
+	for _, field := range []string{"reply_rejection:", "max_connections:", "max_connections_per_ip:", "openpgp:", "identities: []"} {
 		if !bytes.Contains(rewritten, []byte(field)) {
 			t.Fatalf("updated config missing %q", field)
 		}

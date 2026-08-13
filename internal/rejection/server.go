@@ -2,6 +2,8 @@
 package rejection
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -16,7 +18,10 @@ import (
 	"github.com/emersion/go-smtp"
 )
 
-const maxMessageBytes = 1024
+const (
+	maxMessageBytes          = 1024
+	maxCommandsPerConnection = 100
+)
 
 // Logger receives operational messages.
 type Logger interface {
@@ -85,6 +90,17 @@ type trackListener struct {
 	tracker *connectionTracker
 }
 
+type protocolListener struct {
+	net.Listener
+}
+
+type protocolConn struct {
+	net.Conn
+	reader   *bufio.Reader
+	pending  []byte
+	commands int
+}
+
 type trackedConn struct {
 	net.Conn
 	tracker *connectionTracker
@@ -123,7 +139,6 @@ func New(cfg *config.Config, log Logger) *Server {
 	}))
 
 	s.smtp.Domain = s.hostname
-	s.smtp.MaxRecipients = 1
 	s.smtp.MaxMessageBytes = maxMessageBytes
 	s.smtp.ReadTimeout = config.Duration(r.ReadTimeout)
 	s.smtp.WriteTimeout = config.Duration(r.WriteTimeout)
@@ -171,8 +186,10 @@ func (s *Server) Run(ctx context.Context) error {
 	lifetime := max(config.Duration(s.cfg.ReadTimeout), config.Duration(s.cfg.WriteTimeout))
 	listener := &startListener{
 		Listener: &trackListener{
-			Listener: &limitListener{Listener: s.listener, limiter: s.limiter, lifetime: lifetime},
-			tracker:  s.connections,
+			Listener: &protocolListener{
+				Listener: &limitListener{Listener: s.listener, limiter: s.limiter, lifetime: lifetime},
+			},
+			tracker: s.connections,
 		},
 		entered: func() {
 			close(started)
@@ -229,6 +246,56 @@ func (l *startListener) Accept() (net.Conn, error) {
 	l.once.Do(l.entered)
 
 	return l.Listener.Accept()
+}
+
+func (l *protocolListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	return &protocolConn{Conn: conn, reader: bufio.NewReader(conn)}, nil
+}
+
+func (c *protocolConn) Read(p []byte) (int, error) {
+	if len(c.pending) == 0 {
+		line, err := c.reader.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
+			line = []byte("QUIT\r\n")
+			err = nil
+		}
+
+		if len(line) == 0 {
+			return 0, err
+		}
+
+		c.commands++
+
+		command := line
+		if space := bytes.IndexAny(command, " \r\n"); space >= 0 {
+			command = command[:space]
+		}
+
+		switch {
+		case c.commands > maxCommandsPerConnection:
+			line = []byte("QUIT\r\n")
+		case bytes.EqualFold(command, []byte("EHLO")):
+			copy(line, "HELO")
+		case bytes.EqualFold(command, []byte("DATA")):
+			copy(line, "XATA")
+		case bytes.EqualFold(command, []byte("BDAT")):
+			copy(line, "XDAT")
+		case bytes.EqualFold(command, []byte("VRFY")):
+			copy(line, "XRFY")
+		}
+
+		c.pending = line
+	}
+
+	n := copy(p, c.pending)
+	c.pending = c.pending[n:]
+
+	return n, nil
 }
 
 func (s *session) Mail(string, *smtp.MailOptions) error {

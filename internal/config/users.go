@@ -162,6 +162,7 @@ func (cfg *Config) adopt(other *Config) {
 	defer cfg.dataMu.Unlock()
 
 	cfg.Server = other.Server
+	cfg.ReplyRejection = other.ReplyRejection
 	cfg.TLS = other.TLS
 	cfg.DKIM = other.DKIM
 	cfg.OpenPGP = other.OpenPGP

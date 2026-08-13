@@ -122,7 +122,7 @@ sudo -u outboxd /opt/outboxd/outboxd -config /var/lib/outboxd/config.yml user ad
 printf '%s\n' 'a-long-password' | sudo -u outboxd /opt/outboxd/outboxd -config /var/lib/outboxd/config.yml user add alice alice@example.com
 ```
 
-The user command always stores a native Argon2id hash. For migration, a `password_hash` copied into the configuration may instead use the Dovecot-style `{ARGON2ID}$argon2id$...` form. Only Argon2id is supported and imported parameters are subject to resource limits. Restart outboxd after editing users.
+The user command always stores a native Argon2id hash. For migration, a `password_hash` copied into the configuration may instead use the Dovecot-style `{ARGON2ID}$argon2id$...` form. Imported hashes must use the audited native profile: Argon2id `m=19456,t=2,p=1`, a 16-byte salt and a 32-byte output. This keeps each authentication within 19 MiB and all eight permitted authentication workers within 152 MiB, while making unknown-user timing work use the same cost profile. Regenerate incompatible hashes before importing them, then restart outboxd after editing users.
 
 Generate the DNS instructions while the daemon is stopped:
 

@@ -198,7 +198,7 @@ func (s *session) authenticate(username, password string) error {
 
 	user, ok := s.server.cfg.User(username)
 	if !ok || !user.Enabled {
-		passwd.Waste()
+		passwd.Waste(password)
 
 		s.server.authLimit.failed(ip, username)
 

@@ -712,6 +712,44 @@ func TestAuthWorkerMemoryBound(t *testing.T) {
 	}
 }
 
+func TestGeneratedAuthCommentsDocumentAuditedBounds(t *testing.T) {
+	cfg := Default()
+
+	cfg.initializeRuntime()
+
+	data, err := cfg.marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{
+		"19 MiB each; maximum 8, 152 MiB total",
+		"migration hashes must use m=19456,t=2,p=1, a 16-byte salt, and a 32-byte output",
+	} {
+		if !bytes.Contains(data, []byte(want)) {
+			t.Fatalf("generated configuration does not document %q", want)
+		}
+	}
+}
+
+func TestAdoptIncludesReplyRejection(t *testing.T) {
+	cfg := Default()
+
+	cfg.initializeRuntime()
+
+	other := Default()
+
+	other.ReplyRejection.Enabled = true
+	other.ReplyRejection.Domains = []string{"example.com"}
+	other.ReplyRejection.Recipients = []ReplyRejectionRecipient{{Address: "noreply@example.com"}}
+
+	cfg.adopt(other)
+
+	if !cfg.ReplyRejection.Enabled || len(cfg.ReplyRejection.Domains) != 1 || cfg.ReplyRejection.Domains[0] != "example.com" || len(cfg.ReplyRejection.Recipients) != 1 || cfg.ReplyRejection.Recipients[0].Address != "noreply@example.com" {
+		t.Fatalf("reply rejection not adopted: %+v", cfg.ReplyRejection)
+	}
+}
+
 func TestSupportedMaximaAggregateBound(t *testing.T) {
 	data := MaxMessageBytes*DataMemoryCopies + DataMemoryOverhead
 	if data > DataMemoryBudget {

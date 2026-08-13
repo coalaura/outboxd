@@ -3,11 +3,14 @@ package openpgp
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"mime"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	pgp "github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
@@ -24,7 +27,7 @@ func testSigners(t *testing.T, sender string) (*Signers, *pgp.Entity) {
 	}
 
 	return &Signers{
-		identities: map[string]*identity{sender: {entity: entity}},
+		identities: map[string]*identity{sender: {entity: entity, gate: make(chan struct{}, 1)}},
 		maximum:    config.MaxMessageBytes,
 	}, entity
 }
@@ -101,6 +104,34 @@ func TestSignLeavesUnconfiguredSenderUnchanged(t *testing.T) {
 	}
 }
 
+func TestSignAcceptsOrdinaryMessageWithoutContentType(t *testing.T) {
+	signers, _ := testSigners(t, "alice@example.com")
+
+	message := []byte("From: alice@example.com\r\nSubject: plain\r\n\r\nordinary text\r\n")
+
+	signed, ok, err := signers.Sign(context.Background(), "alice@example.com", message)
+	if err != nil || !ok {
+		t.Fatalf("Sign() = signed %v, err %v", ok, err)
+	}
+
+	if !bytes.Contains(signed, []byte("\r\n\r\nordinary text\r\n")) {
+		t.Fatalf("signed message does not preserve default text/plain entity:\n%s", signed)
+	}
+}
+
+func TestSignReportsExpansionBeyondMaximum(t *testing.T) {
+	signers, _ := testSigners(t, "alice@example.com")
+
+	message := []byte("From: alice@example.com\r\n\r\nhello\r\n")
+
+	signers.maximum = int64(len(message) + 1)
+
+	_, _, err := signers.Sign(context.Background(), "alice@example.com", message)
+	if !errors.Is(err, ErrMessageTooLarge) {
+		t.Fatalf("Sign() error = %v", err)
+	}
+}
+
 func TestCanonicalizeNestedMultipart(t *testing.T) {
 	entity := []byte("Content-Type: multipart/alternative; boundary=x\r\n\r\npreamble\r\n--x\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\nh\xc3\xa9llo\r\n--x\r\nContent-Type: text/html\r\nContent-Transfer-Encoding: base64\r\n\r\naGk=\r\n--x--\r\nepilogue")
 
@@ -111,6 +142,77 @@ func TestCanonicalizeNestedMultipart(t *testing.T) {
 
 	if !isSevenBit(canonical) || !bytes.Contains(canonical, []byte("h=C3=A9llo")) || !bytes.Contains(canonical, []byte("aGk=")) {
 		t.Fatalf("unexpected canonical entity:\n%s", canonical)
+	}
+}
+
+func TestCanonicalizeUsesDefaultContentType(t *testing.T) {
+	entity := []byte("Content-Transfer-Encoding: 8bit\r\n\r\nh\xc3\xa9llo\r\n")
+
+	canonical, err := canonicalizeEntity(entity, config.MaxMessageBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !isSevenBit(canonical) || !bytes.Contains(canonical, []byte("h=C3=A9llo")) {
+		t.Fatalf("unexpected canonical entity:\n%s", canonical)
+	}
+}
+
+func TestCanonicalizeRejectsExcessiveMultipartNesting(t *testing.T) {
+	entity := []byte("\r\ntext\r\n")
+
+	for depth := 0; depth <= maxMultipartDepth; depth++ {
+		boundary := fmt.Sprintf("boundary-%d", depth)
+
+		entity = []byte(fmt.Sprintf("Content-Type: multipart/mixed; boundary=%s\r\n\r\n--%s\r\n%s--%s--\r\n", boundary, boundary, entity, boundary))
+	}
+
+	_, err := canonicalizeEntity(entity, config.MaxMessageBytes)
+	if err == nil || !strings.Contains(err.Error(), "nesting exceeds") {
+		t.Fatalf("canonicalizeEntity() error = %v", err)
+	}
+}
+
+func TestSignCancellationWhileWaitingForSigner(t *testing.T) {
+	signers, _ := testSigners(t, "alice@example.com")
+
+	configured := signers.identities["alice@example.com"]
+
+	configured.gate <- struct{}{}
+
+	defer func() {
+		<-configured.gate
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	started := time.Now()
+
+	_, _, err := signers.Sign(ctx, "alice@example.com", []byte("From: alice@example.com\r\n\r\nhello\r\n"))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Sign() error = %v", err)
+	}
+
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("Sign() cancellation took %v", elapsed)
+	}
+}
+
+func TestCanonicalizeHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := canonicalizeEntityContext(ctx, []byte("\r\nhello\r\n"), config.MaxMessageBytes, 0)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canonicalizeEntityContext() error = %v", err)
+	}
+}
+
+func TestCanonicalizeExpansionReportsMessageTooLarge(t *testing.T) {
+	_, err := canonicalizeEntity([]byte("Content-Transfer-Encoding: 8bit\r\n\r\n\xff\r\n"), 45)
+	if !errors.Is(err, ErrMessageTooLarge) {
+		t.Fatalf("canonicalizeEntity() error = %v, want ErrMessageTooLarge", err)
 	}
 }
 

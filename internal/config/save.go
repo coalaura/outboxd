@@ -59,7 +59,7 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.server.implicit_tls_addr":             {yaml.HeadComment(` implicit TLS submission listen address; default ":465"; empty disables`)},
 		"$.server.max_connections":               {yaml.HeadComment(" global concurrent submission connections (maximum 3840; leaves room for bounded DATA, auth, and delivery workers)")},
 		"$.server.max_connections_per_ip":        {yaml.HeadComment(" per-IP concurrent submission connections (maximum 256 and no greater than global)")},
-		"$.server.auth_workers":                  {yaml.HeadComment(" concurrent Argon2id authentications (19 MiB each; maximum 8)")},
+		"$.server.auth_workers":                  {yaml.HeadComment(" concurrent Argon2id authentications (19 MiB each; maximum 8, 152 MiB total)")},
 		"$.server.max_queue_messages":            {yaml.HeadComment(" maximum ready queue message count (0 = unlimited)")},
 		"$.server.max_queue_bytes":               {yaml.HeadComment(" logical quota for ready message bodies only (0 = unlimited)")},
 		"$.server.max_queue_messages_per_user":   {yaml.HeadComment(" per-user ready queue message cap (0 = unlimited; generated DSNs are exempt)")},
@@ -136,7 +136,7 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.dns.spf_includes":     {yaml.HeadComment(" additional SPF include: domains for other legitimate senders")},
 		"$.dns.output_file":      {yaml.HeadComment(" generated DNS instructions; relative paths are below data_directory")},
 
-		"$.users": {yaml.HeadComment("\n# SMTP users; password_hash must contain an Argon2id hash, never plaintext; {ARGON2ID}-prefixed hashes are accepted for migration")},
+		"$.users": {yaml.HeadComment("\n# SMTP users; password_hash must contain an Argon2id hash, never plaintext; migration hashes must use m=19456,t=2,p=1, a 16-byte salt, and a 32-byte output")},
 	}
 
 	if len(cfg.OpenPGP.Identities) == 0 {

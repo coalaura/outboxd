@@ -217,3 +217,28 @@ func TestReplyRejectionMXIsConditional(t *testing.T) {
 		}
 	}
 }
+
+func TestReplyRejectionGuidanceIncludesUncoveredEnvelopeDomains(t *testing.T) {
+	cfg := config.Default()
+
+	cfg.Server.Hostname = "mail.example.com"
+	cfg.Server.Domain = "example.com"
+	cfg.Server.DataDirectory = t.TempDir()
+	cfg.ReplyRejection.Enabled = true
+	cfg.ReplyRejection.Domains = []string{"example.com"}
+	cfg.Users = []config.User{{AllowedSenders: []string{"sender@other.example", "*@news.example"}}}
+
+	_, body, err := Write(cfg, "v=DKIM1; p=x")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	text := string(body)
+	if !strings.Contains(text, "not covered by reply rejection (news.example, other.example) need MX") {
+		t.Fatalf("uncovered envelope domains missing from guidance:\n%s", text)
+	}
+
+	if strings.Contains(text, "not covered by reply rejection (example.com") {
+		t.Fatalf("covered envelope domain included in guidance:\n%s", text)
+	}
+}

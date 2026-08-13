@@ -9,6 +9,7 @@ import (
 
 	"github.com/coalaura/outboxd/internal/mailbox"
 	"github.com/coalaura/outboxd/internal/message"
+	"github.com/coalaura/outboxd/internal/openpgp"
 	"github.com/coalaura/outboxd/internal/queue"
 	"github.com/emersion/go-smtp"
 )
@@ -155,6 +156,12 @@ func (s *session) Data(r io.Reader) error {
 	if err != nil {
 		if ctx.Err() != nil {
 			s.waitDataDeadlineClose()
+		} else if errors.Is(err, openpgp.ErrMessageTooLarge) {
+			return &smtp.SMTPError{
+				Code:         552,
+				EnhancedCode: smtp.EnhancedCode{5, 3, 4},
+				Message:      "Message too large after OpenPGP signing",
+			}
 		}
 
 		s.server.log.Printf("OpenPGP signing failed for %q: %v\n", prepared.From, err)
