@@ -5,7 +5,7 @@ package disk
 import "os"
 
 func EnsurePrivateRoot(path string) error {
-	return Mkdir(path)
+	return MkdirDurable(path)
 }
 
 func ValidatePrivateDirectory(string) error {
