@@ -8,11 +8,11 @@ The intended deployment is one understandable configuration file, one private lo
 
 ## Product Boundaries
 
-outboxd is for sending mail only. Do not turn it into an inbound MX, mailbox store, IMAP/POP server, spam filter, webmail application, HTTP API, control panel, mailing-list manager or general-purpose MTA.
+outboxd is for sending mail only. Its optional public SMTP endpoint may reject recipients but must never accept message data. Do not turn it into an inbound mailbox store, IMAP/POP server, spam filter, webmail application, HTTP API, control panel, mailing-list manager or general-purpose MTA.
 
 It intentionally does not implement DANE, MTA-STS, DNSSEC validation, certificate-authority automation, inbound bounce handling, reply handling or DMARC report collection. Operators use separate services and their own certificate deployment automation for those concerns.
 
-Submission listens on port 587 with STARTTLS and port 465 with implicit TLS by default. It must remain authenticated and relay-restricted; outboxd does not listen for internet mail on port 25. Outbound delivery uses port 25 and defaults to verified, required TLS. Never silently downgrade TLS or broaden relay access.
+Submission listens on port 587 with STARTTLS and port 465 with implicit TLS by default. It must remain authenticated and relay-restricted. The optional rejection-only listener on port 25 is disabled by default and must never accept `DATA`. Outbound delivery uses port 25 and defaults to verified, required TLS. Never silently downgrade TLS or broaden relay access.
 
 ## Core Rules
 

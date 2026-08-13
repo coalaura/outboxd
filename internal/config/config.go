@@ -11,12 +11,13 @@ type Config struct {
 
 	userLookup map[string]*User
 
-	Server   Server   `yaml:"server"`
-	TLS      TLS      `yaml:"tls"`
-	DKIM     DKIM     `yaml:"dkim"`
-	Delivery Delivery `yaml:"delivery"`
-	DNS      DNS      `yaml:"dns"`
-	Users    []User   `yaml:"users"`
+	Server         Server         `yaml:"server"`
+	ReplyRejection ReplyRejection `yaml:"reply_rejection"`
+	TLS            TLS            `yaml:"tls"`
+	DKIM           DKIM           `yaml:"dkim"`
+	Delivery       Delivery       `yaml:"delivery"`
+	DNS            DNS            `yaml:"dns"`
+	Users          []User         `yaml:"users"`
 }
 
 // SubmissionListenAddr returns the STARTTLS listen address or "" if disabled.

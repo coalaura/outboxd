@@ -186,3 +186,34 @@ func TestInstructionsListOnlyEnabledListenerPorts(t *testing.T) {
 		t.Fatal("disabled implicit TLS listener included in instructions")
 	}
 }
+
+func TestReplyRejectionMXIsConditional(t *testing.T) {
+	cfg := config.Default()
+
+	cfg.Server.Hostname = "mail.example.com"
+	cfg.ReplyRejection.Domains = []string{"example.com", "news.example.com"}
+
+	for _, record := range Build(cfg, "v=DKIM1; p=x") {
+		if record.Type == "MX" {
+			t.Fatalf("MX generated while disabled: %+v", record)
+		}
+	}
+
+	cfg.ReplyRejection.Enabled = true
+
+	records := Build(cfg, "v=DKIM1; p=x")
+
+	seen := map[string]string{}
+
+	for _, record := range records {
+		if record.Type == "MX" {
+			seen[record.Name] = record.Value
+		}
+	}
+
+	for _, domain := range cfg.ReplyRejection.Domains {
+		if seen[domain+"."] != "10 mail.example.com." {
+			t.Fatalf("missing MX for %s: %v", domain, seen)
+		}
+	}
+}

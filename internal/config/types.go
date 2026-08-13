@@ -34,6 +34,24 @@ type Server struct {
 	CorruptRetention          string `yaml:"corrupt_retention"`
 }
 
+type ReplyRejection struct {
+	Enabled             bool                      `yaml:"enabled"`
+	ListenAddr          string                    `yaml:"listen_addr"`
+	UnknownRecipients   string                    `yaml:"unknown_recipients"`
+	DefaultMessage      string                    `yaml:"default_message"`
+	Domains             []string                  `yaml:"domains"`
+	Recipients          []ReplyRejectionRecipient `yaml:"recipients"`
+	MaxConnections      int                       `yaml:"max_connections"`
+	MaxConnectionsPerIP int                       `yaml:"max_connections_per_ip"`
+	ReadTimeout         string                    `yaml:"read_timeout"`
+	WriteTimeout        string                    `yaml:"write_timeout"`
+}
+
+type ReplyRejectionRecipient struct {
+	Address string `yaml:"address"`
+	Message string `yaml:"message"`
+}
+
 type TLS struct {
 	Mode                   string `yaml:"mode"`
 	AllowSelfSignedServing bool   `yaml:"allow_self_signed_serving"`

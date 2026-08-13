@@ -63,6 +63,15 @@ func Default() *Config {
 			DeadRetention:           "720h",
 			CorruptRetention:        "336h",
 		},
+		ReplyRejection: ReplyRejection{
+			ListenAddr:          ":25",
+			UnknownRecipients:   "listed_only",
+			DefaultMessage:      "This address does not accept email",
+			MaxConnections:      128,
+			MaxConnectionsPerIP: 8,
+			ReadTimeout:         "1m",
+			WriteTimeout:        "30s",
+		},
 		TLS: TLS{
 			Mode:            "self_signed",
 			CertificateFile: "tls/server.crt",

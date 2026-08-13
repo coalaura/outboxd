@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/coalaura/outboxd/internal/mailbox"
 	"github.com/coalaura/outboxd/internal/passwd"
 	"github.com/coalaura/outboxd/internal/queue"
 )
@@ -63,6 +64,11 @@ func (cfg *Config) Validate() error {
 
 	if cfg.Server.AuthWorkers <= 0 || cfg.Server.AuthWorkers > MaxAuthWorkers {
 		return errors.New("auth worker limit is invalid or exceeds supported bounds")
+	}
+
+	err = cfg.validateReplyRejection()
+	if err != nil {
+		return err
 	}
 
 	if cfg.Server.MaxQueueMessages < 0 || cfg.Server.MaxQueueBytes < 0 || cfg.Server.MaxQueueMessagesPerUser < 0 || cfg.Server.MaxQueueBytesPerUser < 0 || cfg.Server.MinFreeDiskBytes < 0 {
@@ -334,6 +340,113 @@ func (cfg *Config) Validate() error {
 		}
 
 		usernames[username] = struct{}{}
+	}
+
+	return nil
+}
+
+func (cfg *Config) validateReplyRejection() error {
+	r := &cfg.ReplyRejection
+
+	if r.ListenAddr == "" {
+		return errors.New("reply_rejection.listen_addr must not be empty")
+	}
+
+	switch r.UnknownRecipients {
+	case "listed_only", "all":
+	default:
+		return errors.New("reply_rejection.unknown_recipients must be listed_only or all")
+	}
+
+	err := validateResponseMessage("reply_rejection.default_message", r.DefaultMessage)
+	if err != nil {
+		return err
+	}
+
+	if r.MaxConnections <= 0 || r.MaxConnections > MaxReplyConnections || r.MaxConnectionsPerIP <= 0 || r.MaxConnectionsPerIP > MaxReplyConnectionsPerIP || r.MaxConnectionsPerIP > r.MaxConnections {
+		return errors.New("reply rejection connection limits are invalid or exceed supported bounds")
+	}
+
+	err = validateDuration("reply_rejection.read_timeout", r.ReadTimeout, MaxReplyReadTimeout)
+	if err != nil {
+		return err
+	}
+
+	err = validateDuration("reply_rejection.write_timeout", r.WriteTimeout, MaxReplyWriteTimeout)
+	if err != nil {
+		return err
+	}
+
+	domains := make(map[string]struct{}, len(r.Domains))
+
+	for i, domain := range r.Domains {
+		err = validateDomain(fmt.Sprintf("reply_rejection.domains[%d]", i), domain)
+		if err != nil {
+			return err
+		}
+
+		canonical := strings.ToLower(domain)
+
+		if _, exists := domains[canonical]; exists {
+			return fmt.Errorf("duplicate reply rejection domain %q", domain)
+		}
+
+		domains[canonical] = struct{}{}
+		r.Domains[i] = canonical
+	}
+
+	if r.Enabled && len(domains) == 0 {
+		return errors.New("reply_rejection.domains must contain at least one domain when enabled")
+	}
+
+	recipients := make(map[string]struct{}, len(r.Recipients))
+
+	for i := range r.Recipients {
+		recipient := &r.Recipients[i]
+
+		address, err := mailbox.Address(recipient.Address)
+		if err != nil {
+			return fmt.Errorf("reply_rejection.recipients[%d].address: %w", i, err)
+		}
+
+		domain, err := mailbox.DomainOf(address)
+		if err != nil {
+			return fmt.Errorf("reply_rejection.recipients[%d].address: %w", i, err)
+		}
+
+		if _, ok := domains[domain]; !ok {
+			return fmt.Errorf("reply_rejection recipient %q is outside configured domains", address)
+		}
+
+		if recipient.Message != "" {
+			err = validateResponseMessage(fmt.Sprintf("reply_rejection.recipients[%d].message", i), recipient.Message)
+			if err != nil {
+				return err
+			}
+		}
+
+		canonical := strings.ToLower(address)
+
+		if _, exists := recipients[canonical]; exists {
+			return fmt.Errorf("duplicate reply rejection recipient %q", address)
+		}
+
+		recipients[canonical] = struct{}{}
+		recipient.Address = address
+	}
+
+	return nil
+}
+
+func validateResponseMessage(name, message string) error {
+	if message == "" || len(message) > 256 {
+		return fmt.Errorf("%s must contain 1 to 256 ASCII characters", name)
+	}
+
+	for _, char := range message {
+		if char < 32 || char > 126 {
+			return fmt.Errorf("%s must contain only printable ASCII characters", name)
+		}
 	}
 
 	return nil

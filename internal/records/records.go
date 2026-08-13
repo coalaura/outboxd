@@ -33,7 +33,7 @@ func Build(cfg *config.Config, dkim string) []Record {
 	hostname := strings.TrimSuffix(strings.ToLower(cfg.Server.Hostname), ".") + "."
 	domain := strings.TrimSuffix(strings.ToLower(cfg.Server.Domain), ".") + "."
 
-	records := make([]Record, 0, 8)
+	records := make([]Record, 0, 8+len(cfg.ReplyRejection.Domains))
 
 	if cfg.DNS.PublicIPv4 != "" {
 		ip, err := netip.ParseAddr(cfg.DNS.PublicIPv4)
@@ -54,6 +54,17 @@ func Build(cfg *config.Config, dkim string) []Record {
 			Value:   cfg.DNS.PublicIPv6,
 			Purpose: "Public IPv6 address of the SMTP hostname",
 		})
+	}
+
+	if cfg.ReplyRejection.Enabled {
+		for _, rejectionDomain := range cfg.ReplyRejection.Domains {
+			records = append(records, Record{
+				Name:    strings.TrimSuffix(strings.ToLower(rejectionDomain), ".") + ".",
+				Type:    "MX",
+				Value:   "10 " + hostname,
+				Purpose: "Routes attempted replies to outboxd's rejection-only SMTP endpoint",
+			})
+		}
 	}
 
 	// One SPF TXT per distinct owner name.
@@ -133,7 +144,7 @@ func Write(cfg *config.Config, dkim string) (string, []byte, error) {
 
 	fmt.Fprintf(&buffer, "DNS setup for %s (%s)\n", cfg.Server.Domain, time.Now().Format(time.RFC3339))
 
-	buffer.WriteString("- Outboxd is outbound submission + delivery only: it does not provide inbound MX\n")
+	buffer.WriteString("- Outboxd is outbound submission + delivery only; it never accepts inbound message data\n")
 	buffer.WriteString("- Outbound TCP port 25 (sending mail) must be open from this host\n")
 
 	addr := cfg.Server.ImplicitTLSListenAddr()
@@ -146,7 +157,13 @@ func Write(cfg *config.Config, dkim string) (string, []byte, error) {
 		fmt.Fprintf(&buffer, "- Inbound TCP port %s (STARTTLS submission) must be open for clients\n", listenPort(addr))
 	}
 
-	buffer.WriteString("- Do not publish an MX for this host unless a separate mailbox accepts mail elsewhere\n")
+	if cfg.ReplyRejection.Enabled {
+		fmt.Fprintf(&buffer, "- Inbound TCP port %s must be open for the optional rejection-only SMTP endpoint\n", listenPort(cfg.ReplyRejection.ListenAddr))
+		buffer.WriteString("- Generated MX records route attempted replies to permanent SMTP rejection; no inbound message is accepted or stored\n")
+	} else {
+		buffer.WriteString("- Reply rejection is disabled: outboxd does not listen on public SMTP port 25 or generate MX records\n")
+		buffer.WriteString("- Do not publish an MX for this host unless a separate mailbox accepts mail elsewhere\n")
+	}
 
 	if cfg.DNS.PublicIPv4 != "" {
 		fmt.Fprintf(&buffer, "- PTR for %s must resolve to %s, and %s must resolve back to %s (FCrDNS)\n", cfg.DNS.PublicIPv4, cfg.Server.Hostname, cfg.Server.Hostname, cfg.DNS.PublicIPv4)
@@ -157,7 +174,13 @@ func Write(cfg *config.Config, dkim string) (string, []byte, error) {
 	}
 
 	buffer.WriteString("- PTR records are set at the hosting provider, not in this zone\n")
-	fmt.Fprintf(&buffer, "- Envelope-sender domain(s) need MX (or an A/AAAA implicit MX) pointing at a mailbox that accepts bounces and replies;\n  receivers reject mail whose envelope sender cannot be bounced to. outboxd itself is not that mailbox.\n")
+
+	if cfg.ReplyRejection.Enabled {
+		buffer.WriteString("- Configured rejection domains deliberately reject bounces and replies during SMTP; use a separate MX where those messages must be received\n")
+	} else {
+		buffer.WriteString("- Envelope-sender domain(s) need MX (or an A/AAAA implicit MX) pointing at a mailbox that accepts bounces and replies;\n  receivers reject mail whose envelope sender cannot be bounced to. outboxd itself is not that mailbox.\n")
+	}
+
 	buffer.WriteString("- Publish exactly one SPF TXT per owner name (never two SPF records at the same name)\n")
 	buffer.WriteString("- DMARC aggregate reports (rua) must go to a mailbox you control; outboxd does not ingest reports\n")
 	buffer.WriteString("- External DMARC report destinations need a <org>._report._dmarc.<rua-host> authorization TXT\n")

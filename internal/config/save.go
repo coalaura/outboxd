@@ -46,7 +46,7 @@ func (cfg *Config) marshal() ([]byte, error) {
 	var buffer bytes.Buffer
 
 	comments := yaml.CommentMap{
-		"$.server":                               {yaml.HeadComment(" SMTP submission server (send-only; no inbound MX)")},
+		"$.server":                               {yaml.HeadComment(" authenticated SMTP submission server")},
 		"$.server.hostname":                      {yaml.HeadComment(" public SMTP hostname used for EHLO, TLS, and reverse DNS")},
 		"$.server.domain":                        {yaml.HeadComment(" sending domain used for DKIM, SPF, and DMARC; prefer a dedicated subdomain")},
 		"$.server.max_message_bytes":             {yaml.HeadComment(" maximum accepted message size in bytes (bounded so one DATA worker fits the 512 MiB processing budget)")},
@@ -73,6 +73,18 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.server.read_timeout":                  {yaml.HeadComment(" SMTP command-idle, TLS-read, and DATA-read timeout (maximum 30m)")},
 		"$.server.write_timeout":                 {yaml.HeadComment(" SMTP response and TLS-write timeout (maximum 30m)")},
 		"$.server.data_directory":                {yaml.HeadComment(" generated keys, certificates, DNS instructions and queue data; relative to the config file directory")},
+
+		"$.reply_rejection":                        {yaml.HeadComment("\n# optional rejection-only public SMTP endpoint; never accepts message data")},
+		"$.reply_rejection.enabled":                {yaml.HeadComment(" disabled by default; when false outboxd does not bind listen_addr")},
+		"$.reply_rejection.listen_addr":            {yaml.HeadComment(` public SMTP listen address; default ":25"`)},
+		"$.reply_rejection.unknown_recipients":     {yaml.HeadComment(` "listed_only" gives unknown addresses a generic rejection; "all" uses default_message`)},
+		"$.reply_rejection.default_message":        {yaml.HeadComment(" rejection text for listed recipients without an override and all-mode unknown recipients")},
+		"$.reply_rejection.domains":                {yaml.HeadComment(" domains for which this endpoint is authoritative; other domains are relay-denied")},
+		"$.reply_rejection.recipients":             {yaml.HeadComment(" exact recipient addresses with optional customized rejection text")},
+		"$.reply_rejection.max_connections":        {yaml.HeadComment(" independent global concurrent connection limit (maximum 1024)")},
+		"$.reply_rejection.max_connections_per_ip": {yaml.HeadComment(" independent per-IP concurrent connection limit (maximum 64)")},
+		"$.reply_rejection.read_timeout":           {yaml.HeadComment(" SMTP command read timeout (maximum 5m)")},
+		"$.reply_rejection.write_timeout":          {yaml.HeadComment(" SMTP response write timeout (maximum 5m)")},
 
 		"$.tls":                           {yaml.HeadComment("\n# TLS used by the submission listeners")},
 		"$.tls.mode":                      {yaml.HeadComment(` "self_signed" is development-only; use "files" with a publicly trusted certificate in production`)},

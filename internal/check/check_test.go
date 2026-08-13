@@ -376,6 +376,48 @@ func TestEnvelopeImplicitMX(t *testing.T) {
 	t.Fatal("missing envelope mx check")
 }
 
+func TestReplyRejectionMXMustUseConfiguredHost(t *testing.T) {
+	cfg := baseCfg()
+
+	cfg.Users = nil
+	cfg.ReplyRejection.Enabled = true
+	cfg.ReplyRejection.Domains = []string{"example.com", "replies.example.com"}
+
+	r := &fakeResolver{mx: map[string][]*net.MX{
+		"example.com":         {{Host: "mail.example.com.", Pref: 10}},
+		"replies.example.com": {{Host: "other.example.com.", Pref: 10}},
+	}}
+
+	results := checkEnvelopeMX(context.Background(), r, cfg)
+	if len(results) != 2 {
+		t.Fatalf("results=%+v", results)
+	}
+
+	if results[0].Level != Pass || results[1].Level != Fail || !strings.Contains(results[1].Message, "rejection host") {
+		t.Fatalf("results=%+v", results)
+	}
+}
+
+func TestReplyRejectionMXMustBeExclusive(t *testing.T) {
+	cfg := baseCfg()
+
+	cfg.Users = nil
+	cfg.ReplyRejection.Enabled = true
+	cfg.ReplyRejection.Domains = []string{"example.com"}
+
+	r := &fakeResolver{mx: map[string][]*net.MX{
+		"example.com": {
+			{Host: "mail.example.com.", Pref: 10},
+			{Host: "other.example.com.", Pref: 20},
+		},
+	}}
+
+	results := checkEnvelopeMX(context.Background(), r, cfg)
+	if len(results) != 1 || results[0].Level != Fail || !strings.Contains(results[0].Message, "exclusively") {
+		t.Fatalf("results=%+v", results)
+	}
+}
+
 func TestNoPublicInternetInFake(t *testing.T) {
 	// Ensure Run with empty fake produces deterministic failures without panic
 	// and without dialing the network (fake returns empty).

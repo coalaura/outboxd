@@ -2,7 +2,7 @@
 
 outboxd is a small outbound mail server for straightforward, properly signed mail delivery. It accepts authenticated SMTP submission from configured users, DKIM-signs messages, queues them durably and delivers them to recipient MX servers.
 
-It is for sending mail. It is not an inbound MX, mailbox server, IMAP server, spam filter or webmail application.
+It is for sending mail. It is not an inbound mailbox server, IMAP server, spam filter or webmail application. An optional rejection-only SMTP endpoint can reject attempted replies without accepting their message data.
 
 The project was started after I spent way too long configuring Postfix, Dovecot and OpenDKIM to work together for a small sending service. The intended setup is one complete, understandable configuration file and one private data directory: set a hostname, sending domain and public IP, provision key material, add users, publish the generated DNS records, then start the daemon.
 
@@ -14,7 +14,7 @@ The project was started after I spent way too long configuring Postfix, Dovecot 
 - A publicly trusted TLS certificate for the submission hostname. Certificate files are configured with `tls.mode: files`.
 - A private local filesystem for `data_directory`. Put it on a quota-controlled volume if disk exhaustion matters.
 
-outboxd listens for authenticated submission on port 587 (STARTTLS) and port 465 (implicit TLS) by default. It sends mail outbound on TCP port 25. It does not listen for internet mail on port 25.
+outboxd listens for authenticated submission on port 587 (STARTTLS) and port 465 (implicit TLS) by default. It sends mail outbound on TCP port 25. The optional reply-rejection feature is disabled by default; unless explicitly enabled, outboxd never listens for internet mail on port 25.
 
 ## Install
 
@@ -93,6 +93,22 @@ dns:
 
 Set the remaining options in the generated comments as needed. In particular, keep the default secure outbound TLS policy unless you intentionally need a weaker compatibility policy.
 
+To reject replies without operating a receiving mail server, enable the rejection-only endpoint in the same configuration. The same `outboxd serve` process then listens on port 25; a second process is neither needed nor supported.
+
+```yaml
+reply_rejection:
+  enabled: true
+  listen_addr: ":25"
+  unknown_recipients: listed_only
+  default_message: This address does not accept replies
+  domains: [example.com]
+  recipients:
+    - address: noreply@example.com
+      message: This address does not accept replies. Contact support@example.com.
+```
+
+`listed_only` uses customized messages for listed addresses and a generic nonexistent-recipient rejection for other addresses in an authoritative domain. `all` uses `default_message` for every otherwise-unlisted address in those domains. Other domains are always relay-denied. The endpoint rejects every recipient during SMTP and never accepts `DATA`, queues inbound messages, sends automatic replies or exposes submission users. It has independent connection limits and no STARTTLS requirement. Restart outboxd after changing this startup configuration.
+
 Provision again to create the data directory, spool and create-once DKIM key:
 
 ```bash
@@ -132,14 +148,14 @@ outboxd checks the configured certificate and key during TLS handshakes, rate-li
 
 ## DNS Checklist
 
-`outboxd dns` writes and prints the records to publish. It includes the DKIM record and guidance for SPF, DMARC and TLS-RPT.
+`outboxd dns` writes and prints the records to publish. It includes the DKIM record and guidance for SPF, DMARC and TLS-RPT. When reply rejection is enabled, it also includes MX records for each explicitly configured rejection domain; no MX records are generated for this feature while it is disabled.
 
 - Publish A (and optionally AAAA) for `server.hostname` using `dns.public_ipv4` and `dns.public_ipv6`.
 - Set reverse DNS for each sending IP to `server.hostname` and ensure the hostname resolves back to the same IP.
 - Publish the generated DKIM TXT record.
 - Publish one SPF TXT record for each sending identity domain.
 - Start DMARC with `p=none`, inspect reports, then move to `quarantine` or `reject` when appropriate.
-- Use a separate service with an MX record for bounces, replies and DMARC reports. outboxd does not receive mail.
+- Use a separate service with an MX record wherever bounces or replies must actually be received. The optional outboxd MX endpoint only returns permanent SMTP rejections and does not receive or store mail.
 
 New IPs also need normal reputation work: authenticated users only, sensible sending rates and low complaint rates.
 
@@ -194,5 +210,5 @@ Use `OUTBOXD_CONFIG` instead of `-config` to select a config path.
 - Use `tls.mode: files` with a publicly trusted certificate in production. `self_signed` is development-only and requires an explicit opt-in.
 - Keep the config, DKIM key and data directory readable and writable only by the service account. On Windows, configure the service account and ACLs yourself.
 - Outbound delivery defaults to verified, required TLS. Do not enable plaintext or insecure TLS unless the compatibility tradeoff is deliberate.
-- outboxd does not implement inbound mail, DANE, MTA-STS or DNSSEC validation.
+- outboxd does not accept inbound message data and does not implement inbound mail storage, DANE, MTA-STS or DNSSEC validation.
 - A private local filesystem with reliable rename/sync behavior is required for the queue durability guarantees.

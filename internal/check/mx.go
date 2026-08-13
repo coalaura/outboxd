@@ -19,11 +19,18 @@ func checkEnvelopeMX(ctx context.Context, r Resolver, cfg *config.Config) []Resu
 
 		mxs, err := r.LookupMX(ctx, d)
 		if err == nil && len(mxs) > 0 {
-			var null int
+			var (
+				null             int
+				hasRejectionHost bool
+			)
 
 			for _, mx := range mxs {
 				if mx != nil && strings.TrimSpace(mx.Host) == "." {
 					null++
+				}
+
+				if mx != nil && strings.EqualFold(strings.TrimSuffix(strings.TrimSpace(mx.Host), "."), strings.TrimSuffix(cfg.Server.Hostname, ".")) {
+					hasRejectionHost = true
 				}
 			}
 
@@ -42,10 +49,20 @@ func checkEnvelopeMX(ctx context.Context, r Resolver, cfg *config.Config) []Resu
 				continue
 			}
 
+			if rejectionDomain(cfg, d) && (!hasRejectionHost || len(mxs) != 1) {
+				rs = append(rs, Result{
+					Name:    name,
+					Level:   Fail,
+					Message: fmt.Sprintf("%s MX must route exclusively to rejection host %s", d, cfg.Server.Hostname),
+				})
+
+				continue
+			}
+
 			rs = append(rs, Result{
 				Name:    name,
 				Level:   Pass,
-				Message: fmt.Sprintf("%s has MX", d),
+				Message: mxSuccessMessage(cfg, d),
 			})
 
 			continue
@@ -99,6 +116,12 @@ func envelopeDomains(cfg *config.Config) []string {
 		}
 	}
 
+	if cfg.ReplyRejection.Enabled {
+		for _, domain := range cfg.ReplyRejection.Domains {
+			set[strings.ToLower(strings.TrimSuffix(domain, "."))] = struct{}{}
+		}
+	}
+
 	out := make([]string, 0, len(set))
 
 	for d := range set {
@@ -110,4 +133,26 @@ func envelopeDomains(cfg *config.Config) []string {
 	sort.Strings(out)
 
 	return out
+}
+
+func rejectionDomain(cfg *config.Config, domain string) bool {
+	if !cfg.ReplyRejection.Enabled {
+		return false
+	}
+
+	for _, configured := range cfg.ReplyRejection.Domains {
+		if strings.EqualFold(strings.TrimSuffix(configured, "."), strings.TrimSuffix(domain, ".")) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func mxSuccessMessage(cfg *config.Config, domain string) string {
+	if rejectionDomain(cfg, domain) {
+		return fmt.Sprintf("%s routes attempted replies to rejection host %s", domain, cfg.Server.Hostname)
+	}
+
+	return fmt.Sprintf("%s has MX", domain)
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/coalaura/outboxd/internal/deliver"
 	"github.com/coalaura/outboxd/internal/disk"
 	"github.com/coalaura/outboxd/internal/queue"
+	"github.com/coalaura/outboxd/internal/rejection"
 	"github.com/coalaura/outboxd/internal/sign"
 	"github.com/coalaura/outboxd/internal/smtpd"
 )
@@ -119,11 +120,24 @@ func serve(configPath string) error {
 		return err
 	}
 
+	var replyRejection *rejection.Server
+
+	if cfg.ReplyRejection.Enabled {
+		replyRejection = rejection.New(cfg, log)
+
+		err = replyRejection.Listen()
+		if err != nil {
+			submission.CloseListeners()
+
+			return err
+		}
+	}
+
 	deliverer := deliver.NewWithSigner(cfg, spool, log, signer)
 
 	var (
 		wg   sync.WaitGroup
-		errs [2]error
+		errs [3]error
 	)
 
 	wg.Go(func() {
@@ -137,6 +151,14 @@ func serve(configPath string) error {
 
 		errs[1] = deliverer.Run(ctx)
 	})
+
+	if replyRejection != nil {
+		wg.Go(func() {
+			defer stop()
+
+			errs[2] = replyRejection.Run(ctx)
+		})
+	}
 
 	wg.Go(func() {
 		ticker := time.NewTicker(time.Hour)
@@ -183,7 +205,7 @@ func serve(configPath string) error {
 
 	log.Warnln("Stopped")
 
-	return errors.Join(errs[0], errs[1])
+	return errors.Join(errs[:]...)
 }
 
 func logSpoolStats(spool *queue.Queue) {

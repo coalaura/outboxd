@@ -187,6 +187,10 @@ users:
 		t.Fatalf("TLSMode %q", cfg.Delivery.TLSMode)
 	}
 
+	if cfg.ReplyRejection.Enabled || cfg.ReplyRejection.ListenAddr != ":25" || cfg.ReplyRejection.UnknownRecipients != "listed_only" {
+		t.Fatalf("reply rejection defaults: %+v", cfg.ReplyRejection)
+	}
+
 	// Defaults from Default() survive for MaxQueue*
 	if cfg.Server.MaxQueueMessages != 10000 {
 		t.Fatalf("MaxQueueMessages %d", cfg.Server.MaxQueueMessages)
@@ -198,6 +202,60 @@ users:
 
 	if cfg.Delivery.UserConcurrency != 2 || cfg.Delivery.DNSTimeout != "30s" || cfg.Delivery.AttemptTimeout != "30m" || cfg.Delivery.MaxMXCandidates != 10 || cfg.Delivery.MaxIPCandidatesPerMX != 8 {
 		t.Fatalf("delivery work defaults: %+v", cfg.Delivery)
+	}
+}
+
+func TestReplyRejectionValidation(t *testing.T) {
+	cfg := Default()
+
+	cfg.ReplyRejection.Enabled = true
+	cfg.ReplyRejection.Domains = []string{"Example.COM"}
+	cfg.ReplyRejection.Recipients = []ReplyRejectionRecipient{{Address: "noreply@example.com"}}
+
+	cfg.initializeRuntime()
+
+	err := cfg.Validate()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.ReplyRejection.Domains[0] != "example.com" {
+		t.Fatalf("domain not canonicalized: %q", cfg.ReplyRejection.Domains[0])
+	}
+
+	tests := []struct {
+		name string
+		set  func(*Config)
+	}{
+		{"no domains", func(c *Config) {
+			c.ReplyRejection.Domains = nil
+		}},
+		{"bad mode", func(c *Config) {
+			c.ReplyRejection.UnknownRecipients = "drop"
+		}},
+		{"outside recipient", func(c *Config) {
+			c.ReplyRejection.Recipients[0].Address = "noreply@elsewhere.com"
+		}},
+		{"response injection", func(c *Config) {
+			c.ReplyRejection.DefaultMessage = "No\r\n250 accepted"
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := *cfg
+
+			candidate.ReplyRejection = cfg.ReplyRejection
+			candidate.ReplyRejection.Domains = append([]string(nil), cfg.ReplyRejection.Domains...)
+			candidate.ReplyRejection.Recipients = append([]ReplyRejectionRecipient(nil), cfg.ReplyRejection.Recipients...)
+
+			test.set(&candidate)
+
+			err := candidate.Validate()
+			if err == nil {
+				t.Fatal("invalid reply rejection configuration accepted")
+			}
+		})
 	}
 }
 

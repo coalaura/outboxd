@@ -97,6 +97,19 @@ func (s *Server) Listen() error {
 	return nil
 }
 
+// CloseListeners closes listeners opened by Listen before Run starts.
+func (s *Server) CloseListeners() {
+	if s.starttlsListener != nil {
+		_ = s.starttlsListener.Close()
+		s.starttlsListener = nil
+	}
+
+	if s.implicitListener != nil {
+		_ = s.implicitListener.Close()
+		s.implicitListener = nil
+	}
+}
+
 // Run serves open listeners until ctx is cancelled or a Serve loop fails.
 // Parent cancellation and unexpected Serve exits both trigger graceful shutdown.
 // Run always returns after both accept loops finish; no waiter blocks solely on
