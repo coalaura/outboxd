@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -138,12 +139,12 @@ func OpenWithOptions(directory string, limits Limits, options OpenOptions) (*Que
 		return nil, err
 	}
 
-	err = disk.MkdirDurable(q.root)
+	err = disk.EnsurePrivateRoot(q.root)
 	if err != nil {
 		return nil, err
 	}
 
-	err = disk.ValidatePath(q.root)
+	err = disk.ValidatePrivateDirectory(q.root)
 	if err != nil {
 		return nil, err
 	}
@@ -159,6 +160,13 @@ func OpenWithOptions(directory string, limits Limits, options OpenOptions) (*Que
 
 	q.lock = lock
 
+	err = disk.ValidatePrivateTree(q.root)
+	if err != nil {
+		_ = q.Close()
+
+		return nil, err
+	}
+
 	for _, d := range []string{q.ready, q.dead, q.tmp, q.dsn, q.corr, q.trash} {
 		err = disk.MkdirDurable(d)
 		if err != nil {
@@ -169,6 +177,13 @@ func OpenWithOptions(directory string, limits Limits, options OpenOptions) (*Que
 		err = disk.ValidatePath(d)
 		if err != nil {
 			_ = q.Close()
+			return nil, err
+		}
+
+		err = disk.ValidatePrivateDirectory(d)
+		if err != nil {
+			_ = q.Close()
+
 			return nil, err
 		}
 	}
@@ -237,10 +252,24 @@ func OpenReadOnly(directory string) (*Queue, error) {
 		return nil, err
 	}
 
+	err = disk.ValidatePrivateDirectory(directory)
+	if err != nil {
+		return nil, err
+	}
+
 	dead := filepath.Join(directory, dirDead)
 
 	err = disk.ValidatePath(dead)
 	if err != nil {
+		return nil, err
+	}
+
+	if _, err := os.Stat(dead); err == nil {
+		err = disk.ValidatePrivateDirectory(dead)
+		if err != nil {
+			return nil, err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 

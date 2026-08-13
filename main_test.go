@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -13,6 +14,59 @@ import (
 	"github.com/coalaura/outboxd/internal/queue"
 	"github.com/coalaura/outboxd/internal/sign"
 )
+
+func TestVersionCLI(t *testing.T) {
+	original := Version
+	Version = "v1.2.3"
+
+	t.Cleanup(func() {
+		Version = original
+	})
+
+	for name, input := range map[string]struct {
+		flag bool
+		args []string
+	}{
+		"flag":    {flag: true},
+		"command": {args: []string{"version"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var output bytes.Buffer
+
+			handled, err := handleVersion(input.flag, input.args, &output)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if !handled {
+				t.Fatal("version invocation was not handled")
+			}
+
+			if got := output.String(); got != "v1.2.3\n" {
+				t.Fatalf("version output=%q", got)
+			}
+		})
+	}
+
+	var output bytes.Buffer
+
+	handled, err := handleVersion(false, []string{"user", "list"}, &output)
+	if err != nil || handled || output.Len() != 0 {
+		t.Fatalf("normal command handled=%v err=%v output=%q", handled, err, output.String())
+	}
+}
+
+func TestParseGlobalVersionFlagPreservesCommands(t *testing.T) {
+	configPath, showVersion, args := parseGlobalFlags([]string{"--config", "custom.yml", "user", "list"})
+	if configPath != "custom.yml" || showVersion || strings.Join(args, " ") != "user list" {
+		t.Fatalf("normal flags parsed as config=%q version=%v args=%q", configPath, showVersion, args)
+	}
+
+	configPath, showVersion, args = parseGlobalFlags([]string{"--config", "custom.yml", "--version"})
+	if configPath != "custom.yml" || !showVersion || len(args) != 0 {
+		t.Fatalf("version flags parsed as config=%q version=%v args=%q", configPath, showVersion, args)
+	}
+}
 
 func TestServeDataDirectoryResolvedAgainstConfig(t *testing.T) {
 	// Relative data_directory must resolve next to the config file, not CWD.

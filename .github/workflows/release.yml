@@ -1,0 +1,210 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  project_name: outboxd
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Validate stable SemVer tag and commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Tag must be a stable SemVer tag such as v1.2.3" >&2
+            exit 1
+          fi
+          if [[ "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" != "tag" ]]; then
+            echo "Release tags must be annotated tags" >&2
+            exit 1
+          fi
+
+          tagged_commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          event_commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          if [[ "$tagged_commit" != "$event_commit" || "$(git rev-parse HEAD)" != "$tagged_commit" ]]; then
+            echo "Checked-out commit does not match $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Check tidy modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Race tests
+        run: go test -race ./...
+
+  test:
+    name: Test (${{ matrix.os }})
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+  build:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: [validate, test]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build and package
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          archive_base="${{ env.project_name }}_${version}_${GOOS}_${GOARCH}"
+          package_dir="staging/${archive_base}"
+          binary="${{ env.project_name }}"
+          if [[ "$GOOS" == "windows" ]]; then
+            binary="${binary}.exe"
+          fi
+
+          mkdir -p "$package_dir" dist
+          go build \
+            -trimpath \
+            -buildvcs=false \
+            -ldflags "-s -w -X main.Version=${GITHUB_REF_NAME}" \
+            -o "${package_dir}/${binary}" .
+          cp LICENSE README.md "$package_dir/"
+
+          if [[ "$GOOS" == "linux" ]]; then
+            cp -R conf "$package_dir/"
+            chmod 0755 "${package_dir}/${binary}" "${package_dir}"/conf/*.sh
+          fi
+
+          if [[ "$GOOS" == "linux" && "$GOARCH" == "amd64" ]]; then
+            test "$("${package_dir}/${binary}" --version)" = "$GITHUB_REF_NAME"
+            test "$("${package_dir}/${binary}" version)" = "$GITHUB_REF_NAME"
+          fi
+
+          if [[ "$GOOS" == "windows" ]]; then
+            (cd staging && zip -qr "../dist/${archive_base}.zip" "$archive_base")
+          else
+            tar -C staging -czf "dist/${archive_base}.tar.gz" "$archive_base"
+          fi
+
+      - name: Upload archive
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ env.project_name }}_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  release:
+    name: Release
+    needs: [validate, test, build]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: ${{ env.project_name }}_*
+          path: release
+          merge-multiple: true
+
+      - name: Generate and verify checksums
+        shell: bash
+        working-directory: release
+        run: |
+          set -euo pipefail
+          test "$(find . -maxdepth 1 -type f \( -name 'outboxd_*.tar.gz' -o -name 'outboxd_*.zip' \) | wc -l)" -eq 6
+          sha256sum outboxd_*.tar.gz outboxd_*.zip > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "outboxd $GITHUB_REF_NAME" \
+            --generate-notes \
+            release/*

@@ -2,29 +2,29 @@
 
 set -euo pipefail
 
-echo "Stopping service..."
-systemctl stop "outboxd" 2>/dev/null || true
+if [ "${EUID}" -ne 0 ]; then
+    echo "uninstall.sh must be run as root" >&2
+    exit 1
+fi
 
-echo "Disabling service..."
-systemctl disable "outboxd" 2>/dev/null || true
+echo "Stopping and disabling service..."
 
-echo "Removing unit file..."
-rm -f "/etc/systemd/system/outboxd.service"
+if ! systemctl disable --now outboxd 2>/dev/null; then
+    echo "Service was not running or enabled."
+fi
 
-echo "Removing sysusers config..."
-rm -f "/etc/sysusers.d/outboxd.conf"
+echo "Removing installed service files..."
+rm -f /etc/systemd/system/outboxd.service
+rm -f /usr/lib/sysusers.d/outboxd.conf
+# Remove the path used by older installations, including a stale symlink.
+rm -f /etc/sysusers.d/outboxd.conf
 
 echo "Reloading daemon..."
 systemctl daemon-reload
-systemctl reset-failed "outboxd" 2>/dev/null || true
 
-echo "Removing user and group..."
-if id "outboxd" &>/dev/null; then
-    userdel "outboxd" 2>/dev/null || true
+if ! systemctl reset-failed outboxd 2>/dev/null; then
+    echo "Service had no failed state to reset."
 fi
 
-if getent group "outboxd" &>/dev/null; then
-    groupdel "outboxd" 2>/dev/null || true
-fi
-
-echo "Uninstall complete. Private state at /var/lib/outboxd was preserved."
+echo "Uninstall complete. /opt/outboxd and /var/lib/outboxd were preserved."
+echo "The outboxd account was retained so preserved private state keeps a valid owner."

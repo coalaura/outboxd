@@ -3,9 +3,11 @@
 package disk
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
+	"github.com/coalaura/outboxd/internal/windowsacl"
 	"golang.org/x/sys/windows"
 )
 
@@ -16,9 +18,34 @@ type winFileLock struct {
 // Lock acquires an exclusive, non-blocking byte-range lock on path, creating
 // the file if needed. The returned FileLock must stay open for the lock's life.
 func Lock(path string) (*FileLock, error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0600)
-	if err != nil {
-		return nil, err
+	var f *os.File
+	var err error
+
+	for {
+		f, err = os.OpenFile(path, os.O_RDWR, 0)
+		if err == nil {
+			err = windowsacl.ValidateHandle(windows.Handle(f.Fd()), path, true, false)
+			if err != nil {
+				_ = f.Close()
+
+				return nil, err
+			}
+
+			break
+		}
+
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+
+		f, err = createPrivateFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
+		if err == nil {
+			break
+		}
+
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
 	}
 
 	var ol windows.Overlapped

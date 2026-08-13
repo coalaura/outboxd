@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"unsafe"
 
+	"github.com/coalaura/outboxd/internal/windowsacl"
 	"golang.org/x/sys/windows"
 )
 
@@ -17,10 +18,8 @@ type windowsFileAttributeTag struct {
 	reparseTag uint32
 }
 
-// CheckFile verifies file type on Windows. ACL validation is intentionally not
-// claimed here; production operators must restrict DACLs on private files.
 func CheckFile(path string, private bool) error {
-	file, err := openChecked(path, false)
+	file, err := openChecked(path, private, false)
 	if err != nil {
 		return err
 	}
@@ -28,10 +27,8 @@ func CheckFile(path string, private bool) error {
 	return file.Close()
 }
 
-// ReadCheckedFile validates the opened final handle before reading it. Windows
-// mode bits do not represent DACLs; deployments must restrict private-file ACLs.
 func ReadCheckedFile(path string, private, allowSymlink bool, maximum int64) ([]byte, error) {
-	file, err := openChecked(path, allowSymlink)
+	file, err := openChecked(path, private, allowSymlink)
 	if err != nil {
 		return nil, err
 	}
@@ -50,14 +47,14 @@ func ReadCheckedFile(path string, private, allowSymlink bool, maximum int64) ([]
 	return body, nil
 }
 
-func openChecked(path string, allowSymlink bool) (*os.File, error) {
+func openChecked(path string, private, allowSymlink bool) (*os.File, error) {
 	if allowSymlink {
 		file, err := os.Open(path)
 		if err != nil {
 			return nil, err
 		}
 
-		return validateOpenedFile(path, file)
+		return validateOpenedFile(path, file, private, false)
 	}
 
 	name, err := windows.UTF16PtrFromString(path)
@@ -93,10 +90,10 @@ func openChecked(path string, allowSymlink bool) (*os.File, error) {
 		return nil, fmt.Errorf("%q must not be a symlink or reparse point", path)
 	}
 
-	return validateOpenedFile(path, os.NewFile(uintptr(handle), path))
+	return validateOpenedFile(path, os.NewFile(uintptr(handle), path), private, !allowSymlink)
 }
 
-func validateOpenedFile(path string, file *os.File) (*os.File, error) {
+func validateOpenedFile(path string, file *os.File, private, managed bool) (*os.File, error) {
 	info, err := file.Stat()
 	if err != nil {
 		file.Close()
@@ -110,11 +107,25 @@ func validateOpenedFile(path string, file *os.File) (*os.File, error) {
 		return nil, fmt.Errorf("%q must open as a regular file", path)
 	}
 
+	if private {
+		err = windowsacl.ValidateHandle(windows.Handle(file.Fd()), path, managed, false)
+		if err != nil {
+			file.Close()
+
+			return nil, err
+		}
+	}
+
 	return file, nil
 }
 
 func (cfg Config) CheckGeneratedParents(path string) error {
 	data, _ := filepath.Abs(filepath.Clean(cfg.ResolvedDataDir()))
+
+	err := validateManagedRoot(data)
+	if err != nil {
+		return err
+	}
 
 	for current := filepath.Dir(path); ; current = filepath.Dir(current) {
 		info, err := os.Lstat(current)
@@ -135,4 +146,29 @@ func (cfg Config) CheckGeneratedParents(path string) error {
 			return fmt.Errorf("generated path escapes data directory")
 		}
 	}
+}
+
+func validateManagedRoot(path string) error {
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+
+	handle, err := windows.CreateFile(
+		name,
+		windows.READ_CONTROL,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		0,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	defer windows.CloseHandle(handle)
+
+	return windowsacl.ValidateHandle(handle, path, true, false)
 }

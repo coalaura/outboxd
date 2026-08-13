@@ -41,6 +41,14 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 		return errors.New("cannot generate a DSN for a DSN")
 	}
 
+	if source.Pending() != 0 {
+		return errors.New("cannot generate a DSN while recipients are pending")
+	}
+
+	if source.Failed() == 0 {
+		return errors.New("cannot generate a DSN without failed recipients")
+	}
+
 	if dsn.Incarnation == "" {
 		incarnation, err := newIncarnation()
 		if err != nil {
@@ -102,6 +110,10 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 
 	if durableSource.Incarnation != source.Incarnation {
 		return fmt.Errorf("%w: source incarnation changed", ErrIDConflict)
+	}
+
+	if durableSource.Size != source.Size || durableSource.BodyDigest != source.BodyDigest {
+		return fmt.Errorf("%w: source body identity changed", ErrIDConflict)
 	}
 
 	if durableSource.DSNID != "" {
@@ -166,16 +178,16 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 		return err
 	}
 
-	linked := *durableSource
+	linked := cloneEnvelope(source)
 
 	linked.DSNID = dsn.ID
 
-	err = validateEnvelope(&linked)
+	err = validateEnvelope(linked)
 	if err != nil {
 		return err
 	}
 
-	linkedMeta, err := marshalEnvelope(&linked)
+	linkedMeta, err := marshalEnvelope(linked)
 	if err != nil {
 		return err
 	}
@@ -262,7 +274,7 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 		}
 	}()
 
-	err = os.Mkdir(stageDir, 0700)
+	err = disk.MkdirDurable(stageDir)
 	if err != nil {
 		return err
 	}
@@ -279,11 +291,6 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 			}
 		}
 	}()
-
-	err = disk.Sync(q.dsn)
-	if err != nil {
-		return err
-	}
 
 	err = disk.Write(filepath.Join(stageDir, addStateName), []byte(addPending), 0600)
 	if err != nil {
@@ -314,7 +321,7 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 	// persistent allocation into committed usage before linking the source.
 	commitPhysical(persistentPhysical)
 
-	retainedSourceTemp, storeErr := q.storeReady(&linked)
+	retainedSourceTemp, storeErr := q.storeReady(linked)
 	if retainedSourceTemp {
 		commitPhysical(sourceTempPhysical)
 	}
@@ -335,7 +342,7 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 
 	cleanup = false
 
-	staged, moved, err := q.publishStagedDSN(&linked, dsn)
+	staged, moved, err := q.publishStagedDSN(linked, dsn)
 	if err != nil && !moved {
 		commitPhysical(stagingPhysical)
 

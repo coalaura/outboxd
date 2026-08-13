@@ -1,7 +1,7 @@
 [Unit]
 Description=outboxd outbound mail server
 After=network-online.target
-Requires=network-online.target
+Wants=network-online.target
 StartLimitBurst=10
 StartLimitIntervalSec=60
 

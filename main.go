@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -21,8 +22,21 @@ import (
 
 var log = plain.New(plain.WithDate(plain.RFC3339Local))
 
+var Version = "dev"
+
 func main() {
-	configPath, args := parseGlobalFlags(os.Args[1:])
+	configPath, showVersion, args := parseGlobalFlags(os.Args[1:])
+
+	handled, err := handleVersion(showVersion, args, os.Stdout)
+	if err != nil {
+		log.MustExit(err)
+
+		return
+	}
+
+	if handled {
+		return
+	}
 
 	if len(args) == 0 {
 		log.MustExit(serve(configPath))
@@ -69,16 +83,41 @@ func main() {
 
 		log.MustExit(serve(configPath))
 	default:
-		log.MustExit(fmt.Errorf("unknown command %q, expected user, provision, dns, check, dead, corrupt, or serve (default)", args[0]))
+		log.MustExit(fmt.Errorf("unknown command %q, expected version, user, provision, dns, check, dead, corrupt, or serve (default)", args[0]))
 	}
 }
 
+func printVersion(w io.Writer) {
+	fmt.Fprintln(w, Version)
+}
+
+func handleVersion(showVersion bool, args []string, w io.Writer) (bool, error) {
+	if showVersion {
+		printVersion(w)
+
+		return true, nil
+	}
+
+	if len(args) == 0 || args[0] != "version" {
+		return false, nil
+	}
+
+	if len(args) != 1 {
+		return true, errors.New("usage: outboxd version")
+	}
+
+	printVersion(w)
+
+	return true, nil
+}
+
 // parseGlobalFlags extracts -config / --config before the subcommand.
-func parseGlobalFlags(args []string) (configPath string, rest []string) {
+func parseGlobalFlags(args []string) (configPath string, showVersion bool, rest []string) {
 	fs := flag.NewFlagSet("outboxd", flag.ContinueOnError)
 
 	fs.SetOutput(os.Stderr)
 	fs.StringVar(&configPath, "config", "", "path to config.yml (or set OUTBOXD_CONFIG)")
+	fs.BoolVar(&showVersion, "version", false, "print version and exit")
 
 	// Stop at first non-flag so subcommands keep their own args.
 	err := fs.Parse(args)
@@ -87,7 +126,7 @@ func parseGlobalFlags(args []string) (configPath string, rest []string) {
 		os.Exit(2)
 	}
 
-	return configPath, fs.Args()
+	return configPath, showVersion, fs.Args()
 }
 
 func ensureConfig(configPath string) (*config.Config, bool, error) {
@@ -182,7 +221,7 @@ func provision(configPath string) error {
 		return fmt.Errorf("validate data namespace %s: %w", cfg.ResolvedDataDir(), err)
 	}
 
-	err = disk.Mkdir(cfg.ResolvedDataDir())
+	err = disk.EnsurePrivateRoot(cfg.ResolvedDataDir())
 	if err != nil {
 		return err
 	}

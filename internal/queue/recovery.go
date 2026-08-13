@@ -9,6 +9,8 @@ import (
 	"github.com/coalaura/outboxd/internal/disk"
 )
 
+var errDSNSourceScanIncomplete = errors.New("DSN source scan incomplete")
+
 func (q *Queue) recoverTmp() error {
 	entries, err := os.ReadDir(q.tmp)
 	if err != nil {
@@ -156,6 +158,12 @@ func (q *Queue) recoverDSN() error {
 			}
 
 			qerr := q.quarantineDSNStage(path, id, "invalid", err)
+			if errors.Is(qerr, errDSNSourceScanIncomplete) {
+				q.recordTransientBlocked(id, path, qerr)
+
+				continue
+			}
+
 			if qerr != nil {
 				q.recordQuarantineFailure(id, path, err, qerr)
 			}
@@ -270,7 +278,15 @@ func (q *Queue) blockLinkedSource(dsnID string, cause error) {
 		sourceDir := filepath.Join(q.ready, entry.Name())
 
 		source, err := q.loadAcceptedDir(sourceDir, entry.Name())
-		if err != nil || source.DSNID != dsnID {
+		if err != nil {
+			if !IsCorruption(err) {
+				q.recordTransientBlocked(entry.Name(), sourceDir, fmt.Errorf("inspect possible source for staged DSN %s: %w", dsnID, err))
+			}
+
+			continue
+		}
+
+		if source.DSNID != dsnID {
 			continue
 		}
 
@@ -288,6 +304,8 @@ func (q *Queue) quarantineDSNStage(stage, id, suffix string, cause error) error 
 		return err
 	}
 
+	var linked []*Envelope
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -297,11 +315,31 @@ func (q *Queue) quarantineDSNStage(stage, id, suffix string, cause error) error 
 
 		source, err := q.loadAcceptedDir(sourceDir, entry.Name())
 		if err != nil {
+			if !IsCorruption(err) {
+				for _, candidate := range entries {
+					if !candidate.IsDir() {
+						continue
+					}
+
+					candidateDir := filepath.Join(q.ready, candidate.Name())
+					q.recordTransientBlocked(candidate.Name(), candidateDir, fmt.Errorf("source scan for corrupt staged DSN %s is incomplete: %w", id, err))
+				}
+
+				return fmt.Errorf("%w: source %s: %v", errDSNSourceScanIncomplete, entry.Name(), err)
+			}
+
 			continue
 		}
+
 		if source.DSNID != id {
 			continue
 		}
+
+		linked = append(linked, source)
+	}
+
+	for _, source := range linked {
+		sourceDir := filepath.Join(q.ready, source.ID)
 
 		err = q.quarantineDir(sourceDir, source.ID+"-dsn-source")
 		if err != nil {

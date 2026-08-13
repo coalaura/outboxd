@@ -88,6 +88,12 @@ func testEnv(id string) *Envelope {
 }
 
 func testDSN(source *Envelope) *Envelope {
+	for i := range source.Recipients {
+		if source.Recipients[i].Status == StatusPending {
+			source.Recipients[i].Status = StatusFailed
+		}
+	}
+
 	env := testEnv(DSNID(source.ID, source.Incarnation, source.DSNGeneration))
 
 	env.Sender = ""
@@ -2424,6 +2430,127 @@ func TestAddDSNLinksSourceBeforePublicationAndRecovers(t *testing.T) {
 	}
 }
 
+func TestAddDSNPersistsTerminalSourceSnapshot(t *testing.T) {
+	clearHooks(t)
+
+	root := t.TempDir()
+
+	q := mustOpen(t, root, Limits{})
+
+	source := testEnv("dsn-terminal-snapshot")
+
+	source.Recipients = append(source.Recipients, Recipient{Address: "carol@example.com", Domain: "example.com", Status: StatusPending})
+
+	err := q.Add(source, []byte("source"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	source.Recipients[0] = Recipient{Address: "bob@example.com", Domain: "example.com", Status: StatusSent, Detail: "delivered", Code: 250, EnhancedCode: "2.0.0"}
+	source.Recipients[1] = Recipient{Address: "carol@example.com", Domain: "example.com", Status: StatusFailed, Detail: "mailbox unavailable", Code: 550, EnhancedCode: "5.1.1"}
+	source.LastError = "carol@example.com: mailbox unavailable"
+	source.Attempts = 3
+
+	err = q.AddDSN(source, testDSN(source), []byte("dsn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stored, err := q.loadAcceptedDir(filepath.Join(root, dirReady, source.ID), source.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if stored.Pending() != 0 || stored.Attempts != source.Attempts || stored.LastError != source.LastError || !slices.Equal(stored.Recipients, source.Recipients) {
+		t.Fatalf("stored source did not preserve terminal snapshot: %#v", stored)
+	}
+}
+
+func TestAddDSNRejectsPendingSource(t *testing.T) {
+	clearHooks(t)
+
+	q := mustOpen(t, t.TempDir(), Limits{})
+
+	source := testEnv("dsn-pending-source")
+
+	err := q.Add(source, []byte("source"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dsn := testDSN(cloneEnvelope(source))
+
+	err = q.AddDSN(source, dsn, []byte("dsn"))
+	if err == nil || !strings.Contains(err.Error(), "recipients are pending") {
+		t.Fatalf("AddDSN error=%v want pending-recipient rejection", err)
+	}
+}
+
+func TestAddDSNRejectsSourceWithoutFailedRecipients(t *testing.T) {
+	clearHooks(t)
+
+	q := mustOpen(t, t.TempDir(), Limits{})
+	t.Cleanup(func() { _ = q.Close() })
+
+	source := testEnv("dsn-without-failures")
+	if err := q.Add(source, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+
+	source.Recipients[0].Status = StatusSent
+	dsn := testDSN(source)
+
+	if err := q.AddDSN(source, dsn, []byte("dsn")); err == nil || !strings.Contains(err.Error(), "without failed recipients") {
+		t.Fatalf("AddDSN error=%v", err)
+	}
+}
+
+func TestAddDSNStageMkdirDurabilityFailureCleansUp(t *testing.T) {
+	clearHooks(t)
+
+	root := t.TempDir()
+
+	q := mustOpen(t, root, Limits{})
+
+	source := testEnv("dsn-stage-mkdir-sync")
+
+	err := q.Add(source, []byte("source"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dsn := testDSN(source)
+	before := q.SpoolStats()
+	wantErr := errors.New("sync DSN stage parent")
+
+	disk.SetHooks(disk.Hooks{BeforeSyncDir: func(path string) error {
+		if filepath.Clean(path) == filepath.Join(root, dirDSN) {
+			return wantErr
+		}
+
+		return nil
+	}})
+
+	err = q.AddDSN(source, dsn, []byte("dsn"))
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("AddDSN error=%v want %v", err, wantErr)
+	}
+
+	if _, err := os.Stat(filepath.Join(root, dirDSN, dsn.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed durable mkdir retained stage: %v", err)
+	}
+
+	after := q.SpoolStats()
+	if after != before {
+		t.Fatalf("SpoolStats=%+v want %+v", after, before)
+	}
+}
+
 func TestOpenQuarantinesUnlinkedDSNStage(t *testing.T) {
 	clearHooks(t)
 
@@ -3478,6 +3605,8 @@ func TestSMTPUTF8EnvelopeInvariant(t *testing.T) {
 	// Null sender DSN with ASCII recipient, no SMTPUTF8.
 	source6 := testEnv("source-u6")
 
+	source6.Recipients[0].Status = StatusFailed
+
 	err = q.Add(source6, body)
 	if err != nil {
 		t.Fatal(err)
@@ -3498,6 +3627,8 @@ func TestSMTPUTF8EnvelopeInvariant(t *testing.T) {
 	// Null sender DSN with UTF-8 recipient requires SMTPUTF8.
 	source7 := testEnv("source-u7")
 
+	source7.Recipients[0].Status = StatusFailed
+
 	err = q.Add(source7, body)
 	if err != nil {
 		t.Fatal(err)
@@ -3516,6 +3647,8 @@ func TestSMTPUTF8EnvelopeInvariant(t *testing.T) {
 	}
 
 	source8 := testEnv("source-u8")
+
+	source8.Recipients[0].Status = StatusFailed
 
 	err = q.Add(source8, body)
 	if err != nil {
@@ -6883,6 +7016,93 @@ func TestRecoverDSNPreservesLinkedPairOnTransientSourceRead(t *testing.T) {
 	}
 }
 
+func TestRecoverCorruptDSNBlocksCandidatesAfterOneShotReadFault(t *testing.T) {
+	clearHooks(t)
+
+	root := t.TempDir()
+
+	q := mustOpen(t, root, Limits{})
+
+	source := testEnv("corrupt-dsn-uncertain-source")
+	unrelated := testEnv("corrupt-dsn-unrelated")
+
+	for _, env := range []*Envelope{source, unrelated} {
+		err := q.Add(env, []byte("body"))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err := q.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stageID := DSNID(source.ID, source.Incarnation, source.DSNGeneration)
+	stagePath := filepath.Join(root, dirDSN, stageID)
+
+	err = os.Mkdir(stagePath, 0700)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeAcceptedMarker(t, stagePath)
+
+	err = os.WriteFile(filepath.Join(stagePath, metaName), []byte("{"), 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = os.WriteFile(filepath.Join(stagePath, bodyName), []byte("dsn"), 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	unrelatedMeta := filepath.Join(root, dirReady, unrelated.ID, metaName)
+
+	var faulted atomic.Bool
+
+	disk.SetHooks(disk.Hooks{BeforeRead: func(path string) error {
+		if filepath.Clean(path) == unrelatedMeta && faulted.CompareAndSwap(false, true) {
+			return syscall.EIO
+		}
+
+		return nil
+	}})
+
+	reopened, err := Open(root, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		_ = reopened.Close()
+	})
+
+	if !faulted.Load() {
+		t.Fatal("source read fault was not exercised")
+	}
+
+	if reopened.Len() != 0 {
+		t.Fatalf("Len=%d want no entries after incomplete source scan; warnings=%v corrupt=%v", reopened.Len(), reopened.Warnings, reopened.Corrupt)
+	}
+
+	if _, err := os.Stat(stagePath); err != nil {
+		t.Fatalf("uncertain corrupt stage was relocated: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(root, dirReady, source.ID)); err != nil {
+		t.Fatalf("uncertain source was relocated: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, dirReady, unrelated.ID)); err != nil {
+		t.Fatalf("unrelated candidate was relocated: %v", err)
+	}
+
+	if len(reopened.Corrupt) != 0 || len(reopened.Warnings) == 0 {
+		t.Fatalf("one-shot source fault misclassified: warnings=%v corrupt=%v", reopened.Warnings, reopened.Corrupt)
+	}
+}
+
 func TestMetadataReplacementPhysicalAccountingAcrossAllocationBoundary(t *testing.T) {
 	largeDetail := strings.Repeat("x", maxEnvelopeDetailBytes)
 
@@ -7090,6 +7310,8 @@ func TestMetadataReplacementPhysicalAccountingAcrossAllocationBoundary(t *testin
 		baseline := q.SpoolStats().Used
 
 		source := testEnv("account-dsn-link-boundary")
+
+		source.Recipients[0].Status = StatusFailed
 
 		source.Size = 4
 		source.BodyDigest = bodyDigest([]byte("body"))

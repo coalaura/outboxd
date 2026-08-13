@@ -11,20 +11,70 @@ The project was started after I spent way too long configuring Postfix, Dovecot 
 - A server with a stable public IP and outbound TCP port 25 available.
 - A hostname such as `mail.example.com` with matching forward and reverse DNS.
 - A sending domain such as `example.com`.
-- A publicly trusted TLS certificate for the submission hostname. Let's Encrypt paths are supported in `tls.mode: files`.
+- A publicly trusted TLS certificate for the submission hostname. Certificate files are configured with `tls.mode: files`.
 - A private local filesystem for `data_directory`. Put it on a quota-controlled volume if disk exhaustion matters.
 
 outboxd listens for authenticated submission on port 587 (STARTTLS) and port 465 (implicit TLS) by default. It sends mail outbound on TCP port 25. It does not listen for internet mail on port 25.
 
-## Quick Start
+## Install
 
-Choose a config path, then create the initial configuration:
+The Linux service expects a canonical payload at `/opt/outboxd` containing the `outboxd` binary and the repository's `conf` directory. Private configuration and data are kept separately in `/var/lib/outboxd`; replacing the payload does not replace state.
+
+### Release archive
+
+Download the archive and its checksum from the release page. Substitute the release version and platform shown there:
 
 ```bash
-outboxd -config /etc/outboxd/config.yml provision
+tag=v1.2.3
+version=${tag#v}
+archive="outboxd_${version}_linux_amd64.tar.gz"
+base_url="https://github.com/coalaura/outboxd/releases/download/${tag}"
+
+curl -fLO "$base_url/$archive"
+curl -fLO "$base_url/SHA256SUMS"
+sha256sum --ignore-missing --check SHA256SUMS
+
+sudo install -d -o root -g root -m 0755 /opt/outboxd
+sudo tar -xzf "$archive" -C /opt/outboxd --strip-components=1
+sudo /opt/outboxd/conf/setup.sh
 ```
 
-The first run creates a commented config file and stops. Edit the essentials:
+Inspect the release page rather than guessing a checksum. The archive's top-level directory is stripped so that the binary is always `/opt/outboxd/outboxd`.
+
+### Build from source
+
+Go 1.26.5 or newer is required. Build the binary, assemble the same payload, and run the same setup script:
+
+```bash
+git clone https://github.com/coalaura/outboxd.git
+cd outboxd
+go test ./...
+go build -trimpath -buildvcs=false -o outboxd .
+
+sudo install -d -o root -g root -m 0755 /opt/outboxd/conf
+sudo install -o root -g root -m 0755 outboxd /opt/outboxd/outboxd
+sudo install -o root -g root -m 0644 conf/outboxd.conf conf/outboxd.service /opt/outboxd/conf/
+sudo install -o root -g root -m 0755 conf/setup.sh conf/uninstall.sh /opt/outboxd/conf/
+sudo /opt/outboxd/conf/setup.sh
+```
+
+`setup.sh` must run as root. It creates or reuses the `outboxd` system account, prepares `/var/lib/outboxd` with mode `0700`, installs copies of the sysusers and systemd files, reloads systemd, and enables the service. It is safe to rerun after replacing `/opt/outboxd`; it does not recursively change payload or state ownership.
+
+## Quick Start
+
+Run administrative commands as the service account so generated configuration, keys, and queue state keep the correct ownership. Create the initial configuration:
+
+```bash
+sudo -u outboxd /opt/outboxd/outboxd -config /var/lib/outboxd/config.yml provision
+```
+
+The first run creates a commented config file and stops. Edit the essentials with an editor that runs as `outboxd`:
+
+```bash
+sudo -u outboxd vi /var/lib/outboxd/config.yml
+```
+
+Configure certificate paths that match your deployment. Files under the private state directory are compatible with the supplied systemd sandbox:
 
 ```yaml
 server:
@@ -34,8 +84,8 @@ server:
 
 tls:
   mode: files
-  certificate_file: /etc/letsencrypt/live/mail.example.com/fullchain.pem
-  private_key_file: /etc/letsencrypt/live/mail.example.com/privkey.pem
+  certificate_file: /var/lib/outboxd/tls/fullchain.pem
+  private_key_file: /var/lib/outboxd/tls/privkey.pem
 
 dns:
   public_ipv4: 203.0.113.10
@@ -46,30 +96,37 @@ Set the remaining options in the generated comments as needed. In particular, ke
 Provision again to create the data directory, spool and create-once DKIM key:
 
 ```bash
-outboxd -config /etc/outboxd/config.yml provision
+sudo -u outboxd /opt/outboxd/outboxd -config /var/lib/outboxd/config.yml provision
 ```
 
 Add an SMTP user. If stdin is a terminal, outboxd generates a password and prints it once. To supply one yourself, pipe a single-line password of at least 12 bytes.
 
 ```bash
-outboxd -config /etc/outboxd/config.yml user add alice alice@example.com
-printf '%s\n' 'a-long-password' | outboxd -config /etc/outboxd/config.yml user add alice alice@example.com
+sudo -u outboxd /opt/outboxd/outboxd -config /var/lib/outboxd/config.yml user add alice alice@example.com
+printf '%s\n' 'a-long-password' | sudo -u outboxd /opt/outboxd/outboxd -config /var/lib/outboxd/config.yml user add alice alice@example.com
 ```
 
 Generate the DNS instructions while the daemon is stopped:
 
 ```bash
-outboxd -config /etc/outboxd/config.yml dns
+sudo -u outboxd /opt/outboxd/outboxd -config /var/lib/outboxd/config.yml dns
 ```
 
 Copy the generated records into DNS, then verify the deployment and start the service:
 
 ```bash
-outboxd -config /etc/outboxd/config.yml check
-outboxd -config /etc/outboxd/config.yml serve
+sudo -u outboxd /opt/outboxd/outboxd -config /var/lib/outboxd/config.yml check
+sudo systemctl start outboxd
+sudo systemctl status outboxd
 ```
 
 `dns`, `check` and `serve` load an existing DKIM key; they never create or replace one. Run `provision` if the key is missing. Stop the daemon before running `dns`, changing the DKIM key or generated DNS path or changing the config/data-directory path.
+
+## TLS Certificates
+
+Certificate deployment is intentionally left to the operator so outboxd can be used with any certificate authority or existing automation. The `outboxd` service account must be able to read both configured files. On Unix, the private key must have no group or other permission bits; use mode `0600` and ownership that permits the service account to read it. Do not weaken the key permissions to make an external certificate directory accessible. Copying or deploying certificate material into a private location such as `/var/lib/outboxd/tls` is one compatible approach, but outboxd does not prescribe or install that automation.
+
+outboxd checks the configured certificate and key during TLS handshakes, rate-limited to avoid filesystem reads on every connection. A valid changed pair is loaded automatically; no signal, systemd reload, or restart is needed. If a transient read or validation failure occurs while files are replaced, outboxd continues serving the previously loaded certificate while it remains valid and retries on a later handshake. Once the old certificate expires, an invalid replacement cannot be used and affected TLS handshakes fail.
 
 ## DNS Checklist
 
@@ -88,9 +145,11 @@ New IPs also need normal reputation work: authenticated users only, sensible sen
 
 The generated `config.yml` documents every setting. Relative paths resolve next to the config file; generated DKIM material, self-signed development TLS material, DNS instructions and queue state live under `server.data_directory`.
 
-Operator-managed TLS files may be outside `data_directory`, which is useful for Let's Encrypt. The config ownership lock and short-lived atomic-write files live beside the config file.
+Operator-managed TLS files may be outside `data_directory`, subject to service sandbox access and private-key permission requirements. The config ownership lock and short-lived atomic-write files live beside the config file.
 
 Configuration, users, DKIM keys, queue limits and delivery policy are loaded at startup. Restart outboxd after changing them. TLS certificate and key contents are the only runtime-reloaded files.
+
+To remove the installed systemd and sysusers files, run `sudo /opt/outboxd/conf/uninstall.sh`. It deliberately preserves `/opt/outboxd`, `/var/lib/outboxd`, and the `outboxd` account so private state retains its owner. Remove preserved state and then the account manually only when permanently decommissioning the service.
 
 Useful limits include:
 

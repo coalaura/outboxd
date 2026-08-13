@@ -285,7 +285,20 @@ func Temp(path string) (*os.File, error) {
 		return nil, err
 	}
 
-	return os.CreateTemp(directory, "."+filepath.Base(path)+".tmp-*")
+	file, err := createPrivateTemp(directory, "."+filepath.Base(path)+".tmp-")
+	if err != nil {
+		return nil, err
+	}
+
+	err = protectPrivateFile(file.Name())
+	if err != nil {
+		file.Close()
+		os.Remove(file.Name())
+
+		return nil, err
+	}
+
+	return file, nil
 }
 
 // Commit flushes, closes and atomically moves file into place.
@@ -347,8 +360,16 @@ func WriteExclusive(path string, body []byte, mode os.FileMode) error {
 		return err
 	}
 
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	file, err := createPrivateFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
+		return err
+	}
+
+	err = protectPrivateFile(path)
+	if err != nil {
+		file.Close()
+		os.Remove(path)
+
 		return err
 	}
 

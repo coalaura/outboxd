@@ -536,6 +536,129 @@ func TestCompletedDSNDoesNotRegenerateBeforeSourceTransition(t *testing.T) {
 	}
 }
 
+func TestTerminalSourceRecoveryAfterDSNPublication(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		recipients []queue.Recipient
+		wantDead   bool
+	}{
+		{
+			name: "partial_success_finishes",
+			recipients: []queue.Recipient{
+				{Address: "sent@ex.com", Domain: "ex.com", Status: queue.StatusSent, Detail: "delivered", Code: 250, EnhancedCode: "2.0.0"},
+				{Address: "failed@ex.com", Domain: "ex.com", Status: queue.StatusFailed, Detail: "gone", Code: 550, EnhancedCode: "5.1.1"},
+			},
+		},
+		{
+			name: "all_failed_buries",
+			recipients: []queue.Recipient{
+				{Address: "first@ex.com", Domain: "ex.com", Status: queue.StatusFailed, Detail: "gone", Code: 550, EnhancedCode: "5.1.1"},
+				{Address: "second@ex.com", Domain: "ex.com", Status: queue.StatusFailed, Detail: "blocked", Code: 550, EnhancedCode: "5.7.1"},
+			},
+			wantDead: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+
+			q, err := queue.Open(root, queue.Limits{})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			now := time.Now().Add(-time.Hour)
+
+			source := &queue.Envelope{
+				ID:          "dsn-recovery-" + strings.ReplaceAll(tc.name, "_", "-"),
+				Username:    "user",
+				Sender:      "alice@ex.com",
+				Recipients:  tc.recipients,
+				Created:     now,
+				NextAttempt: now,
+				Attempts:    2,
+				LastError:   "terminal delivery result",
+			}
+
+			err = q.Add(source, []byte("From: alice@ex.com\r\n\r\nbody\r\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = q.Next(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			d := New(&config.Config{Server: config.Server{Hostname: "mail.test"}}, q, nopLog{})
+
+			err = d.ensureDSN(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			dsnID := source.DSNID
+
+			err = q.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			q, err = queue.Open(root, queue.Limits{})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(func() {
+				_ = q.Close()
+			})
+
+			d = New(&config.Config{Server: config.Server{Hostname: "mail.test"}}, q, nopLog{})
+
+			recovered, err := q.Next(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if recovered.ID != source.ID || recovered.Pending() != 0 || recovered.DSNID != dsnID {
+				t.Fatalf("recovered source can be retransmitted: %#v", recovered)
+			}
+
+			err = d.complete(recovered)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, readyErr := os.Stat(filepath.Join(root, "ready", source.ID))
+			_, deadErr := os.Stat(filepath.Join(root, "dead", source.ID))
+
+			if tc.wantDead {
+				if readyErr == nil || deadErr != nil {
+					t.Fatalf("source readyErr=%v deadErr=%v want buried", readyErr, deadErr)
+				}
+			} else if readyErr == nil || !os.IsNotExist(deadErr) {
+				t.Fatalf("source readyErr=%v deadErr=%v want finished", readyErr, deadErr)
+			}
+
+			entries, err := os.ReadDir(filepath.Join(root, "ready"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var dsnCount int
+
+			for _, entry := range entries {
+				if entry.Name() == dsnID {
+					dsnCount++
+				}
+			}
+
+			if dsnCount != 1 {
+				t.Fatalf("DSN count=%d want 1", dsnCount)
+			}
+		})
+	}
+}
+
 func TestGeneratedDSNHasIndependentSchedulingOwner(t *testing.T) {
 	q, err := queue.Open(t.TempDir(), queue.Limits{})
 	if err != nil {
