@@ -12,6 +12,7 @@ import (
 	"github.com/coalaura/outboxd/internal/config"
 	"github.com/coalaura/outboxd/internal/deliver"
 	"github.com/coalaura/outboxd/internal/disk"
+	pgpsign "github.com/coalaura/outboxd/internal/openpgp"
 	"github.com/coalaura/outboxd/internal/queue"
 	"github.com/coalaura/outboxd/internal/rejection"
 	"github.com/coalaura/outboxd/internal/sign"
@@ -52,6 +53,13 @@ func serve(configPath string) error {
 	signer, err := sign.Load(cfg)
 	if err != nil {
 		return fmt.Errorf("load DKIM key (run 'outboxd -config %s provision' first): %w", cfg.Path(), err)
+	}
+
+	log.Println("Loading OpenPGP signing keys...")
+
+	pgpSigners, err := pgpsign.Load(cfg)
+	if err != nil {
+		return fmt.Errorf("load OpenPGP signing keys: %w", err)
 	}
 
 	// Exclusive spool lock is daemon ownership: hold it before writing certs.
@@ -113,7 +121,7 @@ func serve(configPath string) error {
 	ctx, stop := terminationContext(context.Background())
 	defer stop()
 
-	submission := smtpd.New(cfg, keeper, signer, spool, log)
+	submission := smtpd.NewWithOpenPGP(cfg, keeper, signer, pgpSigners, spool, log)
 
 	err = submission.Listen()
 	if err != nil {

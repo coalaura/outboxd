@@ -66,6 +66,17 @@ type DKIM struct {
 	Headers        []string `yaml:"headers"`
 }
 
+type OpenPGP struct {
+	Identities []OpenPGPIdentity `yaml:"identities,omitempty"`
+}
+
+type OpenPGPIdentity struct {
+	Sender         string `yaml:"sender"`
+	SigningKey     string `yaml:"signing_key"`
+	PassphraseFile string `yaml:"passphrase_file,omitempty"`
+	Signing        string `yaml:"signing"`
+}
+
 // gost:preserve-layout
 type Delivery struct {
 	// TLSMode: opportunistic | required | opportunistic_insecure

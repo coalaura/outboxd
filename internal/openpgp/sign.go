@@ -1,0 +1,582 @@
+package openpgp
+
+import (
+	"bytes"
+	"context"
+	"crypto"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"mime"
+	"mime/quotedprintable"
+	"net/mail"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	pgp "github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
+	"github.com/coalaura/outboxd/internal/config"
+)
+
+const (
+	maxKeyBytes        = 4 << 20
+	maxPassphraseBytes = 4 << 10
+)
+
+type identity struct {
+	entity *pgp.Entity
+	mu     sync.Mutex
+}
+
+// Signers is an immutable startup snapshot of configured signing identities.
+type Signers struct {
+	identities map[string]*identity
+	maximum    int64
+}
+
+type limitedBuffer struct {
+	bytes.Buffer
+	maximum int64
+}
+
+func (b *limitedBuffer) Write(data []byte) (int, error) {
+	if int64(b.Len())+int64(len(data)) > b.maximum {
+		return 0, errors.New("signed message exceeds configured maximum size")
+	}
+
+	return b.Buffer.Write(data)
+}
+
+// Load reads and validates configured private keys without changing them.
+func Load(cfg *config.Config) (*Signers, error) {
+	signers := &Signers{
+		identities: make(map[string]*identity, len(cfg.OpenPGP.Identities)),
+		maximum:    cfg.Server.MaxMessageBytes,
+	}
+
+	for _, configured := range cfg.OpenPGP.Identities {
+		loaded, err := loadIdentity(cfg, configured)
+		if err != nil {
+			return nil, fmt.Errorf("openpgp identity %q: %w", configured.Sender, err)
+		}
+
+		signers.identities[configured.Sender] = loaded
+	}
+
+	return signers, nil
+}
+
+func loadIdentity(cfg *config.Config, configured config.OpenPGPIdentity) (*identity, error) {
+	keyPath := cfg.ResolvePath(configured.SigningKey)
+	if !filepath.IsAbs(configured.SigningKey) {
+		err := cfg.CheckGeneratedParents(keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("check signing key path: %w", err)
+		}
+	}
+
+	keyData, err := config.ReadCheckedFile(keyPath, true, false, maxKeyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("read signing key: %w", err)
+	}
+
+	entities, err := pgp.ReadArmoredKeyRing(bytes.NewReader(keyData))
+	if err != nil {
+		entities, err = pgp.ReadKeyRing(bytes.NewReader(keyData))
+	}
+
+	clear(keyData)
+
+	if err != nil {
+		return nil, fmt.Errorf("parse signing key: %w", err)
+	}
+
+	if len(entities) != 1 {
+		return nil, fmt.Errorf("signing key must contain exactly one entity, got %d", len(entities))
+	}
+
+	entity := entities[0]
+
+	key, ok := entity.SigningKey(time.Now())
+	if !ok || key.PrivateKey == nil {
+		return nil, errors.New("no valid private signing key")
+	}
+
+	encrypted := key.PrivateKey.Encrypted
+
+	if configured.PassphraseFile == "" {
+		if encrypted {
+			return nil, errors.New("signing key is encrypted but passphrase_file is not configured")
+		}
+	} else {
+		if !encrypted {
+			return nil, errors.New("passphrase_file is configured but the signing key is not encrypted")
+		}
+
+		passphrase, err := readPassphrase(cfg, configured.PassphraseFile)
+		if err != nil {
+			return nil, err
+		}
+
+		err = entity.DecryptPrivateKeys(passphrase)
+		if err != nil {
+			clear(passphrase)
+
+			return nil, fmt.Errorf("decrypt signing key: %w", err)
+		}
+
+		clear(passphrase)
+	}
+
+	if _, ok := entity.SigningKey(time.Now()); !ok {
+		return nil, errors.New("no currently valid signing key")
+	}
+
+	if !hasIdentity(entity, configured.Sender) {
+		return nil, errors.New("sender is not present in the key identities")
+	}
+
+	err = pgp.DetachSign(bytes.NewBuffer(nil), entity, bytes.NewReader(nil), signingConfig())
+	if err != nil {
+		return nil, fmt.Errorf("validate signing key: %w", err)
+	}
+
+	return &identity{entity: entity}, nil
+}
+
+func readPassphrase(cfg *config.Config, path string) ([]byte, error) {
+	resolved := cfg.ResolvePath(path)
+
+	if !filepath.IsAbs(path) {
+		err := cfg.CheckGeneratedParents(resolved)
+		if err != nil {
+			return nil, fmt.Errorf("check passphrase file path: %w", err)
+		}
+	}
+
+	value, err := config.ReadCheckedFile(resolved, true, false, maxPassphraseBytes)
+	if err != nil {
+		return nil, fmt.Errorf("read passphrase file: %w", err)
+	}
+
+	value = bytes.TrimSuffix(value, []byte("\n"))
+	value = bytes.TrimSuffix(value, []byte("\r"))
+
+	if len(value) == 0 {
+		return nil, errors.New("passphrase file is empty")
+	}
+
+	if bytes.ContainsAny(value, "\r\n\x00") {
+		return nil, errors.New("passphrase file must contain one non-empty line without NUL")
+	}
+
+	return value, nil
+}
+
+func hasIdentity(entity *pgp.Entity, sender string) bool {
+	now := time.Now()
+
+	for _, identity := range entity.Identities {
+		if identity.SelfSignature == nil || identity.SelfSignature.SigExpired(now) || identity.Revoked(now) {
+			continue
+		}
+
+		address, err := mail.ParseAddress(identity.Name)
+		if err != nil {
+			continue
+		}
+
+		if canonicalAddress(address.Address) == sender {
+			return true
+		}
+	}
+
+	return false
+}
+
+func canonicalAddress(address string) string {
+	at := strings.LastIndexByte(address, '@')
+	if at < 0 {
+		return address
+	}
+
+	return address[:at] + "@" + strings.ToLower(address[at+1:])
+}
+
+// Sign wraps data in multipart/signed when sender has a configured identity.
+func (s *Signers) Sign(ctx context.Context, sender string, data []byte) ([]byte, bool, error) {
+	if s == nil {
+		return data, false, nil
+	}
+
+	configured := s.identities[sender]
+	if configured == nil {
+		return data, false, nil
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+
+	outer, entity, err := splitMessage(data)
+	if err != nil {
+		return nil, false, err
+	}
+
+	entity, err = canonicalizeEntity(entity, s.maximum)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if !bytes.HasSuffix(entity, []byte("\r\n")) {
+		entity = append(entity, '\r', '\n')
+	}
+
+	configured.mu.Lock()
+	defer configured.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+
+	var signature bytes.Buffer
+
+	err = pgp.ArmoredDetachSign(&signature, configured.entity, bytes.NewReader(entity), signingConfig())
+	if err != nil {
+		return nil, false, fmt.Errorf("create detached signature: %w", err)
+	}
+
+	boundary, err := randomBoundary()
+	if err != nil {
+		return nil, false, err
+	}
+
+	armor := bytes.ReplaceAll(signature.Bytes(), []byte("\n"), []byte("\r\n"))
+
+	result := buildSignedMessage(outer, entity, armor, boundary)
+
+	if int64(len(result)) > s.maximum {
+		return nil, false, fmt.Errorf("signed message exceeds maximum size of %d bytes", s.maximum)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+
+	return result, true, nil
+}
+
+func signingConfig() *packet.Config {
+	return &packet.Config{DefaultHash: crypto.SHA256, MinRSABits: 2048}
+}
+
+func randomBoundary() (string, error) {
+	var value [24]byte
+
+	_, err := rand.Read(value[:])
+	if err != nil {
+		return "", fmt.Errorf("generate MIME boundary: %w", err)
+	}
+
+	return "outboxd-" + hex.EncodeToString(value[:]), nil
+}
+
+func buildSignedMessage(outer, entity, signature []byte, boundary string) []byte {
+	var result bytes.Buffer
+	result.Grow(len(outer) + len(entity) + len(signature) + 512)
+
+	result.Write(outer)
+	result.WriteString("MIME-Version: 1.0\r\n")
+	result.WriteString("Content-Type: multipart/signed; protocol=\"application/pgp-signature\"; micalg=pgp-sha256; boundary=\"")
+	result.WriteString(boundary)
+	result.WriteString("\"\r\n\r\n")
+	result.WriteString("This is an OpenPGP/MIME signed message.\r\n\r\n--")
+	result.WriteString(boundary)
+	result.WriteString("\r\n")
+	result.Write(entity)
+	result.WriteString("--")
+	result.WriteString(boundary)
+	result.WriteString("\r\nContent-Type: application/pgp-signature; name=\"signature.asc\"\r\n")
+	result.WriteString("Content-Description: OpenPGP digital signature\r\n")
+	result.WriteString("Content-Disposition: attachment; filename=\"signature.asc\"\r\n\r\n")
+	result.Write(signature)
+	result.WriteString("\r\n--")
+	result.WriteString(boundary)
+	result.WriteString("--\r\n")
+
+	return result.Bytes()
+}
+
+func splitMessage(data []byte) ([]byte, []byte, error) {
+	headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
+	if headerEnd < 0 {
+		return nil, nil, errors.New("message has no header/body separator")
+	}
+
+	fields, err := headerFields(data[:headerEnd+2])
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var outer, entity bytes.Buffer
+
+	for _, field := range fields {
+		name := fieldName(field)
+		if strings.HasPrefix(name, "content-") {
+			entity.Write(field)
+		} else if name != "mime-version" {
+			outer.Write(field)
+		}
+	}
+
+	entity.WriteString("\r\n")
+	entity.Write(data[headerEnd+4:])
+
+	return outer.Bytes(), entity.Bytes(), nil
+}
+
+func canonicalizeEntity(data []byte, maximum int64) ([]byte, error) {
+	if int64(len(data)) > maximum {
+		return nil, errors.New("MIME entity exceeds configured maximum size")
+	}
+
+	headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
+	if headerEnd < 0 {
+		return nil, errors.New("MIME entity has no header/body separator")
+	}
+
+	head := data[:headerEnd+2]
+	body := data[headerEnd+4:]
+
+	if !isSevenBit(head) {
+		return nil, errors.New("MIME entity headers are not 7-bit safe")
+	}
+
+	contentType := headerValue(head, "content-type")
+
+	mediaType, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return nil, fmt.Errorf("parse MIME Content-Type: %w", err)
+	}
+
+	if strings.HasPrefix(strings.ToLower(mediaType), "multipart/") {
+		boundary := params["boundary"]
+		if boundary == "" {
+			return nil, errors.New("multipart MIME entity has no boundary")
+		}
+
+		canonicalBody, err := canonicalizeMultipart(body, boundary, maximum-int64(len(head))-2)
+		if err != nil {
+			return nil, err
+		}
+
+		canonical := joinEntity(head, canonicalBody)
+
+		if !isSevenBit(canonical) {
+			return nil, errors.New("multipart MIME preamble or epilogue is not 7-bit safe")
+		}
+
+		return canonical, nil
+	}
+
+	if isSevenBit(body) {
+		return data, nil
+	}
+
+	encoding := strings.ToLower(strings.TrimSpace(headerValue(head, "content-transfer-encoding")))
+	if encoding == "base64" || encoding == "quoted-printable" {
+		return nil, fmt.Errorf("%s MIME body contains non-ASCII encoded data", encoding)
+	}
+
+	if encoding != "" && encoding != "7bit" && encoding != "8bit" && encoding != "binary" {
+		return nil, fmt.Errorf("unsupported MIME content-transfer-encoding %q", encoding)
+	}
+
+	head, err = replaceHeader(head, "Content-Transfer-Encoding", "quoted-printable")
+	if err != nil {
+		return nil, err
+	}
+
+	var encoded limitedBuffer
+
+	encoded.maximum = maximum - int64(len(head)) - 2
+
+	writer := quotedprintable.NewWriter(&encoded)
+
+	_, err = writer.Write(body)
+	if err != nil {
+		return nil, err
+	}
+
+	err = writer.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	return joinEntity(head, encoded.Bytes()), nil
+}
+
+func canonicalizeMultipart(body []byte, boundary string, maximum int64) ([]byte, error) {
+	marker := []byte("--" + boundary)
+
+	var result bytes.Buffer
+
+	partStart := -1
+
+	for offset := 0; offset < len(body); {
+		lineEnd := bytes.Index(body[offset:], []byte("\r\n"))
+		if lineEnd < 0 {
+			lineEnd = len(body) - offset
+		} else {
+			lineEnd += 2
+		}
+
+		line := bytes.TrimRight(body[offset:offset+lineEnd], "\r\n \t")
+		if bytes.Equal(line, marker) || bytes.Equal(line, append(append([]byte{}, marker...), '-', '-')) {
+			if partStart >= 0 {
+				part := body[partStart:offset]
+
+				canonical, err := canonicalizeEntity(part, maximum-int64(result.Len()))
+				if err != nil {
+					return nil, err
+				}
+
+				err = appendLimited(&result, canonical, maximum)
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				err := appendLimited(&result, body[:offset], maximum)
+				if err != nil {
+					return nil, err
+				}
+			}
+
+			err := appendLimited(&result, body[offset:offset+lineEnd], maximum)
+			if err != nil {
+				return nil, err
+			}
+
+			if bytes.HasSuffix(line, []byte("--")) {
+				err = appendLimited(&result, body[offset+lineEnd:], maximum)
+				if err != nil {
+					return nil, err
+				}
+
+				return result.Bytes(), nil
+			}
+
+			partStart = offset + lineEnd
+		}
+
+		offset += lineEnd
+	}
+
+	return nil, errors.New("multipart MIME entity has no closing boundary")
+}
+
+func appendLimited(result *bytes.Buffer, data []byte, maximum int64) error {
+	if int64(result.Len())+int64(len(data)) > maximum {
+		return errors.New("canonical MIME entity exceeds configured maximum size")
+	}
+
+	result.Write(data)
+
+	return nil
+}
+
+func joinEntity(head, body []byte) []byte {
+	result := make([]byte, 0, len(head)+2+len(body))
+
+	result = append(result, head...)
+	result = append(result, '\r', '\n')
+	result = append(result, body...)
+
+	return result
+}
+
+func isSevenBit(data []byte) bool {
+	for _, value := range data {
+		if value >= 0x80 || value == 0 {
+			return false
+		}
+	}
+
+	return true
+}
+
+func replaceHeader(head []byte, name, value string) ([]byte, error) {
+	fields, err := headerFields(head)
+	if err != nil {
+		return nil, err
+	}
+
+	var result bytes.Buffer
+
+	for _, field := range fields {
+		if fieldName(field) != strings.ToLower(name) {
+			result.Write(field)
+		}
+	}
+
+	fmt.Fprintf(&result, "%s: %s\r\n", name, value)
+
+	return result.Bytes(), nil
+}
+
+func headerValue(head []byte, wanted string) string {
+	fields, _ := headerFields(head)
+
+	for _, field := range fields {
+		if fieldName(field) == wanted {
+			colon := bytes.IndexByte(field, ':')
+			value := strings.ReplaceAll(string(field[colon+1:]), "\r\n", " ")
+
+			return strings.TrimSpace(value)
+		}
+	}
+
+	return ""
+}
+
+func headerFields(head []byte) ([][]byte, error) {
+	lines := bytes.SplitAfter(head, []byte("\r\n"))
+
+	fields := make([][]byte, 0, len(lines))
+
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+
+		if line[0] == ' ' || line[0] == '\t' {
+			if len(fields) == 0 {
+				return nil, errors.New("header starts with a continuation line")
+			}
+
+			fields[len(fields)-1] = append(fields[len(fields)-1], line...)
+
+			continue
+		}
+
+		if bytes.IndexByte(line, ':') <= 0 {
+			return nil, errors.New("malformed MIME header")
+		}
+
+		fields = append(fields, append([]byte(nil), line...))
+	}
+
+	return fields, nil
+}
+
+func fieldName(field []byte) string {
+	colon := bytes.IndexByte(field, ':')
+	if colon < 0 {
+		return ""
+	}
+
+	return strings.ToLower(string(field[:colon]))
+}

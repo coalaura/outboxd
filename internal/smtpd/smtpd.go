@@ -15,6 +15,7 @@ import (
 	"github.com/coalaura/outboxd/internal/certs"
 	"github.com/coalaura/outboxd/internal/config"
 	"github.com/coalaura/outboxd/internal/mailbox"
+	pgpsign "github.com/coalaura/outboxd/internal/openpgp"
 	"github.com/coalaura/outboxd/internal/queue"
 	"github.com/coalaura/outboxd/internal/sign"
 	"github.com/emersion/go-smtp"
@@ -42,6 +43,7 @@ type Server struct {
 	signer      *sign.Signer
 	log         Logger
 	queueAdd    func(context.Context, *queue.Envelope, []byte) error
+	openPGPSign func(context.Context, string, []byte) ([]byte, bool, error)
 	signMessage func(context.Context, []byte) (string, error)
 
 	connLimit   *connectionLimiter
@@ -169,6 +171,11 @@ func (s *Server) dataTimeout() time.Duration {
 
 // New builds the submission server.
 func New(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signer, spool *queue.Queue, log Logger) *Server {
+	return NewWithOpenPGP(cfg, keeper, signer, nil, spool, log)
+}
+
+// NewWithOpenPGP builds the submission server with optional OpenPGP/MIME signing.
+func NewWithOpenPGP(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signer, pgpSigners *pgpsign.Signers, spool *queue.Queue, log Logger) *Server {
 	authWorkers := cfg.Server.AuthWorkers
 	if authWorkers <= 0 {
 		authWorkers = 4
@@ -202,6 +209,8 @@ func New(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signer, spool *q
 	srv.queueAdd = func(ctx context.Context, envelope *queue.Envelope, data []byte) error {
 		return srv.queue.AddContext(ctx, envelope, data)
 	}
+
+	srv.openPGPSign = pgpSigners.Sign
 
 	srv.signMessage = func(ctx context.Context, data []byte) (string, error) {
 		if err := ctx.Err(); err != nil {

@@ -2,6 +2,7 @@ package smtpd
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -798,6 +799,93 @@ func TestSigningAndQueueFailuresConsumeSubmissionBudget(t *testing.T) {
 	beginMessage(t, queueClient, "")
 
 	queueClient.expectClosed(t)
+}
+
+func TestOpenPGPFailureSkipsDKIMAndQueue(t *testing.T) {
+	const password = "openpgp-failure-password"
+
+	srv, _, spool, _, pool := testServerWithUser(t, password)
+
+	var (
+		transformed atomic.Int32
+		dkim        atomic.Int32
+		added       atomic.Int32
+	)
+
+	srv.openPGPSign = func(context.Context, string, []byte) ([]byte, bool, error) {
+		transformed.Add(1)
+
+		return nil, false, errors.New("injected OpenPGP failure")
+	}
+
+	srv.signMessage = func(context.Context, []byte) (string, error) {
+		dkim.Add(1)
+
+		return "", nil
+	}
+
+	srv.queueAdd = func(context.Context, *queue.Envelope, []byte) error {
+		added.Add(1)
+
+		return nil
+	}
+
+	runTestSubmission(t, srv)
+
+	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
+	defer cl.close()
+
+	cl.authPlain(t, "alice", password)
+
+	beginMessage(t, cl, "")
+	writeMessage(cl, "must not be accepted unsigned")
+
+	cl.readCode(t, 451)
+
+	if transformed.Load() != 1 || dkim.Load() != 0 || added.Load() != 0 || spool.Len() != 0 {
+		t.Fatalf("OpenPGP=%d DKIM=%d queue=%d spool=%d", transformed.Load(), dkim.Load(), added.Load(), spool.Len())
+	}
+}
+
+func TestOpenPGPTransformRunsBeforeDKIM(t *testing.T) {
+	const password = "openpgp-order-password"
+
+	srv, _, spool, _, pool := testServerWithUser(t, password)
+
+	transformed := []byte("From: alice@example.com\r\n\r\ntransformed\r\n")
+
+	srv.openPGPSign = func(context.Context, string, []byte) ([]byte, bool, error) {
+		return transformed, true, nil
+	}
+
+	srv.signMessage = func(_ context.Context, data []byte) (string, error) {
+		if !bytes.Equal(data, transformed) {
+			return "", fmt.Errorf("DKIM received %q", data)
+		}
+
+		return "DKIM-Signature: test\r\n", nil
+	}
+
+	runTestSubmission(t, srv)
+
+	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
+	defer cl.close()
+
+	cl.authPlain(t, "alice", password)
+
+	beginMessage(t, cl, "")
+	writeMessage(cl, "original")
+
+	cl.readCode(t, 250)
+
+	entry, err := spool.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if entry.EightBit {
+		t.Fatal("OpenPGP/MIME queue entry incorrectly requires 8BITMIME")
+	}
 }
 
 func TestBody7BitAndReset(t *testing.T) {

@@ -1,6 +1,6 @@
 # outboxd
 
-outboxd is a small outbound mail server for straightforward, properly signed mail delivery. It accepts authenticated SMTP submission from configured users, DKIM-signs messages, queues them durably and delivers them to recipient MX servers.
+outboxd is a small outbound mail server for straightforward, properly signed mail delivery. It accepts authenticated SMTP submission from configured users, optionally applies per-sender OpenPGP/MIME signatures, DKIM-signs messages, queues them durably and delivers them to recipient MX servers.
 
 It is for sending mail. It is not an inbound mailbox server, IMAP server, spam filter or webmail application. An optional rejection-only SMTP endpoint can reject attempted replies without accepting their message data.
 
@@ -140,6 +140,14 @@ sudo systemctl status outboxd
 
 `dns`, `check` and `serve` load an existing DKIM key; they never create or replace one. Run `provision` if the key is missing. Stop the daemon before running `dns`, changing the DKIM key or generated DNS path or changing the config/data-directory path.
 
+## OpenPGP/MIME Signing
+
+OpenPGP/MIME signing is optional globally and explicit per exact header `From` identity. Add an `openpgp.identities` entry with `sender`, `signing_key` and `signing: required`. The sender local part is case-sensitive and its domain is case-insensitive. A message whose `From` has no configured identity remains unsigned; a configured identity is never allowed to fall back to unsigned delivery.
+
+`signing_key` accepts one armored or binary private-key entity and must contain the configured sender as a key identity plus a currently valid signing key. For an encrypted private key, set `passphrase_file` to a private file containing exactly one passphrase line. Do not put passphrases in the YAML or command line. Relative paths resolve below `server.data_directory`; absolute paths are allowed. Keys and passphrase files must be private regular files and may not be symlinks or reparse points.
+
+Signing produces RFC 3156 `multipart/signed` data before DKIM is applied. The exact canonical MIME entity placed in the first part is signed, with 8-bit MIME leaf bodies converted to quoted-printable. If key loading, canonicalization or signing fails, submission receives a temporary failure and the message is not DKIM-signed, queued or accepted. outboxd does not generate OpenPGP keys, encrypt messages, discover keys or support inline PGP. `check` validates configured OpenPGP keys without modifying them. Keys and passphrases are loaded only at startup, so rotation requires a restart.
+
 ## TLS Certificates
 
 Certificate deployment is intentionally left to the operator so outboxd can be used with any certificate authority or existing automation. The `outboxd` service account must be able to read both configured files. On Unix, the private key must have no group or other permission bits; use mode `0600` and ownership that permits the service account to read it. Do not weaken the key permissions to make an external certificate directory accessible. Copying or deploying certificate material into a private location such as `/var/lib/outboxd/tls` is one compatible approach, but outboxd does not prescribe or install that automation.
@@ -161,11 +169,11 @@ New IPs also need normal reputation work: authenticated users only, sensible sen
 
 ## Configuration And Files
 
-The generated `config.yml` documents every setting. Relative paths resolve next to the config file; generated DKIM material, self-signed development TLS material, DNS instructions and queue state live under `server.data_directory`.
+The generated `config.yml` documents every setting. Relative paths resolve next to the config file; generated DKIM material, operator-supplied OpenPGP material, self-signed development TLS material, DNS instructions and queue state live under `server.data_directory`.
 
 Operator-managed TLS files may be outside `data_directory`, subject to service sandbox access and private-key permission requirements. The config ownership lock and short-lived atomic-write files live beside the config file.
 
-Configuration, users, DKIM keys, queue limits and delivery policy are loaded at startup. Restart outboxd after changing them. TLS certificate and key contents are the only runtime-reloaded files.
+Configuration, users, DKIM and OpenPGP keys, queue limits and delivery policy are loaded at startup. Restart outboxd after changing them. TLS certificate and key contents are the only runtime-reloaded files.
 
 To remove the installed systemd and sysusers files, run `sudo /opt/outboxd/conf/uninstall.sh`. It deliberately preserves `/opt/outboxd`, `/var/lib/outboxd`, and the `outboxd` account so private state retains its owner. Remove preserved state and then the account manually only when permanently decommissioning the service.
 
@@ -208,7 +216,7 @@ Use `OUTBOXD_CONFIG` instead of `-config` to select a config path.
 ## Security Notes
 
 - Use `tls.mode: files` with a publicly trusted certificate in production. `self_signed` is development-only and requires an explicit opt-in.
-- Keep the config, DKIM key and data directory readable and writable only by the service account. On Windows, configure the service account and ACLs yourself.
+- Keep the config, DKIM key, OpenPGP keys and passphrase files, and data directory readable and writable only by the service account. On Windows, configure the service account and ACLs yourself.
 - Outbound delivery defaults to verified, required TLS. Do not enable plaintext or insecure TLS unless the compatibility tradeoff is deliberate.
 - outboxd does not accept inbound message data and does not implement inbound mail storage, DANE, MTA-STS or DNSSEC validation.
 - A private local filesystem with reliable rename/sync behavior is required for the queue durability guarantees.

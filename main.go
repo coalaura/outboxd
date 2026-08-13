@@ -16,6 +16,7 @@ import (
 
 	"github.com/coalaura/outboxd/internal/config"
 	"github.com/coalaura/outboxd/internal/disk"
+	pgpsign "github.com/coalaura/outboxd/internal/openpgp"
 	"github.com/coalaura/outboxd/internal/sign"
 	"github.com/coalaura/plain"
 )
@@ -252,6 +253,11 @@ func provision(configPath string) error {
 		fmt.Fprintf(os.Stdout, "Provisioned DKIM key at %q (create-once).\n", path)
 	} else {
 		fmt.Fprintf(os.Stdout, "DKIM key already provisioned at %q; left unchanged.\n", path)
+	}
+
+	_, err = pgpsign.Load(cfg)
+	if err != nil {
+		return fmt.Errorf("validate OpenPGP signing keys: %w", err)
 	}
 
 	return nil

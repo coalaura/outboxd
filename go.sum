@@ -1,3 +1,7 @@
+github.com/ProtonMail/go-crypto v1.4.1 h1:9RfcZHqEQUvP8RzecWEUafnZVtEvrBVL9BiF67IQOfM=
+github.com/ProtonMail/go-crypto v1.4.1/go.mod h1:e1OaTyu5SYVrO9gKOEhTc+5UcXtTUa+P3uLudwcgPqo=
+github.com/cloudflare/circl v1.6.2 h1:hL7VBpHHKzrV5WTfHCaBsgx/HGbBYlgrwvNXEVDYYsQ=
+github.com/cloudflare/circl v1.6.2/go.mod h1:2eXP6Qfat4O/Yhh8BznvKnJ+uzEoTQ6jVKJRn81BiS4=
 github.com/coalaura/atom v0.1.0 h1:SIDBPkN/yIs9mmj9mTyDLjTkL6RLs+Ayv6NAMiUvSNE=
 github.com/coalaura/atom v0.1.0/go.mod h1:7pDe9uBEj3+qeHhpGdpvlvRp0JR17sEAZdAW+8vhc9M=
 github.com/coalaura/plain v1.5.0 h1:cNnEA1sChxVGqy84Z2fmu5m2zbTjcJNcxJmZC5yge4I=

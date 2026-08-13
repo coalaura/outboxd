@@ -9,6 +9,7 @@ import (
 	"github.com/coalaura/outboxd/internal/certs"
 	"github.com/coalaura/outboxd/internal/check"
 	"github.com/coalaura/outboxd/internal/config"
+	pgpsign "github.com/coalaura/outboxd/internal/openpgp"
 	"github.com/coalaura/outboxd/internal/sign"
 )
 
@@ -36,6 +37,11 @@ func runCheck(configPath string) error {
 	}
 
 	opts.DKIM = &check.DKIMKey{Selector: cfg.DKIM.Selector, PublicKey: signer.PublicKey}
+
+	_, err = pgpsign.Load(cfg)
+	if err != nil {
+		return fmt.Errorf("load OpenPGP signing keys: %w", err)
+	}
 
 	err = certs.Check(cfg)
 	if err != nil {

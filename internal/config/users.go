@@ -161,7 +161,12 @@ func (cfg *Config) adopt(other *Config) {
 	cfg.dataMu.Lock()
 	defer cfg.dataMu.Unlock()
 
-	cfg.Server, cfg.TLS, cfg.DKIM, cfg.Delivery, cfg.DNS = other.Server, other.TLS, other.DKIM, other.Delivery, other.DNS
+	cfg.Server = other.Server
+	cfg.TLS = other.TLS
+	cfg.DKIM = other.DKIM
+	cfg.OpenPGP = other.OpenPGP
+	cfg.Delivery = other.Delivery
+	cfg.DNS = other.DNS
 	cfg.Users = slices.Clone(other.Users)
 	cfg.userLookup = make(map[string]*User, len(cfg.Users))
 

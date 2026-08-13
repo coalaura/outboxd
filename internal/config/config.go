@@ -15,6 +15,7 @@ type Config struct {
 	ReplyRejection ReplyRejection `yaml:"reply_rejection"`
 	TLS            TLS            `yaml:"tls"`
 	DKIM           DKIM           `yaml:"dkim"`
+	OpenPGP        OpenPGP        `yaml:"openpgp,omitempty"`
 	Delivery       Delivery       `yaml:"delivery"`
 	DNS            DNS            `yaml:"dns"`
 	Users          []User         `yaml:"users"`

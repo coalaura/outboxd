@@ -205,6 +205,39 @@ users:
 	}
 }
 
+func TestOpenPGPIdentityValidation(t *testing.T) {
+	cfg := Default()
+
+	cfg.Server.Hostname = "mail.example.com"
+	cfg.Server.Domain = "example.com"
+	cfg.Users = []User{{Username: "alice", PasswordHash: validUserPHC(t), AllowedSenders: []string{"alice@example.com"}, Enabled: true}}
+	cfg.OpenPGP.Identities = []OpenPGPIdentity{{Sender: "Alice@EXAMPLE.com", SigningKey: "openpgp/alice.asc", Signing: "required"}}
+
+	err := cfg.Init()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := cfg.OpenPGP.Identities[0].Sender; got != "Alice@example.com" {
+		t.Fatalf("canonical sender = %q", got)
+	}
+
+	cfg.OpenPGP.Identities = append(cfg.OpenPGP.Identities, cfg.OpenPGP.Identities[0])
+
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "duplicate sender") {
+		t.Fatalf("duplicate Validate() error = %v", err)
+	}
+
+	cfg.OpenPGP.Identities = cfg.OpenPGP.Identities[:1]
+	cfg.OpenPGP.Identities[0].Signing = "optional"
+
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "must be required") {
+		t.Fatalf("optional Validate() error = %v", err)
+	}
+}
+
 func TestReplyRejectionValidation(t *testing.T) {
 	cfg := Default()
 

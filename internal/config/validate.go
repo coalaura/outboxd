@@ -204,6 +204,40 @@ func (cfg *Config) Validate() error {
 		return errors.New("dkim.headers must contain Sender")
 	}
 
+	openPGPSenders := make(map[string]struct{}, len(cfg.OpenPGP.Identities))
+
+	if len(cfg.OpenPGP.Identities) > MaxOpenPGPIdentities {
+		return fmt.Errorf("openpgp.identities must contain at most %d entries", MaxOpenPGPIdentities)
+	}
+
+	for i := range cfg.OpenPGP.Identities {
+		identity := &cfg.OpenPGP.Identities[i]
+
+		sender, err := mailbox.Address(identity.Sender)
+		if err != nil {
+			return fmt.Errorf("openpgp.identities[%d].sender: %w", i, err)
+		}
+
+		at := strings.LastIndexByte(sender, '@')
+		sender = sender[:at] + "@" + strings.ToLower(sender[at+1:])
+
+		if _, exists := openPGPSenders[sender]; exists {
+			return fmt.Errorf("openpgp.identities[%d]: duplicate sender %q", i, sender)
+		}
+
+		openPGPSenders[sender] = struct{}{}
+
+		identity.Sender = sender
+
+		if identity.SigningKey == "" {
+			return fmt.Errorf("openpgp.identities[%d].signing_key must not be empty", i)
+		}
+
+		if identity.Signing != "required" {
+			return fmt.Errorf("openpgp.identities[%d].signing must be required", i)
+		}
+	}
+
 	switch cfg.Delivery.TLSMode {
 	case "opportunistic", "required", "opportunistic_insecure":
 	default:

@@ -149,6 +149,23 @@ func (s *session) Data(r io.Reader) error {
 		return errTemporaryFailure
 	}
 
+	var openPGPSigned bool
+
+	prepared.Data, openPGPSigned, err = s.server.openPGPSign(ctx, prepared.From, prepared.Data)
+	if err != nil {
+		if ctx.Err() != nil {
+			s.waitDataDeadlineClose()
+		}
+
+		s.server.log.Printf("OpenPGP signing failed for %q: %v\n", prepared.From, err)
+
+		return errTemporaryFailure
+	}
+
+	if openPGPSigned {
+		prepared.EightBit = false
+	}
+
 	signature, err := s.server.signMessage(ctx, prepared.Data)
 	if err != nil {
 		if ctx.Err() != nil {
