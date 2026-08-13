@@ -46,15 +46,51 @@ func TestAdministrativeCommandsRequireExactArity(t *testing.T) {
 	}
 
 	tests := []administrativeCommandArityCase{
-		{"dead list extra", func() error { return dead(path, []string{"list", "extra"}) }},
-		{"dead show missing", func() error { return dead(path, []string{"show"}) }},
-		{"dead show extra", func() error { return dead(path, []string{"show", "id", "extra"}) }},
-		{"dead retry extra", func() error { return dead(path, []string{"retry", "id", "extra"}) }},
-		{"dead export extra", func() error { return dead(path, []string{"export", "id", "extra"}) }},
-		{"dead delete missing", func() error { return dead(path, []string{"delete"}) }},
-		{"corrupt list extra", func() error { return corrupt(path, []string{"list", "extra"}) }},
-		{"corrupt delete missing", func() error { return corrupt(path, []string{"delete"}) }},
-		{"corrupt delete extra", func() error { return corrupt(path, []string{"delete", "name", "extra"}) }},
+		{"queue list extra", func() error {
+			return queueCommand(path, []string{"list", "extra"})
+		}},
+		{"queue show missing", func() error {
+			return queueCommand(path, []string{"show"})
+		}},
+		{"queue show extra", func() error {
+			return queueCommand(path, []string{"show", "id", "extra"})
+		}},
+		{"queue retry extra", func() error {
+			return queueCommand(path, []string{"retry", "id", "extra"})
+		}},
+		{"queue export extra", func() error {
+			return queueCommand(path, []string{"export", "id", "extra"})
+		}},
+		{"queue delete missing", func() error {
+			return queueCommand(path, []string{"delete"})
+		}},
+		{"dead list extra", func() error {
+			return dead(path, []string{"list", "extra"})
+		}},
+		{"dead show missing", func() error {
+			return dead(path, []string{"show"})
+		}},
+		{"dead show extra", func() error {
+			return dead(path, []string{"show", "id", "extra"})
+		}},
+		{"dead retry extra", func() error {
+			return dead(path, []string{"retry", "id", "extra"})
+		}},
+		{"dead export extra", func() error {
+			return dead(path, []string{"export", "id", "extra"})
+		}},
+		{"dead delete missing", func() error {
+			return dead(path, []string{"delete"})
+		}},
+		{"corrupt list extra", func() error {
+			return corrupt(path, []string{"list", "extra"})
+		}},
+		{"corrupt delete missing", func() error {
+			return corrupt(path, []string{"delete"})
+		}},
+		{"corrupt delete extra", func() error {
+			return corrupt(path, []string{"delete", "name", "extra"})
+		}},
 	}
 
 	for _, test := range tests {

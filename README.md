@@ -205,6 +205,11 @@ outboxd [-config path] config update         # add current defaults to an existi
 outboxd [-config path] user add <user> [sender...]
 outboxd [-config path] dns                   # write and print DNS instructions
 outboxd [-config path] check                 # verify local configuration and DNS
+outboxd [-config path] queue list
+outboxd [-config path] queue show <id>
+outboxd [-config path] queue export <id>
+outboxd [-config path] queue retry <id>
+outboxd [-config path] queue delete <id>
 outboxd [-config path] dead list
 outboxd [-config path] dead show <id>
 outboxd [-config path] dead export <id>
@@ -215,6 +220,8 @@ outboxd [-config path] corrupt delete <name>
 ```
 
 Use `OUTBOXD_CONFIG` instead of `-config` to select a config path.
+
+`queue list`, `queue show` and `queue export` are read-only and may run while the daemon is serving. `queue retry` makes an existing message immediately due without clearing its attempt or recipient history. Retry and delete require the daemon to be stopped so they cannot race delivery. Deletion is crash-safe and refuses messages with linked DSN state.
 
 After replacing the binary, run `config update` to atomically rewrite an existing configuration in the current documented format. Configured values are retained and fields omitted by older versions receive current defaults. The command requires an existing valid configuration, does not provision keys or other assets and requires a daemon restart before the updated startup configuration takes effect. The canonical rewrite replaces custom YAML formatting and comments with outboxd's generated documentation.
 

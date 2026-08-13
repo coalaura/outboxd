@@ -244,7 +244,8 @@ func OpenWithOptions(directory string, limits Limits, options OpenOptions) (*Que
 
 // OpenReadOnly opens a spool for inspection without taking the exclusive lock
 // and without tmp recovery, trash cleanup, or schedule load.
-// Supported: DeadIDs, LoadDead, ExportDead, ReadBody, Path, DeadDir.
+// Supported: ReadyIDs, LoadReady, ExportReady, DeadIDs, LoadDead, ExportDead,
+// ReadBody, Path, DeadDir.
 // Mutating methods return ErrReadOnly.
 func OpenReadOnly(directory string) (*Queue, error) {
 	err := disk.ValidatePath(directory)
@@ -258,24 +259,27 @@ func OpenReadOnly(directory string) (*Queue, error) {
 	}
 
 	dead := filepath.Join(directory, dirDead)
+	ready := filepath.Join(directory, dirReady)
 
-	err = disk.ValidatePath(dead)
-	if err != nil {
-		return nil, err
-	}
-
-	if _, err := os.Stat(dead); err == nil {
-		err = disk.ValidatePrivateDirectory(dead)
+	for _, namespace := range []string{ready, dead} {
+		err = disk.ValidatePath(namespace)
 		if err != nil {
 			return nil, err
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
+
+		if _, err := os.Stat(namespace); err == nil {
+			err = disk.ValidatePrivateDirectory(namespace)
+			if err != nil {
+				return nil, err
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
 	}
 
 	q := &Queue{
 		root:          directory,
-		ready:         filepath.Join(directory, dirReady),
+		ready:         ready,
 		dead:          dead,
 		tmp:           filepath.Join(directory, dirTmp),
 		dsn:           filepath.Join(directory, dirDSN),

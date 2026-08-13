@@ -75,6 +75,8 @@ func main() {
 		}
 
 		log.MustExit(runCheck(configPath))
+	case "queue":
+		log.MustExit(queueCommand(configPath, args[1:]))
 	case "dead":
 		log.MustExit(dead(configPath, args[1:]))
 	case "corrupt":
@@ -88,7 +90,7 @@ func main() {
 
 		log.MustExit(serve(configPath))
 	default:
-		log.MustExit(fmt.Errorf("unknown command %q, expected version, config, user, openpgp, provision, dns, check, dead, corrupt, or serve (default)", args[0]))
+		log.MustExit(fmt.Errorf("unknown command %q, expected version, config, user, openpgp, provision, dns, check, queue, dead, corrupt, or serve (default)", args[0]))
 	}
 }
 

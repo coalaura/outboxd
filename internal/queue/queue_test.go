@@ -1047,6 +1047,167 @@ func TestRetryPersistenceFailureStillRecoverable(t *testing.T) {
 	}
 }
 
+func TestReadyAdministration(t *testing.T) {
+	root := t.TempDir()
+
+	q := mustOpen(t, root, Limits{})
+
+	envelope := testEnv("admin-ready")
+
+	body := []byte("Subject: queued\r\n\r\nbody\r\n")
+
+	err := q.Add(envelope, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ids, err := q.ReadyIDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !slices.Equal(ids, []string{envelope.ID}) {
+		t.Fatalf("ReadyIDs=%v", ids)
+	}
+
+	loaded, err := q.LoadReady(envelope.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	loaded.Attempts = 3
+	loaded.LastError = "temporary failure"
+	loaded.NextAttempt = time.Now().Add(time.Hour)
+
+	err = q.Retry(loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	retried, err := q.RetryReady(envelope.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if retried.Attempts != 3 || retried.LastError != "temporary failure" || retried.NextAttempt.After(time.Now()) {
+		t.Fatalf("RetryReady changed history or did not make entry due: %+v", retried)
+	}
+
+	var exported bytes.Buffer
+
+	err = q.ExportReady(envelope.ID, &exported)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(exported.Bytes(), body) {
+		t.Fatalf("ExportReady=%q want %q", exported.Bytes(), body)
+	}
+
+	err = q.DeleteReady(envelope.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = q.LoadReady(envelope.ID)
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("LoadReady after delete error=%v", err)
+	}
+
+	if q.Len() != 0 {
+		t.Fatalf("Len=%d after delete", q.Len())
+	}
+}
+
+func TestReadyReadOnlyInspectionAlongsideLockedQueue(t *testing.T) {
+	root := t.TempDir()
+
+	q := mustOpen(t, root, Limits{})
+
+	envelope := testEnv("admin-read-only")
+
+	body := []byte("message")
+
+	err := q.Add(envelope, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	readOnly, err := OpenReadOnly(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ids, err := readOnly.ReadyIDs()
+	if err != nil || !slices.Equal(ids, []string{envelope.ID}) {
+		t.Fatalf("ReadyIDs=%v error=%v", ids, err)
+	}
+
+	var exported bytes.Buffer
+
+	err = readOnly.ExportReady(envelope.ID, &exported)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(exported.Bytes(), body) {
+		t.Fatalf("ExportReady=%q", exported.Bytes())
+	}
+
+	_, err = readOnly.RetryReady(envelope.ID)
+	if !errors.Is(err, ErrReadOnly) {
+		t.Fatalf("RetryReady error=%v want ErrReadOnly", err)
+	}
+
+	err = readOnly.DeleteReady(envelope.ID)
+	if !errors.Is(err, ErrReadOnly) {
+		t.Fatalf("DeleteReady error=%v want ErrReadOnly", err)
+	}
+}
+
+func TestDeleteReadyRejectsLinkedDSNState(t *testing.T) {
+	q := mustOpen(t, t.TempDir(), Limits{})
+
+	envelope := testEnv("admin-linked")
+
+	err := q.Add(envelope, []byte("body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	source, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	source.Recipients[0].Status = StatusFailed
+	source.Recipients[0].Detail = "rejected"
+	source.Recipients[0].Code = 550
+	source.Recipients[0].EnhancedCode = "5.1.1"
+
+	err = q.Retry(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dsn := testDSN(source)
+
+	err = q.AddDSN(source, dsn, []byte("dsn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = q.DeleteReady(envelope.ID)
+	if err == nil || !strings.Contains(err.Error(), "linked DSN") {
+		t.Fatalf("DeleteReady error=%v", err)
+	}
+
+	_, err = q.LoadReady(envelope.ID)
+	if err != nil {
+		t.Fatalf("linked source was removed: %v", err)
+	}
+}
+
 func TestRetryReconcilesPostRenameMetadataError(t *testing.T) {
 	clearHooks(t)
 
