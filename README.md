@@ -22,6 +22,14 @@ outboxd listens for authenticated submission on port 587 (STARTTLS) and port 465
 
 The Linux service keeps its payload, private configuration and data together under `/opt/outboxd`. The binary and `conf` directory are root-owned, the service reads `/opt/outboxd/config.yml` and only `/opt/outboxd/data` is writable by the `outboxd` account.
 
+For a fresh Linux server with systemd, the guided installer downloads and verifies the latest stable release, prompts for the essential configuration, provisions keys, optionally imports an existing Let's Encrypt certificate, adds SMTP users and optional OpenPGP keys, generates the DNS instructions and starts outboxd:
+
+```bash
+curl -fsSL https://src.ws2.sh/outboxd/install.sh | sh
+```
+
+The installer reads prompts directly from the controlling terminal, parses the complete script before taking action, uses `sudo` when the shell is not already root and refuses to overwrite an existing `/opt/outboxd`. Review `install.sh` before running a network-delivered root installer. Release checksums detect download corruption or mismatched assets; because the checksum and archive come from the same GitHub release, they are not an independent signature.
+
 ### Release archive
 
 Download the archive and its checksum from the release page. Substitute the release version and platform shown there:
@@ -158,7 +166,7 @@ Signing produces RFC 3156 `multipart/signed` data before DKIM is applied. The ex
 
 Certificate deployment is intentionally left to the operator so outboxd can be used with any certificate authority or existing automation. The `outboxd` service account must be able to read both configured files. On Unix, the private key must have no group or other permission bits; use mode `0600` and ownership that permits the service account to read it. Do not weaken the key permissions to make an external certificate directory accessible. Copying or deploying certificate material into a private location such as `/opt/outboxd/data/tls` is one compatible approach, but outboxd does not prescribe or install that automation.
 
-outboxd checks the configured certificate and key during TLS handshakes, rate-limited to avoid filesystem reads on every connection. A valid changed pair is loaded automatically; no signal, systemd reload or restart is needed. If a transient read or validation failure occurs while files are replaced, outboxd continues serving the previously loaded certificate while it remains valid and retries on a later handshake. Once the old certificate expires, an invalid replacement cannot be used and affected TLS handshakes fail.
+outboxd checks the configured certificate and key during TLS handshakes, rate-limited to avoid filesystem reads on every connection. A valid changed pair is loaded automatically; no signal, systemd reload or restart is needed. If a transient read or validation failure occurs while files are replaced, outboxd continues serving the previously loaded certificate while it remains valid and retries on a later handshake. Once the old certificate expires, an invalid replacement cannot be used and affected TLS handshakes fail. The guided installer's Certbot hook copies renewed files into the root-controlled `/opt/outboxd/tls` directory so a compromised service account cannot redirect a root renewal hook through a replaced parent directory.
 
 ## DNS Checklist
 
