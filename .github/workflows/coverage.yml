@@ -15,8 +15,18 @@ concurrency:
 
 jobs:
   test:
-    name: Test and upload coverage
-    runs-on: ubuntu-latest
+    name: Test and upload coverage (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-latest
+          - platform: windows
+            os: windows-latest
+          - platform: darwin
+            os: macos-latest
 
     steps:
       - name: Check out source
@@ -35,17 +45,13 @@ jobs:
         run: go mod download
 
       - name: Run tests with coverage
-        run: |
-          go test \
-            -race \
-            -covermode=atomic \
-            -coverpkg=./... \
-            -coverprofile=coverage.out \
-            ./...
+        run: go test -race -covermode=atomic -coverpkg=./... -coverprofile=coverage.out ./...
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@0561704f0f02c16a585d4c7555e57fa2e44cf909 # v5.5.2
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.out
+          flags: ${{ matrix.platform }}
+          name: ${{ matrix.platform }}
           fail_ci_if_error: true
