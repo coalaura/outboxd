@@ -52,7 +52,7 @@ Submission listens on port 587 with STARTTLS and port 465 with implicit TLS by d
 
 ## Deployment And Releases
 
-- Keep the supported Linux layout coherent: release payload under `/opt/outboxd`, private configuration and state under `/var/lib/outboxd` and the daemon running as the `outboxd` account.
+- Keep the supported Linux layout coherent: root-owned release payload and private config under `/opt/outboxd`, writable state under `/opt/outboxd/data` and the daemon running as the `outboxd` account.
 - Ports 465 and 587 require `CAP_NET_BIND_SERVICE` on standard Linux systems. Do not remove the systemd bounding and ambient capability unless the listener defaults or privilege model also change.
 - Certificate deployment remains operator-owned and certificate-authority-neutral. Do not add project-managed ACME or Let's Encrypt automation. TLS file reload must retain the last valid unexpired pair when a replacement is transiently invalid.
 - Preserve release workflow gates: stable annotated SemVer tags, module verification, tidy check, vet, race tests, native Linux/Windows/macOS tests, cross-platform builds, version smoke tests, packaged documentation/configuration and verified checksums.

@@ -2,13 +2,12 @@
 
 ## Supported Versions
 
-| Version | Supported |
-| ------- | --------- |
-| 0.2.x   | Yes       |
-| 0.1.x   | No        |
-| < 0.1.0 | No        |
+| Version  | Supported |
+| -------- | --------- |
+| 0.2.1    | Yes       |
+| <= 0.2.0 | No        |
 
-Only the current minor release series receives security updates. outboxd is new software; review the documentation and security notes before deploying it in production.
+Only the latest release receives security updates. outboxd is new software; review the documentation and security notes before deploying it in production.
 
 Security reports affecting supported releases or the current `master` branch are welcome.
 

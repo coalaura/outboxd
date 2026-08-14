@@ -43,7 +43,7 @@ func LoadFile(path string) (*Config, error) {
 	cfg.path = abs
 	cfg.baseDir = filepath.Dir(abs)
 
-	raw, err := ReadCheckedFile(abs, true, false, maxConfigFileBytes)
+	raw, err := readConfigFile(abs, maxConfigFileBytes)
 	if err != nil {
 		return nil, fmt.Errorf("config file: %w", err)
 	}

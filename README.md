@@ -20,7 +20,7 @@ outboxd listens for authenticated submission on port 587 (STARTTLS) and port 465
 
 ## Install
 
-The Linux service expects a canonical payload at `/opt/outboxd` containing the `outboxd` binary and the repository's `conf` directory. Private configuration and data are kept separately in `/var/lib/outboxd`; replacing the payload does not replace state.
+The Linux service keeps its payload, private configuration and data together under `/opt/outboxd`. The binary and `conf` directory are root-owned, the service reads `/opt/outboxd/config.yml` and only `/opt/outboxd/data` is writable by the `outboxd` account.
 
 ### Release archive
 
@@ -37,7 +37,7 @@ curl -fLO "$base_url/SHA256SUMS"
 sha256sum --ignore-missing --check SHA256SUMS
 
 sudo install -d -o root -g root -m 0755 /opt/outboxd
-sudo tar -xzf "$archive" -C /opt/outboxd --strip-components=1
+sudo tar --no-same-owner -xzf "$archive" -C /opt/outboxd --strip-components=1
 sudo /opt/outboxd/conf/setup.sh
 ```
 
@@ -60,20 +60,21 @@ sudo install -o root -g root -m 0755 conf/setup.sh conf/uninstall.sh /opt/outbox
 sudo /opt/outboxd/conf/setup.sh
 ```
 
-`setup.sh` must run as root. It creates or reuses the `outboxd` system account, prepares `/var/lib/outboxd` with mode `0700`, installs copies of the sysusers and systemd files, reloads systemd and enables the service. It is safe to rerun after replacing `/opt/outboxd`; it does not recursively change payload or state ownership.
+`setup.sh` must run as root. It creates or reuses the `outboxd` system account, prepares `/opt/outboxd/data` with mode `0700`, links the sysusers and systemd paths to the files in `/opt/outboxd/conf`, reloads systemd, enables the service and restarts it if it is already running. Editing those source files takes effect after `systemctl daemon-reload`; rerunning setup refreshes ownership and modes without recursively changing the data directory.
 
 ## Quick Start
 
-Run administrative commands as the service account so generated configuration, keys and queue state keep the correct ownership. Create the initial configuration:
+The root-owned `/opt/outboxd` directory prevents the service account from replacing the binary or the systemd/sysusers source files. Create the initial configuration as root:
 
 ```bash
-sudo -u outboxd /opt/outboxd/outboxd -config /var/lib/outboxd/config.yml provision
+sudo -g outboxd /opt/outboxd/outboxd -config /opt/outboxd/config.yml provision
 ```
 
-The first run creates a commented config file and stops. Edit the essentials with an editor that runs as `outboxd`:
+The first run creates a commented config file and stops. Edit the essentials, then rerun setup to make it root-owned and read-only to the service account:
 
 ```bash
-sudo -u outboxd vi /var/lib/outboxd/config.yml
+sudoedit /opt/outboxd/config.yml
+sudo /opt/outboxd/conf/setup.sh
 ```
 
 Configure certificate paths that match your deployment. Files under the private state directory are compatible with the supplied systemd sandbox:
@@ -82,12 +83,12 @@ Configure certificate paths that match your deployment. Files under the private 
 server:
   hostname: mail.example.com
   domain: example.com
-  data_directory: /var/lib/outboxd
+  data_directory: /opt/outboxd/data
 
 tls:
   mode: files
-  certificate_file: /var/lib/outboxd/tls/fullchain.pem
-  private_key_file: /var/lib/outboxd/tls/privkey.pem
+  certificate_file: /opt/outboxd/data/tls/fullchain.pem
+  private_key_file: /opt/outboxd/data/tls/privkey.pem
 
 dns:
   public_ipv4: 203.0.113.10
@@ -114,14 +115,15 @@ reply_rejection:
 Provision again to create the data directory, spool and create-once DKIM key:
 
 ```bash
-sudo -u outboxd /opt/outboxd/outboxd -config /var/lib/outboxd/config.yml provision
+sudo -u outboxd /opt/outboxd/outboxd -config /opt/outboxd/config.yml provision
 ```
 
 Add an SMTP user. If stdin is a terminal, outboxd generates a password and prints it once. To supply one yourself, pipe a single-line password of at least 12 bytes.
 
 ```bash
-sudo -u outboxd /opt/outboxd/outboxd -config /var/lib/outboxd/config.yml user add alice alice@example.com
-printf '%s\n' 'a-long-password' | sudo -u outboxd /opt/outboxd/outboxd -config /var/lib/outboxd/config.yml user add alice alice@example.com
+sudo -g outboxd /opt/outboxd/outboxd -config /opt/outboxd/config.yml user add alice alice@example.com
+printf '%s\n' 'a-long-password' | sudo -g outboxd /opt/outboxd/outboxd -config /opt/outboxd/config.yml user add alice alice@example.com
+sudo /opt/outboxd/conf/setup.sh
 ```
 
 The user command always stores a native Argon2id hash. For migration, a `password_hash` copied into the configuration may instead use the Dovecot-style `{ARGON2ID}$argon2id$...` form. Imported hashes must use the audited native profile: Argon2id `m=19456,t=2,p=1`, a 16-byte salt and a 32-byte output. This keeps each authentication within 19 MiB and all eight permitted authentication workers within 152 MiB, while making unknown-user timing work use the same cost profile. Regenerate incompatible hashes before importing them, then restart outboxd after editing users.
@@ -129,13 +131,13 @@ The user command always stores a native Argon2id hash. For migration, a `passwor
 Generate the DNS instructions while the daemon is stopped:
 
 ```bash
-sudo -u outboxd /opt/outboxd/outboxd -config /var/lib/outboxd/config.yml dns
+sudo -u outboxd /opt/outboxd/outboxd -config /opt/outboxd/config.yml dns
 ```
 
 Copy the generated records into DNS, then verify the deployment and start the service:
 
 ```bash
-sudo -u outboxd /opt/outboxd/outboxd -config /var/lib/outboxd/config.yml check
+sudo -u outboxd /opt/outboxd/outboxd -config /opt/outboxd/config.yml check
 sudo systemctl start outboxd
 sudo systemctl status outboxd
 ```
@@ -146,7 +148,7 @@ sudo systemctl status outboxd
 
 OpenPGP/MIME signing is optional globally and explicit per exact header `From` identity. Add an `openpgp.identities` entry with `sender`, `signing_key` and `signing: required`. The sender local part is case-sensitive and its domain is case-insensitive. A message whose `From` has no configured identity remains unsigned; a configured identity is never allowed to fall back to unsigned delivery.
 
-Generate and configure an encrypted RSA-3072 key for an existing user's exact allowed sender with `outboxd -config /path/to/config.yml openpgp create <username> <sender>`. The command creates a random passphrase file and armored private key below `server.data_directory`, never overwrites existing material, validates the key through the production signing loader and atomically updates the configuration. It does not print the passphrase. The config is committed only after both private files are durable; if durability confirmation fails after config replacement, the command reports that partial-success state and preserves the referenced files. Restart outboxd afterward.
+Generate and configure an encrypted RSA-3072 key for an existing user's exact allowed sender with `outboxd -config /path/to/config.yml openpgp create <username> <sender>`. The command creates a random passphrase file and armored private key below `server.data_directory`, never overwrites existing material, validates the key through the production signing loader and atomically updates the configuration. It does not print the passphrase. The config is committed only after both private files are durable; if durability confirmation fails after config replacement, the command reports that partial-success state and preserves the referenced files. With the supplied Linux layout, run the command as root with group `outboxd`, run `sudo chown -R --no-dereference outboxd:outboxd /opt/outboxd/data/openpgp` so the service can traverse and read the complete generated tree, rerun `setup.sh` to restore config ownership and mode, and restart outboxd afterward.
 
 `signing_key` accepts one armored or binary private-key entity and must contain the configured sender as a key identity plus a currently valid signing key. For an encrypted private key, set `passphrase_file` to a private file containing exactly one passphrase line. Do not put passphrases in the YAML or command line. Relative paths resolve below `server.data_directory`; absolute paths are allowed. Keys and passphrase files must be private regular files and may not be symlinks or reparse points.
 
@@ -154,7 +156,7 @@ Signing produces RFC 3156 `multipart/signed` data before DKIM is applied. The ex
 
 ## TLS Certificates
 
-Certificate deployment is intentionally left to the operator so outboxd can be used with any certificate authority or existing automation. The `outboxd` service account must be able to read both configured files. On Unix, the private key must have no group or other permission bits; use mode `0600` and ownership that permits the service account to read it. Do not weaken the key permissions to make an external certificate directory accessible. Copying or deploying certificate material into a private location such as `/var/lib/outboxd/tls` is one compatible approach, but outboxd does not prescribe or install that automation.
+Certificate deployment is intentionally left to the operator so outboxd can be used with any certificate authority or existing automation. The `outboxd` service account must be able to read both configured files. On Unix, the private key must have no group or other permission bits; use mode `0600` and ownership that permits the service account to read it. Do not weaken the key permissions to make an external certificate directory accessible. Copying or deploying certificate material into a private location such as `/opt/outboxd/data/tls` is one compatible approach, but outboxd does not prescribe or install that automation.
 
 outboxd checks the configured certificate and key during TLS handshakes, rate-limited to avoid filesystem reads on every connection. A valid changed pair is loaded automatically; no signal, systemd reload or restart is needed. If a transient read or validation failure occurs while files are replaced, outboxd continues serving the previously loaded certificate while it remains valid and retries on a later handshake. Once the old certificate expires, an invalid replacement cannot be used and affected TLS handshakes fail.
 
@@ -179,7 +181,7 @@ Operator-managed TLS files may be outside `data_directory`, subject to service s
 
 Configuration, users, DKIM and OpenPGP keys, queue limits and delivery policy are loaded at startup. Restart outboxd after changing them. TLS certificate and key contents are the only runtime-reloaded files.
 
-To remove the installed systemd and sysusers files, run `sudo /opt/outboxd/conf/uninstall.sh`. It deliberately preserves `/opt/outboxd`, `/var/lib/outboxd` and the `outboxd` account so private state retains its owner. Remove preserved state and then the account manually only when permanently decommissioning the service.
+To remove the installed systemd and sysusers links, run `sudo /opt/outboxd/conf/uninstall.sh`. It deliberately preserves `/opt/outboxd` and the `outboxd` account so private configuration and data retain their owner. Remove the preserved directory and then the account manually only when permanently decommissioning the service.
 
 Useful limits include:
 
@@ -224,16 +226,16 @@ outboxd [-config path] corrupt list
 outboxd [-config path] corrupt delete <name>
 ```
 
-Use `OUTBOXD_CONFIG` instead of `-config` to select a config path.
+The application defaults to `config.yml` in the working directory. The supplied Linux service explicitly selects `/opt/outboxd/config.yml`. Use `OUTBOXD_CONFIG` or `-config` to select a different path.
 
 `queue list`, `queue show` and `queue export` are read-only and may run while the daemon is serving. `queue retry` makes an existing message immediately due without clearing its attempt or recipient history. Retry and delete require the daemon to be stopped so they cannot race delivery. Deletion is crash-safe and refuses messages with linked DSN state.
 
-After replacing the binary, run `config update` to atomically rewrite an existing configuration in the current documented format. Configured values are retained and fields omitted by older versions receive current defaults. The command requires an existing valid configuration, does not provision keys or other assets and requires a daemon restart before the updated startup configuration takes effect. The canonical rewrite replaces custom YAML formatting and comments with outboxd's generated documentation.
+After replacing the binary, run `config update` as root with group `outboxd` to atomically rewrite an existing configuration in the current documented format, then rerun `setup.sh` to restore its service-readable ownership and mode. Configured values are retained and fields omitted by older versions receive current defaults. The command requires an existing valid configuration, does not provision keys or other assets and requires a daemon restart before the updated startup configuration takes effect. The canonical rewrite replaces custom YAML formatting and comments with outboxd's generated documentation.
 
 ## Security Notes
 
 - Use `tls.mode: files` with a publicly trusted certificate in production. `self_signed` is development-only and requires an explicit opt-in.
-- Keep the config, DKIM key, OpenPGP keys and passphrase files and data directory readable and writable only by the service account. On Windows, configure the service account and ACLs yourself.
+- Keep the config root-owned and readable only by the `outboxd` group, and keep DKIM keys, OpenPGP keys, passphrase files and the data directory readable and writable only by the service account. On Windows, configure the service account and ACLs yourself.
 - Outbound delivery defaults to verified, required TLS. Do not enable plaintext or insecure TLS unless the compatibility tradeoff is deliberate.
 - outboxd does not accept inbound message data and does not implement inbound mail storage, DANE, MTA-STS or DNSSEC validation.
 - A private local filesystem with reliable rename/sync behavior is required for the queue durability guarantees.

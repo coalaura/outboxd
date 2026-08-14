@@ -26,5 +26,5 @@ if ! systemctl reset-failed outboxd 2>/dev/null; then
     echo "Service had no failed state to reset."
 fi
 
-echo "Uninstall complete. /opt/outboxd and /var/lib/outboxd were preserved."
+echo "Uninstall complete. /opt/outboxd, including its config and data, was preserved."
 echo "The outboxd account was retained so preserved private state keeps a valid owner."

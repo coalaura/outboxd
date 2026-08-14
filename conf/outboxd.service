@@ -10,21 +10,20 @@ Type=simple
 User=outboxd
 Group=outboxd
 
-WorkingDirectory=/var/lib/outboxd
-ExecStart=/opt/outboxd/outboxd -config /var/lib/outboxd/config.yml serve
+WorkingDirectory=/opt/outboxd
+ExecStart=/opt/outboxd/outboxd -config /opt/outboxd/config.yml serve
 
 StandardOutput=journal
 StandardError=journal
 StandardInput=null
 
-# systemd creates /var/lib/outboxd for the service account. It contains the
-# private config, DKIM and OpenPGP keys/passphrases, spool, generated DNS output,
-# and any generated development TLS assets.
-StateDirectory=outboxd
-StateDirectoryMode=0700
+# setup.sh creates /opt/outboxd/data for the service account. It contains DKIM
+# and OpenPGP keys/passphrases, spool, generated DNS output, and any generated
+# development TLS assets. The root-owned config is read-only to the service.
 
 # Filesystem Sandboxing
 ProtectSystem=strict
+ReadWritePaths=/opt/outboxd/data /opt/outboxd/config.yml.outboxd.lock
 ProtectHome=yes
 PrivateTmp=yes
 PrivateMounts=yes
