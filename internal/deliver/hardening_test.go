@@ -1263,17 +1263,37 @@ func TestRunQuarantinesCorruptBodyAndContinues(t *testing.T) {
 		t.Fatal("healthy delivery was blocked by corrupt queue item")
 	}
 
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 
-	for q.Len() != 0 && time.Now().Before(deadline) {
+	var quarantined bool
+
+	for time.Now().Before(deadline) {
+		ids, listErr := q.CorruptIDs()
+		if listErr != nil {
+			cancel()
+			<-done
+
+			t.Fatal(listErr)
+		}
+
+		messages, _ := q.Stats()
+		if len(ids) == 1 && messages == 0 {
+			quarantined = true
+
+			break
+		}
+
 		time.Sleep(time.Millisecond)
 	}
 
-	if q.Len() != 0 {
+	if !quarantined {
 		cancel()
 		<-done
 
-		t.Fatalf("queue length=%d after healthy completion and quarantine", q.Len())
+		ids, _ := q.CorruptIDs()
+		messages, _ := q.Stats()
+
+		t.Fatalf("queue messages=%d corrupt entries=%v after healthy completion and quarantine", messages, ids)
 	}
 
 	select {
