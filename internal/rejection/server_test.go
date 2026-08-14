@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +18,30 @@ type testLogger struct{}
 func (testLogger) Printf(string, ...any) {}
 
 func (testLogger) Println(...any) {}
+
+type captureLogger struct {
+	mu  sync.Mutex
+	out strings.Builder
+}
+
+func (l *captureLogger) Printf(format string, values ...any) {
+	l.mu.Lock()
+	fmt.Fprintf(&l.out, format, values...)
+	l.mu.Unlock()
+}
+
+func (l *captureLogger) Println(values ...any) {
+	l.mu.Lock()
+	fmt.Fprintln(&l.out, values...)
+	l.mu.Unlock()
+}
+
+func (l *captureLogger) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.out.String()
+}
 
 func testServer(t *testing.T, mode string) (*Server, context.CancelFunc, <-chan error) {
 	t.Helper()
@@ -146,6 +171,87 @@ func TestAllModeUsesDefaultForUnknownRecipient(t *testing.T) {
 
 	if got := smtpCommand(t, srv, "unknown@example.com"); got != "550 5.1.1 This address does not accept replies" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestRecipientRejectionsAreLogged(t *testing.T) {
+	cfg := config.Default()
+
+	cfg.Server.Hostname = "mail.example.com"
+	cfg.ReplyRejection.Enabled = true
+	cfg.ReplyRejection.UnknownRecipients = "listed_only"
+	cfg.ReplyRejection.Domains = []string{"example.com"}
+	cfg.ReplyRejection.DefaultMessage = "This address does not accept replies"
+	cfg.ReplyRejection.Recipients = []config.ReplyRejectionRecipient{{Address: "noreply@example.com"}}
+
+	log := new(captureLogger)
+
+	s := &session{server: New(cfg, log), remoteIP: "192.0.2.10"}
+
+	err := s.Mail("sender@example.net", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		recipient string
+		reason    string
+	}{
+		{"invalid", "invalid recipient address"},
+		{"user@elsewhere.example", "relaying denied"},
+		{"noreply@example.com", "configured recipient"},
+		{"unknown@example.com", "recipient does not exist"},
+	}
+
+	for _, test := range tests {
+		err = s.Rcpt(test.recipient, nil)
+		if err == nil {
+			t.Fatalf("Rcpt(%q) succeeded", test.recipient)
+		}
+	}
+
+	want := ""
+
+	for _, test := range tests {
+		want += fmt.Sprintf("Reply rejection from %q sender %q recipient %q: %s\n", "192.0.2.10", "sender@example.net", test.recipient, test.reason)
+	}
+
+	if got := log.String(); got != want {
+		t.Fatalf("log:\n%s\nwant:\n%s", got, want)
+	}
+
+	s.Reset()
+
+	err = s.Rcpt("unknown@example.com", nil)
+	if err == nil {
+		t.Fatal("Rcpt after reset succeeded")
+	}
+
+	if got := log.String(); !strings.HasSuffix(got, "sender \"\" recipient \"unknown@example.com\": recipient does not exist\n") {
+		t.Fatalf("reset did not clear sender in log: %s", got)
+	}
+}
+
+func TestAllModeRejectionIsLogged(t *testing.T) {
+	cfg := config.Default()
+
+	cfg.Server.Hostname = "mail.example.com"
+	cfg.ReplyRejection.Enabled = true
+	cfg.ReplyRejection.UnknownRecipients = "all"
+	cfg.ReplyRejection.Domains = []string{"example.com"}
+	cfg.ReplyRejection.DefaultMessage = "This address does not accept replies"
+
+	log := new(captureLogger)
+
+	s := &session{server: New(cfg, log), remoteIP: "192.0.2.10"}
+
+	err := s.Rcpt("unknown@example.com", nil)
+	if err == nil {
+		t.Fatal("Rcpt succeeded")
+	}
+
+	if got := log.String(); !strings.Contains(got, "recipient \"unknown@example.com\": default rejection\n") {
+		t.Fatalf("log=%q", got)
 	}
 }
 

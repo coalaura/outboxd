@@ -43,7 +43,9 @@ type Server struct {
 }
 
 type session struct {
-	server *Server
+	server   *Server
+	remoteIP string
+	sender   string
 }
 
 type connectionLimiter struct {
@@ -134,8 +136,8 @@ func New(cfg *config.Config, log Logger) *Server {
 		s.recipients[strings.ToLower(recipient.Address)] = message
 	}
 
-	s.smtp = smtp.NewServer(smtp.BackendFunc(func(*smtp.Conn) (smtp.Session, error) {
-		return &session{server: s}, nil
+	s.smtp = smtp.NewServer(smtp.BackendFunc(func(conn *smtp.Conn) (smtp.Session, error) {
+		return &session{server: s, remoteIP: connectionIP(conn.Conn().RemoteAddr())}, nil
 	}))
 
 	s.smtp.Domain = s.hostname
@@ -298,41 +300,51 @@ func (c *protocolConn) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func (s *session) Mail(string, *smtp.MailOptions) error {
+func (s *session) Mail(from string, _ *smtp.MailOptions) error {
+	s.sender = from
+
 	return nil
 }
 
 func (s *session) Rcpt(to string, _ *smtp.RcptOptions) error {
 	address, err := mailbox.Address(to)
 	if err != nil {
-		return smtpError(550, smtp.EnhancedCode{5, 1, 3}, "Invalid recipient address")
+		return s.reject(to, smtp.EnhancedCode{5, 1, 3}, "Invalid recipient address", "invalid recipient address")
 	}
 
 	domain, err := mailbox.DomainOf(address)
 	if err != nil {
-		return smtpError(550, smtp.EnhancedCode{5, 1, 3}, "Invalid recipient address")
+		return s.reject(to, smtp.EnhancedCode{5, 1, 3}, "Invalid recipient address", "invalid recipient address")
 	}
 
 	if _, ok := s.server.domains[domain]; !ok {
-		return smtpError(550, smtp.EnhancedCode{5, 7, 1}, "Relaying denied")
+		return s.reject(address, smtp.EnhancedCode{5, 7, 1}, "Relaying denied", "relaying denied")
 	}
 
 	if message, ok := s.server.recipients[strings.ToLower(address)]; ok {
-		return smtpError(550, smtp.EnhancedCode{5, 1, 1}, message)
+		return s.reject(address, smtp.EnhancedCode{5, 1, 1}, message, "configured recipient")
 	}
 
 	if s.server.cfg.UnknownRecipients == "all" {
-		return smtpError(550, smtp.EnhancedCode{5, 1, 1}, s.server.cfg.DefaultMessage)
+		return s.reject(address, smtp.EnhancedCode{5, 1, 1}, s.server.cfg.DefaultMessage, "default rejection")
 	}
 
-	return smtpError(550, smtp.EnhancedCode{5, 1, 1}, "Recipient does not exist")
+	return s.reject(address, smtp.EnhancedCode{5, 1, 1}, "Recipient does not exist", "recipient does not exist")
+}
+
+func (s *session) reject(to string, enhanced smtp.EnhancedCode, message, reason string) error {
+	s.server.log.Printf("Reply rejection from %q sender %q recipient %q: %s\n", s.remoteIP, s.sender, to, reason)
+
+	return smtpError(550, enhanced, message)
 }
 
 func (*session) Data(r io.Reader) error {
 	return smtpError(554, smtp.EnhancedCode{5, 5, 1}, "Message data is not accepted")
 }
 
-func (*session) Reset() {}
+func (s *session) Reset() {
+	s.sender = ""
+}
 
 func (*session) Logout() error {
 	return nil
