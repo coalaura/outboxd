@@ -34,6 +34,7 @@ jobs:
           cache: true
 
       - name: Validate stable SemVer tag and commit
+        if: ${{ !env.ACT }}
         shell: bash
         run: |
           set -euo pipefail
