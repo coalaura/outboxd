@@ -276,9 +276,9 @@ printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || fail "latest rele
 version=${tag#v}
 
 version_supported=$(printf '%s\n' "$version" | awk -F. '{
-    if ($1 > 0 || ($1 == 0 && ($2 > 2 || ($2 == 2 && $3 >= 2)))) print "yes"
+    if ($1 > 0 || ($1 == 0 && ($2 > 2 || ($2 == 2 && $3 >= 1)))) print "yes"
 }')
-[ "$version_supported" = yes ] || fail "guided installation requires outboxd v0.2.2 or newer; latest is $tag"
+[ "$version_supported" = yes ] || fail "guided installation requires outboxd v0.2.1 or newer; latest is $tag"
 
 archive="outboxd_${version}_linux_${architecture}.tar.gz"
 archive_base=${archive%.tar.gz}
