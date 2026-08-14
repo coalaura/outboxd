@@ -2,6 +2,24 @@
 
 set -euo pipefail
 
+enable_service=true
+case "$#" in
+    0)
+        ;;
+    1)
+        if [ "$1" != "--no-enable" ]; then
+            echo "usage: setup.sh [--no-enable]" >&2
+            exit 1
+        fi
+
+        enable_service=false
+        ;;
+    *)
+        echo "usage: setup.sh [--no-enable]" >&2
+        exit 1
+        ;;
+esac
+
 if [ "${EUID}" -ne 0 ]; then
     echo "setup.sh must be run as root" >&2
     exit 1
@@ -14,13 +32,23 @@ config_lock=$config_file.outboxd.lock
 sysusers_file=/usr/lib/sysusers.d/outboxd.conf
 service_file=/etc/systemd/system/outboxd.service
 
-if [ -L "$payload" ] || [ -L "$payload/conf" ]; then
+if [ -L "$payload" ]; then
+    echo "payload and conf directory must not be symlinks" >&2
+    exit 1
+fi
+
+if [ -L "$payload/conf" ]; then
     echo "payload and conf directory must not be symlinks" >&2
     exit 1
 fi
 
 for file in outboxd conf/outboxd.conf conf/outboxd.service conf/setup.sh conf/uninstall.sh; do
-    if [ -L "$payload/$file" ] || [ ! -f "$payload/$file" ]; then
+    if [ -L "$payload/$file" ]; then
+        echo "missing payload file: $payload/$file" >&2
+        exit 1
+    fi
+
+    if [ ! -f "$payload/$file" ]; then
         echo "missing payload file: $payload/$file" >&2
         exit 1
     fi
@@ -33,8 +61,20 @@ fi
 
 # The linked system files are trusted by root, so their source hierarchy must
 # not be replaceable by the service account.
-chown root:root "$payload" "$payload/outboxd" "$payload/conf" "$payload/conf/outboxd.conf" "$payload/conf/outboxd.service" "$payload/conf/setup.sh" "$payload/conf/uninstall.sh"
-chmod 0755 "$payload" "$payload/outboxd" "$payload/conf" "$payload/conf/setup.sh" "$payload/conf/uninstall.sh"
+chown root:root \
+    "$payload" \
+    "$payload/outboxd" \
+    "$payload/conf" \
+    "$payload/conf/outboxd.conf" \
+    "$payload/conf/outboxd.service" \
+    "$payload/conf/setup.sh" \
+    "$payload/conf/uninstall.sh"
+chmod 0755 \
+    "$payload" \
+    "$payload/outboxd" \
+    "$payload/conf" \
+    "$payload/conf/setup.sh" \
+    "$payload/conf/uninstall.sh"
 chmod 0644 "$payload/conf/outboxd.conf" "$payload/conf/outboxd.service"
 
 echo "Installing sysusers config..."
@@ -54,15 +94,27 @@ systemd-sysusers "$sysusers_file"
 
 echo "Preparing private data directory..."
 
-if [ -L "$data_directory" ] || { [ -e "$data_directory" ] && [ ! -d "$data_directory" ]; }; then
+if [ -L "$data_directory" ]; then
     echo "data path must be a directory and not a symlink: $data_directory" >&2
     exit 1
+fi
+
+if [ -e "$data_directory" ]; then
+    if [ ! -d "$data_directory" ]; then
+        echo "data path must be a directory and not a symlink: $data_directory" >&2
+        exit 1
+    fi
 fi
 
 install -d -o outboxd -g outboxd -m 0700 "$data_directory"
 
 if [ -e "$config_file" ]; then
-    if [ -L "$config_file" ] || [ ! -f "$config_file" ]; then
+    if [ -L "$config_file" ]; then
+        echo "config must be a regular file: $config_file" >&2
+        exit 1
+    fi
+
+    if [ ! -f "$config_file" ]; then
         echo "config must be a regular file: $config_file" >&2
         exit 1
     fi
@@ -72,7 +124,12 @@ if [ -e "$config_file" ]; then
 fi
 
 if [ -e "$config_lock" ]; then
-    if [ -L "$config_lock" ] || [ ! -f "$config_lock" ]; then
+    if [ -L "$config_lock" ]; then
+        echo "config ownership lock must be a regular file: $config_lock" >&2
+        exit 1
+    fi
+
+    if [ ! -f "$config_lock" ]; then
         echo "config ownership lock must be a regular file: $config_lock" >&2
         exit 1
     fi
@@ -90,8 +147,16 @@ ln -s "$payload/conf/outboxd.service" "$service_file"
 
 echo "Reloading daemon..."
 systemctl daemon-reload
-systemctl enable outboxd
-systemctl try-restart outboxd
+if [ "$enable_service" = true ]; then
+    systemctl enable outboxd
+    systemctl try-restart outboxd
+else
+    # disable removes linked unit files, so restore the canonical link afterward.
+    systemctl disable --now outboxd
+    rm -f "$service_file"
+    ln -s "$payload/conf/outboxd.service" "$service_file"
+    systemctl daemon-reload
+fi
 
 echo "Setup complete. Create and edit the private configuration, then provision and start the service:"
 echo "  sudo -g outboxd /opt/outboxd/outboxd -config /opt/outboxd/config.yml provision"
