@@ -187,6 +187,7 @@ jobs:
           fi
 
       - name: Upload archive
+        if: ${{ !env.ACT }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ env.project_name }}_${{ matrix.goos }}_${{ matrix.goarch }}
@@ -204,6 +205,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout immutable release commit
+        if: ${{ !env.ACT }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -211,6 +213,7 @@ jobs:
           ref: ${{ github.sha }}
 
       - name: Download archives
+        if: ${{ !env.ACT }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: ${{ env.project_name }}_*
@@ -218,6 +221,7 @@ jobs:
           merge-multiple: true
 
       - name: Generate and verify checksums
+        if: ${{ !env.ACT }}
         shell: bash
         working-directory: release
         run: |
@@ -237,6 +241,7 @@ jobs:
           sha256sum --check --strict SHA256SUMS
 
       - name: Revalidate remote tag before draft
+        if: ${{ !env.ACT }}
         shell: bash
         run: |
           set -euo pipefail
@@ -252,6 +257,7 @@ jobs:
           printf '%s\n' "${remote[@]}" | grep -Fx "$commit"$'\t'"${tag_ref}^{}"
 
       - name: Create draft release
+        if: ${{ !env.ACT }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -266,6 +272,7 @@ jobs:
           touch .release-draft-created
 
       - name: Upload exact release assets
+        if: ${{ !env.ACT }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -282,6 +289,7 @@ jobs:
             release/SHA256SUMS
 
       - name: Verify uploaded release assets
+        if: ${{ !env.ACT }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -307,6 +315,7 @@ jobs:
           (cd verified && sha256sum --check --strict SHA256SUMS)
 
       - name: Revalidate remote tag before publication
+        if: ${{ !env.ACT }}
         shell: bash
         run: |
           set -euo pipefail
@@ -322,13 +331,14 @@ jobs:
           printf '%s\n' "${remote[@]}" | grep -Fx "$commit"$'\t'"${tag_ref}^{}"
 
       - name: Publish verified release
+        if: ${{ !env.ACT }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
 
       - name: Delete failed draft
-        if: ${{ failure() || cancelled() }}
+        if: ${{ !env.ACT && (failure() || cancelled()) }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
