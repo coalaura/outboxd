@@ -183,29 +183,54 @@ func TestCanonicalizeValidatesContentTransferEncodingBeforeFastPaths(t *testing.
 }
 
 func TestCanonicalizeContentTransferEncodingMatrix(t *testing.T) {
-	for _, encoding := range []string{"", "7bit", "8bit", "binary", "base64", "quoted-printable"} {
+	leafEncodings := map[string]string{
+		"":                 "",
+		"7bit":             "7bit",
+		"8bit":             "7bit",
+		"binary":           "7bit",
+		"base64":           "base64",
+		"quoted-printable": "quoted-printable",
+	}
+
+	for encoding, expected := range leafEncodings {
 		head := ""
 
 		if encoding != "" {
 			head = "Content-Transfer-Encoding: " + encoding + "\r\n"
 		}
 
-		_, err := canonicalizeEntity([]byte(head+"\r\nhello\r\n"), config.MaxMessageBytes)
+		canonical, err := canonicalizeEntity([]byte(head+"\r\nhello\r\n"), config.MaxMessageBytes)
 		if err != nil {
 			t.Errorf("leaf encoding %q rejected: %v", encoding, err)
+
+			continue
+		}
+
+		canonicalHead := canonical[:bytes.Index(canonical, []byte("\r\n\r\n"))+2]
+		if got := headerValue(canonicalHead, "content-transfer-encoding"); got != expected {
+			t.Errorf("leaf encoding %q canonicalized to %q, want %q", encoding, got, expected)
 		}
 	}
 
-	for _, encoding := range []string{"", "7bit", "8bit", "binary"} {
+	multipartEncodings := map[string]string{"": "", "7bit": "7bit", "8bit": "7bit", "binary": "7bit"}
+
+	for encoding, expected := range multipartEncodings {
 		head := "Content-Type: multipart/mixed; boundary=x\r\n"
 
 		if encoding != "" {
 			head += "Content-Transfer-Encoding: " + encoding + "\r\n"
 		}
 
-		_, err := canonicalizeEntity([]byte(head+"\r\n--x--\r\n"), config.MaxMessageBytes)
+		canonical, err := canonicalizeEntity([]byte(head+"\r\n--x--\r\n"), config.MaxMessageBytes)
 		if err != nil {
 			t.Errorf("multipart encoding %q rejected: %v", encoding, err)
+
+			continue
+		}
+
+		canonicalHead := canonical[:bytes.Index(canonical, []byte("\r\n\r\n"))+2]
+		if got := headerValue(canonicalHead, "content-transfer-encoding"); got != expected {
+			t.Errorf("multipart encoding %q canonicalized to %q, want %q", encoding, got, expected)
 		}
 	}
 }

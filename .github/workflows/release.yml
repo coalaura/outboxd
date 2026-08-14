@@ -158,16 +158,16 @@ jobs:
           while read -r module module_version; do
             [[ -n "$module" && -n "$module_version" ]]
             module_dir="$(go list -m -f '{{.Dir}}' "${module}@${module_version}")"
-            archive_name="${module//\//__}@${module_version}.txt"
+            archive_name="${module//\//__}@${module_version}"
             printf '%s\t%s\n' "$module" "$module_version" >> "${licenses}/MODULES.txt"
-            if [[ -f "${module_dir}/LICENSE" ]]; then
-              cp "${module_dir}/LICENSE" "${licenses}/${archive_name}"
-            elif [[ "$module" == github.com/coalaura/atom ]]; then
-              printf '%s\n' 'Distributed with permission of its copyright owner; no separate license file is published in this module version.' > "${licenses}/${archive_name}"
-            else
-              echo "Linked module ${module}@${module_version} has no LICENSE file" >&2
-              exit 1
-            fi
+            for notice in \
+              "${module_dir}"/LICENSE "${module_dir}"/LICENSE.* \
+              "${module_dir}"/COPYING "${module_dir}"/COPYING.* \
+              "${module_dir}"/NOTICE "${module_dir}"/NOTICE.*; do
+              if [[ -f "$notice" ]]; then
+                cp "$notice" "${licenses}/${archive_name}__${notice##*/}"
+              fi
+            done
           done < <(go list -deps -f '{{with .Module}}{{if not .Main}}{{.Path}} {{.Version}}{{end}}{{end}}' . | sed '/^$/d' | sort -u)
 
           if [[ "$GOOS" == "linux" ]]; then
@@ -328,7 +328,7 @@ jobs:
         run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
 
       - name: Delete failed draft
-        if: ${{ failure() }}
+        if: ${{ failure() || cancelled() }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

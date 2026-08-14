@@ -461,6 +461,13 @@ func canonicalizeEntityContext(ctx context.Context, data []byte, maximum int64, 
 		return nil, err
 	}
 
+	if encoding == "8bit" || encoding == "binary" {
+		head, err = replaceHeader(head, "Content-Transfer-Encoding", "7bit")
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if multipart {
 		boundary := params["boundary"]
 		if boundary == "" {
@@ -482,7 +489,7 @@ func canonicalizeEntityContext(ctx context.Context, data []byte, maximum int64, 
 	}
 
 	if isSevenBit(body) {
-		return data, nil
+		return joinEntity(head, body), nil
 	}
 
 	if encoding == "base64" || encoding == "quoted-printable" {
