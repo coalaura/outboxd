@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -51,12 +52,21 @@ func validateConfigPermissions(info os.FileInfo) error {
 		return nil
 	}
 
-	stat, ok := info.Sys().(*unix.Stat_t)
-	if !ok || stat.Uid != 0 || permissions != 0440 || !processHasGroup(int(stat.Gid)) {
+	uid, gid, ok := configFileOwner(info)
+	if !ok || uid != 0 || permissions != 0440 || !processHasGroup(gid) {
 		return fmt.Errorf("permissions %04o allow group or other access", permissions)
 	}
 
 	return nil
+}
+
+func configFileOwner(info os.FileInfo) (uint32, int, bool) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, false
+	}
+
+	return stat.Uid, int(stat.Gid), true
 }
 
 func processHasGroup(gid int) bool {
