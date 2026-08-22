@@ -16,6 +16,12 @@ import (
 
 // Validate validates all config options.
 func (cfg *Config) Validate() error {
+	switch cfg.LogLevel {
+	case "debug", "print", "warn", "error":
+	default:
+		return fmt.Errorf("log_level must be debug, print, warn or error, got %q", cfg.LogLevel)
+	}
+
 	err := validateDomain("server.hostname", cfg.Server.Hostname)
 	if err != nil {
 		return err

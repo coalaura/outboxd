@@ -161,6 +161,7 @@ func (cfg *Config) adopt(other *Config) {
 	cfg.dataMu.Lock()
 	defer cfg.dataMu.Unlock()
 
+	cfg.LogLevel = other.LogLevel
 	cfg.Server = other.Server
 	cfg.ReplyRejection = other.ReplyRejection
 	cfg.TLS = other.TLS

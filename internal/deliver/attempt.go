@@ -13,6 +13,8 @@ import (
 func (d *Deliverer) attempt(ctx context.Context, envelope *queue.Envelope) error {
 	owner := deliveryOwner(envelope)
 	if !d.users.tryAcquire(owner) {
+		d.debugf("delivery %s waiting %s for user capacity\n", envelope.ID, d.admission)
+
 		envelope.NextAttempt = time.Now().Add(d.admission)
 
 		err := d.queue.Retry(envelope)
@@ -84,6 +86,14 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 
 	envelope.Attempts++
 	envelope.LastError = ""
+
+	attemptStarted := time.Now()
+
+	d.debugf("delivery %s attempt %d started: pending=%d age=%s\n", envelope.ID, envelope.Attempts, envelope.Pending(), time.Since(envelope.Created).Round(time.Millisecond))
+
+	defer func() {
+		d.debugf("delivery %s attempt %d finished in %s\n", envelope.ID, envelope.Attempts, time.Since(attemptStarted).Round(time.Millisecond))
+	}()
 
 	groups := make(map[string][]int, len(envelope.Recipients))
 	groupOrder := make([]string, 0, len(envelope.Recipients))

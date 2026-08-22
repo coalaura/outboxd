@@ -3,13 +3,19 @@ package deliver
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/coalaura/outboxd/internal/queue"
 )
 
 func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain string, indexes []int) error {
+	lookupStarted := time.Now()
 	hosts, err := d.hosts(ctx, domain)
+	lookupElapsed := time.Since(lookupStarted).Round(time.Millisecond)
+
 	if err != nil {
+		d.debugf("delivery %s MX lookup for %s failed in %s\n", envelope.ID, domain, lookupElapsed)
+
 		if errors.Is(err, errNullMX) || errors.Is(err, errNoSuchDomain) {
 			d.reject(envelope, indexes, err.Error())
 
@@ -18,6 +24,8 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 
 		return err
 	}
+
+	d.debugf("delivery %s MX lookup for %s returned %d host(s) in %s\n", envelope.ID, domain, len(hosts), lookupElapsed)
 
 	var (
 		last              error
@@ -34,10 +42,14 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 		}
 
 		// Hold global only around MX I/O.
+		globalStarted := time.Now()
+
 		err = d.acquireGlobal(ctx)
 		if err != nil {
 			return err
 		}
+
+		d.debugf("delivery %s acquired global capacity for %s in %s\n", envelope.ID, host, time.Since(globalStarted).Round(time.Millisecond))
 
 		done, err := d.send(ctx, envelope, host, indexes)
 

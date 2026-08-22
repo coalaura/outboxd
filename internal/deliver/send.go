@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/coalaura/outboxd/internal/queue"
 )
 
 func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host string, indexes []int) (bool, error) {
+	started := time.Now()
 	client, err := d.connect(ctx, host, !envelope.SMTPUTF8 && !envelope.EightBit)
 	if err != nil {
 		return false, err
@@ -36,11 +38,13 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 		}
 	}
 
+	mailStarted := time.Now()
 	err = client.Mail(envelope.Sender, MailOpts{
 		Size:     envelope.Size,
 		UTF8:     envelope.SMTPUTF8,
 		EightBit: envelope.EightBit,
 	})
+	mailElapsed := time.Since(mailStarted).Round(time.Millisecond)
 
 	if err != nil {
 		if errors.Is(err, errSMTPUTF8Unsupported) || errors.Is(err, err8BITMIMEUnsupported) {
@@ -60,6 +64,8 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 
 	accepted := make([]int, 0, len(indexes))
 	temporary := make([]string, 0, len(indexes))
+
+	rcptStarted := time.Now()
 
 	for _, index := range indexes {
 		recipient := &envelope.Recipients[index]
@@ -85,6 +91,8 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 		temporary = append(temporary, fmt.Sprintf("%s: %s", recipient.Address, recipient.Detail))
 	}
 
+	rcptElapsed := time.Since(rcptStarted).Round(time.Millisecond)
+
 	if len(accepted) == 0 {
 		_ = client.Quit()
 
@@ -102,14 +110,20 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 		}
 	}
 
+	bodyStarted := time.Now()
 	reader, err := openReader(envelope.ID)
+	bodyElapsed := time.Since(bodyStarted).Round(time.Millisecond)
+
 	if err != nil {
 		return false, err
 	}
 
 	defer reader.Close()
 
+	dataStarted := time.Now()
 	dw, err := client.Data()
+	dataElapsed := time.Since(dataStarted).Round(time.Millisecond)
+
 	if err != nil {
 		if permanent(err) {
 			d.rejectSMTP(envelope, accepted, err)
@@ -120,7 +134,10 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 		return false, err
 	}
 
+	writeStarted := time.Now()
 	written, err := io.Copy(dw, io.LimitReader(reader, envelope.Size+1))
+	writeElapsed := time.Since(writeStarted).Round(time.Millisecond)
+
 	if err != nil {
 		// Closing DotWriter emits the DATA terminator. Abort the transport instead.
 		_ = client.Close()
@@ -140,7 +157,10 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 		return false, fmt.Errorf("%w: got at least %d, want %d", errBodyTooLong, written, envelope.Size)
 	}
 
+	replyStarted := time.Now()
 	err = dw.Close()
+	replyElapsed := time.Since(replyStarted).Round(time.Millisecond)
+
 	if err != nil {
 		if permanent(err) {
 			d.rejectSMTP(envelope, accepted, err)
@@ -159,7 +179,11 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 		recipient.Detail = normalizeDiagnostic(fmt.Sprintf("%s: %s", host, reply))
 	}
 
+	quitStarted := time.Now()
 	_ = client.Quit()
+	quitElapsed := time.Since(quitStarted).Round(time.Millisecond)
+
+	d.debugf("delivery %s SMTP transaction with %s completed: recipients=%d bytes=%d mail=%s rcpt=%s body_open=%s data=%s body_write=%s data_reply=%s quit=%s total=%s\n", envelope.ID, host, len(indexes), written, mailElapsed, rcptElapsed, bodyElapsed, dataElapsed, writeElapsed, replyElapsed, quitElapsed, time.Since(started).Round(time.Millisecond))
 
 	if len(temporary) > 0 {
 		return false, fmt.Errorf("temporary RCPT failures: %s", strings.Join(temporary, "; "))

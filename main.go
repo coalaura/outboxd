@@ -25,6 +25,19 @@ var log = plain.New(plain.WithDate(plain.RFC3339Local))
 
 var Version = "dev"
 
+func configuredLogLevel(level string) plain.Level {
+	switch level {
+	case "debug":
+		return plain.LevelDebug
+	case "warn":
+		return plain.LevelWarn
+	case "error":
+		return plain.LevelError
+	default:
+		return plain.LevelPrint
+	}
+}
+
 func main() {
 	configPath, showVersion, args := parseGlobalFlags(os.Args[1:])
 

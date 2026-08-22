@@ -11,6 +11,7 @@ type Config struct {
 
 	userLookup map[string]*User
 
+	LogLevel       string         `yaml:"log_level"`
 	Server         Server         `yaml:"server"`
 	ReplyRejection ReplyRejection `yaml:"reply_rejection"`
 	TLS            TLS            `yaml:"tls"`

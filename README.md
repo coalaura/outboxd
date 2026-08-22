@@ -189,6 +189,8 @@ Operator-managed TLS files may be outside `data_directory`, subject to service s
 
 Configuration, users, DKIM and OpenPGP keys, queue limits and delivery policy are loaded at startup. Restart outboxd after changing them. TLS certificate and key contents are the only runtime-reloaded files.
 
+The top-level `log_level` setting accepts `debug`, `print`, `warn` or `error` and defaults to `print`. Debug logging includes detailed outbound delivery timings and is intended for development and troubleshooting.
+
 To remove the installed systemd and sysusers links, run `sudo /opt/outboxd/conf/uninstall.sh`. It deliberately preserves `/opt/outboxd` and the `outboxd` account so private configuration and data retain their owner. Remove the preserved directory and then the account manually only when permanently decommissioning the service.
 
 Useful limits include:

@@ -34,6 +34,10 @@ func serve(configPath string) error {
 
 	defer ownership.Close()
 
+	log.SetLevel(configuredLogLevel(cfg.LogLevel))
+
+	log.Debugf("Debug logging enabled\n")
+
 	for _, warning := range cfg.Warnings() {
 		log.Warnln(warning)
 	}

@@ -6,6 +6,10 @@ import (
 )
 
 func (cfg *Config) applyDefaults() {
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "print"
+	}
+
 	if !slices.ContainsFunc(cfg.DKIM.Headers, func(header string) bool {
 		return strings.EqualFold(strings.TrimSpace(header), "Sender")
 	}) {
@@ -38,6 +42,7 @@ func Default() *Config {
 	var allowPlain bool
 
 	return &Config{
+		LogLevel: "print",
 		Server: Server{
 			Hostname:                "mail.example.invalid",
 			Domain:                  "example.invalid",

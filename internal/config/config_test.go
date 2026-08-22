@@ -171,6 +171,10 @@ users:
 		t.Fatalf("MaxConnections default %d", cfg.Server.MaxConnections)
 	}
 
+	if cfg.LogLevel != "print" {
+		t.Fatalf("LogLevel default %q", cfg.LogLevel)
+	}
+
 	if cfg.Server.AuthWorkers != 4 {
 		t.Fatalf("AuthWorkers %d", cfg.Server.AuthWorkers)
 	}
@@ -202,6 +206,30 @@ users:
 
 	if cfg.Delivery.UserConcurrency != 2 || cfg.Delivery.DNSTimeout != "30s" || cfg.Delivery.AttemptTimeout != "30m" || cfg.Delivery.MaxMXCandidates != 10 || cfg.Delivery.MaxIPCandidatesPerMX != 8 {
 		t.Fatalf("delivery work defaults: %+v", cfg.Delivery)
+	}
+}
+
+func TestLogLevelValidationAndCanonicalization(t *testing.T) {
+	cfg := Default()
+
+	cfg.LogLevel = " DEBUG "
+
+	cfg.canonicalize()
+
+	if cfg.LogLevel != "debug" {
+		t.Fatalf("canonical LogLevel=%q", cfg.LogLevel)
+	}
+
+	err := cfg.Validate()
+	if err != nil {
+		t.Fatalf("valid log level failed validation: %v", err)
+	}
+
+	cfg.LogLevel = "verbose"
+
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "log_level") {
+		t.Fatalf("invalid log level error=%v", err)
 	}
 }
 
@@ -723,6 +751,7 @@ func TestGeneratedAuthCommentsDocumentAuditedBounds(t *testing.T) {
 	}
 
 	for _, want := range []string{
+		`minimum log level: "debug", "print", "warn", or "error"`,
 		"19 MiB each; maximum 8, 152 MiB total",
 		"migration hashes must use m=19456,t=2,p=1, a 16-byte salt, and a 32-byte output",
 	} {
@@ -732,18 +761,23 @@ func TestGeneratedAuthCommentsDocumentAuditedBounds(t *testing.T) {
 	}
 }
 
-func TestAdoptIncludesReplyRejection(t *testing.T) {
+func TestAdoptIncludesTopLevelSettings(t *testing.T) {
 	cfg := Default()
 
 	cfg.initializeRuntime()
 
 	other := Default()
 
+	other.LogLevel = "debug"
 	other.ReplyRejection.Enabled = true
 	other.ReplyRejection.Domains = []string{"example.com"}
 	other.ReplyRejection.Recipients = []ReplyRejectionRecipient{{Address: "noreply@example.com"}}
 
 	cfg.adopt(other)
+
+	if cfg.LogLevel != "debug" {
+		t.Fatalf("log level not adopted: %q", cfg.LogLevel)
+	}
 
 	if !cfg.ReplyRejection.Enabled || len(cfg.ReplyRejection.Domains) != 1 || cfg.ReplyRejection.Domains[0] != "example.com" || len(cfg.ReplyRejection.Recipients) != 1 || cfg.ReplyRejection.Recipients[0].Address != "noreply@example.com" {
 		t.Fatalf("reply rejection not adopted: %+v", cfg.ReplyRejection)

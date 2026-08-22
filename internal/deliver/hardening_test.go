@@ -67,6 +67,10 @@ func (l *captureLog) Printf(format string, values ...any) {
 	fmt.Fprintf(&l.lines, format, values...)
 }
 
+func (l *captureLog) Debugf(format string, values ...any) {
+	l.Printf(format, values...)
+}
+
 func (l *captureLog) Println(values ...any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -79,6 +83,18 @@ func (l *captureLog) String() string {
 	defer l.mu.Unlock()
 
 	return l.lines.String()
+}
+
+func TestOptionalDebugLogger(t *testing.T) {
+	logger := new(captureLog)
+
+	deliverer := &Deliverer{log: logger}
+
+	deliverer.debugf("delivery timing: %s\n", time.Second)
+
+	if got := logger.String(); got != "delivery timing: 1s\n" {
+		t.Fatalf("debug log=%q", got)
+	}
 }
 
 func servePlainSMTP(conn net.Conn, accepted chan<- struct{}, dataBytes chan<- string) {

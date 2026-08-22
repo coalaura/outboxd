@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/coalaura/plain"
+
 	"github.com/coalaura/outboxd/internal/config"
 	"github.com/coalaura/outboxd/internal/disk"
 	"github.com/coalaura/outboxd/internal/passwd"
@@ -70,6 +72,19 @@ func TestParseGlobalVersionFlagPreservesCommands(t *testing.T) {
 	}
 }
 
+func TestConfiguredLogLevel(t *testing.T) {
+	for value, want := range map[string]plain.Level{
+		"debug": plain.LevelDebug,
+		"print": plain.LevelPrint,
+		"warn":  plain.LevelWarn,
+		"error": plain.LevelError,
+	} {
+		if got := configuredLogLevel(value); got != want {
+			t.Errorf("configuredLogLevel(%q)=%v want %v", value, got, want)
+		}
+	}
+}
+
 func TestConfigUpdatePreservesValuesAndAddsDefaults(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
@@ -120,7 +135,7 @@ func TestConfigUpdatePreservesValuesAndAddsDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, field := range []string{"reply_rejection:", "max_connections:", "max_connections_per_ip:", "openpgp:", "identities: []"} {
+	for _, field := range []string{"log_level: print", "reply_rejection:", "max_connections:", "max_connections_per_ip:", "openpgp:", "identities: []"} {
 		if !bytes.Contains(rewritten, []byte(field)) {
 			t.Fatalf("updated config missing %q", field)
 		}

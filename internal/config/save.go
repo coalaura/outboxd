@@ -46,6 +46,7 @@ func (cfg *Config) marshal() ([]byte, error) {
 	var buffer bytes.Buffer
 
 	comments := yaml.CommentMap{
+		"$.log_level":                            {yaml.HeadComment(` minimum log level: "debug", "print", "warn", or "error"; changes require a restart`)},
 		"$.server":                               {yaml.HeadComment(" authenticated SMTP submission server")},
 		"$.server.hostname":                      {yaml.HeadComment(" public SMTP hostname used for EHLO, TLS, and reverse DNS")},
 		"$.server.domain":                        {yaml.HeadComment(" sending domain used for DKIM, SPF, and DMARC; prefer a dedicated subdomain")},
