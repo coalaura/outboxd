@@ -113,6 +113,14 @@ func (q *Queue) pruneDeadCandidate(id string, retention time.Duration, now time.
 
 	defer q.finishMutation()
 
+	q.mu.Lock()
+	_, blocked := q.blocked[id]
+	q.mu.Unlock()
+
+	if blocked {
+		return false, nil
+	}
+
 	path := filepath.Join(q.dead, id)
 
 	info, err := os.Stat(path)

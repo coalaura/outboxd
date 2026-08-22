@@ -6213,6 +6213,68 @@ func TestPruneQuarantinesExpiredCorruptDeadCandidate(t *testing.T) {
 	}
 }
 
+func TestPrunePreservesBlockedReadyDeadConflict(t *testing.T) {
+	clearHooks(t)
+
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+
+	err := q.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ready := testEnv("prune-blocked-conflict")
+
+	ready.Size = int64(len("ready"))
+
+	readyDir := writeQueueEntry(t, root, dirReady, ready, []byte("ready"))
+
+	dead := *ready
+
+	dead.Incarnation = strings.Repeat("3", 32)
+	dead.Size = int64(len("dead"))
+
+	deadDir := writeQueueEntry(t, root, dirDead, &dead, []byte("dead"))
+
+	old := time.Now().Add(-2 * time.Hour)
+
+	err = os.Chtimes(deadDir, old, old)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	q, err = Open(root, Limits{DeadRetention: time.Hour})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
+	q.mu.Lock()
+	_, blocked := q.blocked[ready.ID]
+	q.mu.Unlock()
+
+	if !blocked {
+		t.Fatal("conflicting ID was not blocked during recovery")
+	}
+
+	deadCount, _, err := q.Prune(time.Now())
+	if err != nil || deadCount != 0 {
+		t.Fatalf("Prune dead=%d err=%v", deadCount, err)
+	}
+
+	if _, err := os.Stat(readyDir); err != nil {
+		t.Fatalf("blocked ready entry changed: %v", err)
+	}
+
+	if _, err := os.Stat(deadDir); err != nil {
+		t.Fatalf("blocked dead entry changed: %v", err)
+	}
+}
+
 func TestLinkedDeadSourceOperationsRequireCompletedDSN(t *testing.T) {
 	operations := []struct {
 		name string
