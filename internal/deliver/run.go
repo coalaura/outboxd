@@ -19,6 +19,8 @@ const (
 func (d *Deliverer) Run(ctx context.Context) error {
 	d.log.Printf("Delivery started with %d queued message(s)\n", d.queue.Len())
 
+	defer d.requeueParked()
+
 	// Registered first so it runs last: cancel() must fire before we wait.
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -67,7 +69,7 @@ func (d *Deliverer) Run(ctx context.Context) error {
 
 		admittedOwner := deliveryOwner(envelope)
 		if !d.users.tryAcquire(admittedOwner) {
-			d.queue.RequeueAfter(envelope, d.admission)
+			d.parkAdmission(envelope, admissionUser, admittedOwner)
 
 			continue
 		}
@@ -77,7 +79,7 @@ func (d *Deliverer) Run(ctx context.Context) error {
 			d.users.release(admittedOwner)
 
 			// Admission is an in-memory scheduling decision, not a delivery attempt.
-			d.queue.RequeueAfter(envelope, d.admission)
+			d.parkAdmission(envelope, admissionDomain, admittedDomain)
 
 			continue
 		}
@@ -156,6 +158,15 @@ func (d *Deliverer) fatalErr() error {
 }
 
 func nextPendingDomain(envelope *queue.Envelope) string {
+	if envelope.PreferredDomain != "" {
+		for i := range envelope.Recipients {
+			recipient := &envelope.Recipients[i]
+			if recipient.Status == queue.StatusPending && recipient.Domain == envelope.PreferredDomain {
+				return envelope.PreferredDomain
+			}
+		}
+	}
+
 	for i := range envelope.Recipients {
 		recipient := &envelope.Recipients[i]
 		if recipient.Status == queue.StatusPending {

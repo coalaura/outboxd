@@ -11,8 +11,9 @@ type slot struct {
 type domainLimiter struct {
 	limit int
 
-	mu    sync.Mutex
-	slots map[string]*slot
+	mu        sync.Mutex
+	slots     map[string]*slot
+	onRelease func(string)
 }
 
 // tryAcquire reserves domain capacity without creating a waiter.
@@ -42,10 +43,11 @@ func (l *domainLimiter) tryAcquire(domain string) bool {
 
 func (l *domainLimiter) release(domain string) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 
 	entry, ok := l.slots[domain]
 	if !ok {
+		l.mu.Unlock()
+
 		return
 	}
 
@@ -53,6 +55,27 @@ func (l *domainLimiter) release(domain string) {
 	if entry.holders <= 0 {
 		delete(l.slots, domain)
 	}
+
+	onRelease := l.onRelease
+
+	l.mu.Unlock()
+
+	if onRelease != nil {
+		onRelease(domain)
+	}
+}
+
+func (l *domainLimiter) available(domain string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if domain == "" {
+		return true
+	}
+
+	entry := l.slots[domain]
+
+	return entry == nil || entry.holders < l.limit
 }
 
 func newDomainLimiter(limit int) *domainLimiter {

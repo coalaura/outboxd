@@ -10,10 +10,12 @@ import (
 	"github.com/coalaura/outboxd/internal/queue"
 )
 
-func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host string, indexes []int) (bool, error) {
+func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, candidate mxCandidate, indexes []int) (bool, error) {
 	trace := d.newDebugTrace()
 
-	client, err := d.connect(ctx, host, !envelope.SMTPUTF8 && !envelope.EightBit)
+	host := candidate.host
+
+	client, err := d.connect(ctx, candidate, !envelope.SMTPUTF8 && !envelope.EightBit)
 
 	trace.mark("connect")
 
@@ -67,6 +69,8 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 
 	accepted := make([]int, 0, len(indexes))
 	temporary := make([]string, 0, len(indexes))
+	pendingIndexes := make([]int, 0, len(indexes))
+	pendingAddresses := make([]string, 0, len(indexes))
 
 	for _, index := range indexes {
 		recipient := &envelope.Recipients[index]
@@ -74,25 +78,49 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, host str
 			continue
 		}
 
-		err = client.Rcpt(recipient.Address)
-		if err == nil {
+		pendingIndexes = append(pendingIndexes, index)
+		pendingAddresses = append(pendingAddresses, recipient.Address)
+	}
+
+	results := make([]error, 0, len(pendingIndexes))
+
+	var batchErr error
+
+	pipelining, _ := client.Extension("PIPELINING")
+	if pipelining && len(pendingIndexes) > 1 {
+		results, batchErr = client.RcptBatch(pendingAddresses)
+	} else {
+		for _, address := range pendingAddresses {
+			results = append(results, client.Rcpt(address))
+		}
+	}
+
+	for resultIndex, result := range results {
+		index := pendingIndexes[resultIndex]
+		recipient := &envelope.Recipients[index]
+
+		if result == nil {
 			accepted = append(accepted, index)
 
 			continue
 		}
 
-		if permanent(err) {
-			d.rejectSMTP(envelope, []int{index}, err)
+		if permanent(result) {
+			d.rejectSMTP(envelope, []int{index}, result)
 
 			continue
 		}
 
-		recipient.Detail = describe(err)
+		recipient.Detail = describe(result)
 
 		temporary = append(temporary, fmt.Sprintf("%s: %s", recipient.Address, recipient.Detail))
 	}
 
 	trace.mark("rcpt")
+
+	if batchErr != nil {
+		return false, batchErr
+	}
 
 	if len(accepted) == 0 {
 		_ = client.Quit()

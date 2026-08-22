@@ -64,6 +64,10 @@ type Envelope struct {
 	// EnqueuedAt is used by quota accounting for in-progress adds.
 	EnqueuedAt time.Time `json:"-"`
 
+	// PreferredDomain is transient scheduler state for resuming a multi-domain
+	// envelope after capacity becomes available.
+	PreferredDomain string `json:"-"`
+
 	index int
 }
 

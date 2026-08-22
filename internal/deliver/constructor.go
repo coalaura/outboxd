@@ -1,6 +1,7 @@
 package deliver
 
 import (
+	"crypto/tls"
 	"crypto/x509"
 	"io"
 	"net"
@@ -75,11 +76,12 @@ func NewWithSigner(cfg *config.Config, spool *queue.Queue, log Logger, signer Si
 		signer:   signer,
 		debugLog: debugLog,
 
-		resolver: netResolver{r: net.DefaultResolver},
-		dialer:   &net.Dialer{Timeout: config.Duration(cfg.Delivery.ConnectionTimeout)},
-		orderIPs: shuffleIPs,
-		orderMX:  shuffleMX,
-		next:     spool.Next,
+		resolver:    netResolver{r: net.DefaultResolver},
+		dialer:      &net.Dialer{Timeout: config.Duration(cfg.Delivery.ConnectionTimeout)},
+		tlsSessions: tls.NewLRUClientSessionCache(64),
+		orderIPs:    shuffleIPs,
+		orderMX:     shuffleMX,
+		next:        spool.Next,
 		reader: func(id string) (io.ReadCloser, error) {
 			return spool.Reader(id)
 		},
@@ -109,6 +111,14 @@ func NewWithSigner(cfg *config.Config, spool *queue.Queue, log Logger, signer Si
 		if ip != nil {
 			d.allowlist[ip.String()] = struct{}{}
 		}
+	}
+
+	d.users.onRelease = func(owner string) {
+		d.wakeAdmission(admissionUser, owner)
+	}
+
+	d.domains.onRelease = func(domain string) {
+		d.wakeAdmission(admissionDomain, domain)
 	}
 
 	return d

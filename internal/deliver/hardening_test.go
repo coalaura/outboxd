@@ -429,7 +429,7 @@ func TestDataCopyErrorAbortsWithoutTerminator(t *testing.T) {
 
 	env.Size = 100
 
-	_, err = d.send(context.Background(), env, "mx.ex.com", []int{0})
+	_, err = d.send(context.Background(), env, mxCandidate{host: "mx.ex.com"}, []int{0})
 	if err == nil || err.Error() != "spool read failed" {
 		t.Fatalf("body read error=%v", err)
 	}
@@ -483,7 +483,7 @@ func TestDataLengthMismatchAbortsWithoutTerminator(t *testing.T) {
 
 			env.Size = 5
 
-			_, err = d.send(context.Background(), env, "mx.ex.com", []int{0})
+			_, err = d.send(context.Background(), env, mxCandidate{host: "mx.ex.com"}, []int{0})
 			if !errors.Is(err, tt.want) {
 				t.Fatalf("send error=%v want %v", err, tt.want)
 			}
@@ -513,8 +513,6 @@ func TestRunDomainAdmissionFairAtMinimumAttemptCapacity(t *testing.T) {
 	cfg.Delivery.CommandTimeout = "30s"
 
 	d := New(cfg, q, nopLogger{})
-
-	d.admission = 10 * time.Millisecond
 
 	if cap(d.active) != 8 {
 		t.Fatalf("attempt capacity=%d want 8", cap(d.active))
@@ -642,6 +640,73 @@ func TestRunDomainAdmissionFairAtMinimumAttemptCapacity(t *testing.T) {
 	}
 }
 
+func TestInitialAdmissionParksUntilRelease(t *testing.T) {
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
+	cfg := testDeliverCfg()
+
+	cfg.Delivery.UserConcurrency = 1
+
+	d := New(cfg, q, nopLogger{})
+
+	if !d.users.tryAcquire("user") {
+		t.Fatal("failed to reserve user capacity")
+	}
+
+	envelope := hardeningEnvelope("parked-admission", time.Now(), queue.Recipient{
+		Address: "r@example.test", Domain: "example.test", Status: queue.StatusPending,
+	})
+
+	envelope.Username = "user"
+
+	err = q.Add(envelope, []byte("body\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	checkedOut, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d.parkAdmission(checkedOut, admissionUser, "user")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+
+	parked, err := q.Next(ctx)
+
+	cancel()
+
+	if !errors.Is(err, context.DeadlineExceeded) || parked != nil {
+		t.Fatalf("parked entry was scheduled: envelope=%v err=%v", parked, err)
+	}
+
+	d.users.release("user")
+
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+
+	resumed, err := q.Next(ctx)
+
+	cancel()
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resumed.ID != envelope.ID || resumed.Attempts != 0 {
+		t.Fatalf("resumed envelope=%+v", resumed)
+	}
+
+	q.Requeue(resumed)
+}
+
 func TestRunMixedDomainAdmissionDoesNotCaptureLaterDomainCapacity(t *testing.T) {
 	q, err := queue.Open(t.TempDir(), queue.Limits{})
 	if err != nil {
@@ -733,7 +798,7 @@ func TestRunMixedDomainAdmissionDoesNotCaptureLaterDomainCapacity(t *testing.T) 
 	}
 }
 
-func TestAttemptTemporaryFirstDomainAndBusyLaterConsumesAttemptWithBackoff(t *testing.T) {
+func TestAttemptTemporaryFirstDomainAndBusyLaterParksUntilRelease(t *testing.T) {
 	q, err := queue.Open(t.TempDir(), queue.Limits{})
 	if err != nil {
 		t.Fatal(err)
@@ -798,15 +863,29 @@ func TestAttemptTemporaryFirstDomainAndBusyLaterConsumesAttemptWithBackoff(t *te
 		t.Fatalf("busy later domain was processed: %+v", got.Recipients[1])
 	}
 
-	if !strings.Contains(got.LastError, "temporary.test") || !strings.Contains(got.LastError, "busy.test: delivery concurrency unavailable") {
+	if !strings.Contains(got.LastError, "temporary.test") || strings.Contains(got.LastError, "delivery concurrency unavailable") {
 		t.Fatalf("aggregate diagnostic=%q", got.LastError)
 	}
 
-	if got.NextAttempt.Before(now.Add(50 * time.Minute)) {
-		t.Fatalf("later-domain contention bypassed normal backoff: %s", got.NextAttempt.Sub(now))
+	if got.NextAttempt.After(time.Now().Add(time.Second)) {
+		t.Fatalf("later-domain contention applied delivery backoff: %s", got.NextAttempt.Sub(now))
 	}
 
 	d.domains.release("busy.test")
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	resumed, err := q.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resumed.PreferredDomain != "busy.test" || nextPendingDomain(resumed) != "busy.test" {
+		t.Fatalf("resumed domain=%q preferred=%q", nextPendingDomain(resumed), resumed.PreferredDomain)
+	}
+
+	q.Requeue(resumed)
 }
 
 func TestAttemptAllTemporaryRCPTPreservesDetailsAndAggregateDiagnostic(t *testing.T) {
@@ -1592,7 +1671,7 @@ func TestMXEqualPreferenceOrderingBeforeTruncation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got, want := strings.Join(hosts, ","), "c.test,b.test,a.test,e.test"; got != want {
+	if got, want := candidateHostList(hosts), "c.test,b.test,a.test,e.test"; got != want {
 		t.Fatalf("MX cap/order=%q want %q", got, want)
 	}
 
@@ -1682,12 +1761,149 @@ func TestMXEqualPreferenceCandidatesCanRotateAcrossRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got, want := strings.Join(first, ","), "d.test,c.test"; got != want {
+	if got, want := candidateHostList(first), "d.test,c.test"; got != want {
 		t.Fatalf("first retry MXs=%q want %q", got, want)
 	}
 
-	if got, want := strings.Join(second, ","), "a.test,b.test"; got != want {
+	if got, want := candidateHostList(second), "a.test,b.test"; got != want {
 		t.Fatalf("second retry MXs=%q want %q", got, want)
+	}
+}
+
+func candidateHostList(candidates []mxCandidate) string {
+	hosts := make([]string, len(candidates))
+
+	for i, candidate := range candidates {
+		hosts[i] = candidate.host
+	}
+
+	return strings.Join(hosts, ",")
+}
+
+func TestClientQuitDoesNotWaitForReply(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+
+	client := NewClient(clientConn, 5*time.Second, 5*time.Second)
+
+	received := make(chan string, 1)
+	release := make(chan struct{})
+
+	go func() {
+		defer serverConn.Close()
+
+		line, _ := bufio.NewReader(serverConn).ReadString('\n')
+		received <- strings.TrimSpace(line)
+
+		<-release
+	}()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- client.Quit()
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("QUIT waited for a server reply")
+	}
+
+	if line := <-received; line != "QUIT" {
+		t.Fatalf("command=%q want QUIT", line)
+	}
+
+	close(release)
+}
+
+func TestClientRcptBatchPipelinesCommands(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+
+	client := NewClient(clientConn, 5*time.Second, 5*time.Second)
+
+	go func() {
+		defer serverConn.Close()
+
+		reader := bufio.NewReader(serverConn)
+
+		for range 2 {
+			_, _ = reader.ReadString('\n')
+		}
+
+		_, _ = io.WriteString(serverConn, "250 2.1.5 accepted\r\n550 5.1.1 rejected\r\n")
+	}()
+
+	results, err := client.RcptBatch([]string{"one@example.test", "two@example.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(results) != 2 || results[0] != nil || !permanent(results[1]) {
+		t.Fatalf("RCPT results=%v", results)
+	}
+}
+
+func TestClientRcptBatchReturnsReceivedResponsesBeforeTransportFailure(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+
+	client := NewClient(clientConn, 5*time.Second, 5*time.Second)
+
+	go func() {
+		reader := bufio.NewReader(serverConn)
+
+		for range 3 {
+			_, _ = reader.ReadString('\n')
+		}
+
+		_, _ = io.WriteString(serverConn, "250 2.1.5 accepted\r\n451 4.3.0 temporary\r\n")
+		_ = serverConn.Close()
+	}()
+
+	results, err := client.RcptBatch([]string{"one@example.test", "two@example.test", "three@example.test"})
+	if err == nil {
+		t.Fatal("RCPT batch succeeded after truncated replies")
+	}
+
+	if len(results) != 3 || results[0] != nil || permanent(results[1]) || smtpCode(results[1]) != 451 || smtpCode(results[2]) != 0 {
+		t.Fatalf("RCPT results=%v err=%v", results, err)
+	}
+}
+
+func TestImplicitMXReusesFilteredAddresses(t *testing.T) {
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
+	d := New(testDeliverCfg(), q, nopLogger{})
+
+	var addressLookups atomic.Int32
+
+	d.SetResolver(resolverFuncs{
+		mx: func(context.Context, string) ([]*net.MX, error) {
+			return nil, &net.DNSError{IsNotFound: true}
+		},
+		ips: func(context.Context, string, string) ([]net.IP, error) {
+			addressLookups.Add(1)
+
+			return []net.IP{net.ParseIP("127.0.0.1")}, nil
+		},
+	})
+
+	candidates, err := d.hosts(context.Background(), "example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if addressLookups.Load() != 1 || len(candidates) != 1 || len(candidates[0].ips) != 1 {
+		t.Fatalf("lookups=%d candidates=%v", addressLookups.Load(), candidates)
 	}
 }
 

@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const bestEffortQuitTimeout = time.Second
+
 // MailOpts controls MAIL FROM parameters.
 type MailOpts struct {
 	Size     int64
@@ -196,6 +198,44 @@ func (c *Client) Rcpt(to string) error {
 	return c.cmd(25, "RCPT TO:<%s>", to)
 }
 
+// RcptBatch pipelines RCPT commands and returns the responses received in order.
+// A transport error leaves recipients without a returned response indeterminate.
+func (c *Client) RcptBatch(recipients []string) ([]error, error) {
+	c.setDeadline(c.command)
+	defer c.conn.SetDeadline(time.Time{})
+
+	ids := make([]uint, 0, len(recipients))
+
+	for _, recipient := range recipients {
+		id, err := c.text.Cmd("RCPT TO:<%s>", recipient)
+		if err != nil {
+			return nil, err
+		}
+
+		ids = append(ids, id)
+	}
+
+	results := make([]error, 0, len(ids))
+
+	for _, id := range ids {
+		c.text.StartResponse(id)
+
+		c.bounded.reset()
+
+		_, _, err := c.readResponse(25)
+
+		c.text.EndResponse(id)
+
+		results = append(results, err)
+
+		if err != nil && smtpCode(err) == 0 {
+			return results, err
+		}
+	}
+
+	return results, nil
+}
+
 // Data starts the DATA phase; Close on the writer finalizes and reads the reply.
 func (c *Client) Data() (*dataWriter, error) {
 	c.setDeadline(c.command)
@@ -212,12 +252,12 @@ func (c *Client) Data() (*dataWriter, error) {
 	return &dataWriter{client: c, w: c.text.DotWriter()}, nil
 }
 
-// Quit sends QUIT.
+// Quit sends QUIT as a best effort and closes without waiting for the reply.
 func (c *Client) Quit() error {
-	c.setDeadline(c.command)
+	c.setDeadline(min(c.command, bestEffortQuitTimeout))
 	defer c.conn.SetDeadline(time.Time{})
 
-	err := c.cmd(221, "QUIT")
+	err := c.text.PrintfLine("QUIT")
 
 	c.Close()
 

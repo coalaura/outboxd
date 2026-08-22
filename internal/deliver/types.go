@@ -2,6 +2,7 @@ package deliver
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"io"
 	"net"
@@ -48,6 +49,11 @@ type outboundTLS struct {
 	allowPlaintext bool
 }
 
+type mxCandidate struct {
+	host string
+	ips  []net.IP
+}
+
 // Signer produces DKIM-Signature headers for locally generated messages (DSNs).
 type Signer interface {
 	Signature(message []byte) (string, error)
@@ -66,7 +72,8 @@ type Deliverer struct {
 
 	// tlsRootCAs is an optional test/production root pool override for verified STARTTLS.
 	// When nil, Go's system roots are used.
-	tlsRootCAs *x509.CertPool
+	tlsRootCAs  *x509.CertPool
+	tlsSessions tls.ClientSessionCache
 
 	// orderIPs rotates sorted candidates before truncation. Production shuffles;
 	// tests may replace it for deterministic ordering.
@@ -80,6 +87,7 @@ type Deliverer struct {
 	global  chan struct{}
 	domains *domainLimiter
 	users   *domainLimiter
+	parked  admissionParking
 
 	command    time.Duration
 	submission time.Duration

@@ -20,20 +20,29 @@ func (d *Deliverer) effectiveTLS() outboundTLS {
 	}
 }
 
-func (d *Deliverer) connect(ctx context.Context, host string, noExtensions bool) (*Client, error) {
+func (d *Deliverer) connect(ctx context.Context, candidate mxCandidate, noExtensions bool) (*Client, error) {
 	trace := d.newDebugTrace()
 
-	ips, err := d.lookupHostIPs(ctx, host)
+	host := candidate.host
+	ips := candidate.ips
 
-	trace.mark("ip_lookup")
+	var err error
 
-	if err != nil {
-		d.debugf("delivery IP lookup for %s failed: %s\n", host, trace)
+	if ips == nil {
+		ips, err = d.lookupHostIPs(ctx, host)
 
-		return nil, err
+		trace.mark("ip_lookup")
+
+		if err != nil {
+			d.debugf("delivery IP lookup for %s failed: %s\n", host, trace)
+
+			return nil, err
+		}
+
+		d.debugf("delivery IP lookup for %s returned %d address(es): %s\n", host, len(ips), trace)
+	} else {
+		d.debugf("delivery implicit MX %s reused %d address(es)\n", host, len(ips))
 	}
-
-	d.debugf("delivery IP lookup for %s returned %d address(es): %s\n", host, len(ips), trace)
 
 	if len(ips) == 0 {
 		return nil, errNoUsableIP
@@ -191,8 +200,9 @@ func (d *Deliverer) dialAndSession(ctx context.Context, mxHost string, ip net.IP
 
 func (d *Deliverer) upgradeTLS(client *Client, mxHost string, policy outboundTLS) error {
 	cfg := &tls.Config{
-		ServerName: mxHost, // SNI is the MX hostname even when dialing an explicit IP
-		MinVersion: tls.VersionTLS12,
+		ServerName:         mxHost, // SNI is the MX hostname even when dialing an explicit IP
+		MinVersion:         tls.VersionTLS12,
+		ClientSessionCache: d.tlsSessions,
 	}
 
 	// InsecureSkipVerify is set only when the configured policy is explicitly insecure

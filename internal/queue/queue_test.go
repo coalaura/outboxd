@@ -1047,6 +1047,61 @@ func TestRetryPersistenceFailureStillRecoverable(t *testing.T) {
 	}
 }
 
+func TestRetryDeferredPersistsWithoutScheduling(t *testing.T) {
+	clearHooks(t)
+
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{})
+
+	envelope := testEnv("retry-deferred")
+
+	err := q.Add(envelope, []byte("body\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got.Attempts = 1
+	got.LastError = "temporary failure"
+
+	err = q.RetryDeferred(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if q.Len() != 0 {
+		t.Fatalf("deferred queue length=%d want 0", q.Len())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+
+	deferred, err := q.Next(ctx)
+
+	cancel()
+
+	if !errors.Is(err, context.DeadlineExceeded) || deferred != nil {
+		t.Fatalf("deferred entry was scheduled: envelope=%v err=%v", deferred, err)
+	}
+
+	q = mustReopen(t, q, root, Limits{})
+	if q.Len() != 1 {
+		t.Fatalf("recovered queue length=%d want 1", q.Len())
+	}
+
+	recovered, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if recovered.Attempts != 1 || recovered.LastError != "temporary failure" {
+		t.Fatalf("recovered deferred envelope=%+v", recovered)
+	}
+}
+
 func TestReadyAdministration(t *testing.T) {
 	root := t.TempDir()
 
@@ -6056,6 +6111,105 @@ func TestPruneAndExplicitDelete(t *testing.T) {
 	_, err = os.Stat(filepath.Join(q.dead, second.ID))
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("dead entry remains: %v", err)
+	}
+}
+
+func TestPruneValidatesOnlyExpiredDeadCandidates(t *testing.T) {
+	clearHooks(t)
+
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{DeadRetention: time.Hour})
+
+	expired := testEnv("expired-dead")
+	retained := testEnv("retained-dead-unread")
+
+	for _, envelope := range []*Envelope{expired, retained} {
+		err := q.Add(envelope, []byte("body"))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = q.Bury(envelope)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	old := time.Now().Add(-2 * time.Hour)
+
+	err := os.Chtimes(filepath.Join(q.dead, expired.ID), old, old)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	retainedBody := filepath.Join(q.dead, retained.ID, bodyName)
+
+	disk.SetHooks(disk.Hooks{BeforeRead: func(path string) error {
+		if filepath.Clean(path) == filepath.Clean(retainedBody) {
+			return errors.New("retained body should not be read")
+		}
+
+		return nil
+	}})
+
+	dead, _, err := q.Prune(time.Now())
+	if err != nil || dead != 1 {
+		t.Fatalf("Prune dead=%d err=%v", dead, err)
+	}
+
+	if _, err := os.Stat(filepath.Join(q.dead, retained.ID)); err != nil {
+		t.Fatalf("retained dead entry changed: %v", err)
+	}
+}
+
+func TestPruneQuarantinesExpiredCorruptDeadCandidate(t *testing.T) {
+	clearHooks(t)
+
+	root := t.TempDir()
+	q := mustOpen(t, root, Limits{DeadRetention: time.Hour})
+
+	envelope := testEnv("expired-corrupt-dead")
+
+	err := q.Add(envelope, []byte("body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = q.Bury(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bodyPath := filepath.Join(q.dead, envelope.ID, bodyName)
+
+	err = os.WriteFile(bodyPath, []byte("changed"), 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	old := time.Now().Add(-2 * time.Hour)
+
+	err = os.Chtimes(filepath.Join(q.dead, envelope.ID), old, old)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dead, _, err := q.Prune(time.Now())
+	if err != nil || dead != 0 {
+		t.Fatalf("Prune dead=%d err=%v", dead, err)
+	}
+
+	if _, err := os.Stat(filepath.Join(q.dead, envelope.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("corrupt dead entry remains: %v", err)
+	}
+
+	corrupt, err := q.CorruptIDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(corrupt) != 1 || !strings.HasPrefix(corrupt[0], envelope.ID+"-invalid-dead.") {
+		t.Fatalf("quarantined entries=%v", corrupt)
 	}
 }
 

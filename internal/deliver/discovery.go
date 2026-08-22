@@ -161,12 +161,14 @@ func (d *Deliverer) allowlisted(ip net.IP) bool {
 	return false
 }
 
-func (d *Deliverer) hosts(ctx context.Context, domain string) ([]string, error) {
+func (d *Deliverer) hosts(ctx context.Context, domain string) ([]mxCandidate, error) {
 	lookupCtx, cancel := context.WithTimeout(ctx, d.dnsTO)
 
 	records, err := d.resolver.LookupMX(lookupCtx, domain)
 
 	cancel()
+
+	var mxNotFound bool
 
 	if err != nil {
 		dnsErr, ok := errors.AsType[*net.DNSError](err)
@@ -174,26 +176,22 @@ func (d *Deliverer) hosts(ctx context.Context, domain string) ([]string, error) 
 			return nil, err
 		}
 
-		lookupCtx, cancel = context.WithTimeout(ctx, d.dnsTO)
-
-		_, err = d.resolver.LookupNetIP(lookupCtx, d.lookupNetwork(), domain)
-
-		cancel()
-
-		if err != nil {
-			dnsErr, ok = errors.AsType[*net.DNSError](err)
-			if ok && dnsErr.IsNotFound {
-				return nil, errNoSuchDomain
-			}
-
-			return nil, err
-		}
-
-		return []string{domain}, nil
+		mxNotFound = true
+		records = nil
 	}
 
 	if len(records) == 0 {
-		return []string{domain}, nil
+		ips, lookupErr := d.lookupHostIPs(ctx, domain)
+		if lookupErr != nil {
+			dnsErr, ok := errors.AsType[*net.DNSError](lookupErr)
+			if mxNotFound && ok && dnsErr.IsNotFound {
+				return nil, errNoSuchDomain
+			}
+
+			return nil, lookupErr
+		}
+
+		return []mxCandidate{{host: domain, ips: ips}}, nil
 	}
 
 	valid := make([]*net.MX, 0, len(records))
@@ -232,7 +230,7 @@ func (d *Deliverer) hosts(ctx context.Context, domain string) ([]string, error) 
 		}
 	}
 
-	hosts := make([]string, 0, min(len(valid), d.maxMX))
+	hosts := make([]mxCandidate, 0, min(len(valid), d.maxMX))
 	seen := make(map[string]struct{}, len(valid))
 
 	for _, record := range valid {
@@ -243,7 +241,7 @@ func (d *Deliverer) hosts(ctx context.Context, domain string) ([]string, error) 
 			}
 
 			seen[host] = struct{}{}
-			hosts = append(hosts, host)
+			hosts = append(hosts, mxCandidate{host: host})
 
 			if len(hosts) == d.maxMX {
 				break

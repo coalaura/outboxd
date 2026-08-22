@@ -25,15 +25,6 @@ func (q *Queue) Prune(now time.Time) (dead, corrupt int, err error) {
 		return 0, 0, opErr
 	}
 
-	opErr = q.startMutation()
-	if opErr != nil {
-		return 0, 0, opErr
-	}
-
-	defer q.finishMutation()
-
-	q.validateDead()
-
 	dead, deadErr := q.pruneNamespace(q.dead, q.limits.DeadRetention, now, "")
 	corrupt, corruptErr := q.pruneNamespace(q.corr, q.limits.CorruptRetention, now, "corrupt-")
 
@@ -70,89 +61,180 @@ func (q *Queue) pruneNamespace(namespace string, retention time.Duration, now ti
 			continue
 		}
 
-		storedAt := info.ModTime()
-
-		if namespace == q.corr {
-			dot := strings.LastIndexByte(entry.Name(), '.')
-			if dot >= 0 {
-				stamp, parseErr := strconv.ParseInt(entry.Name()[dot+1:], 10, 64)
-				if parseErr == nil {
-					storedAt = time.Unix(0, stamp)
-				}
-			}
-		}
-
+		storedAt := storedAt(namespace == q.corr, entry.Name(), info.ModTime())
 		if now.Sub(storedAt) < retention || !validOpaqueName(entry.Name()) {
 			continue
 		}
 
+		var deleted bool
+
 		if namespace == q.dead {
-			q.mu.Lock()
-			_, busy := q.transitioning[entry.Name()]
-			_, blocked := q.blocked[entry.Name()]
-			q.mu.Unlock()
-
-			if busy || blocked || ValidateID(entry.Name()) != nil {
+			if ValidateID(entry.Name()) != nil {
 				continue
 			}
 
-			transitionErr := q.beginTransition(entry.Name())
-			if transitionErr != nil {
-				continue
+			deleted, infoErr = q.pruneDeadCandidate(entry.Name(), retention, now, initialDead)
+		} else {
+			deleted, infoErr = q.pruneCorruptCandidate(entry.Name(), retention, now, prefix)
+		}
+
+		if infoErr != nil {
+			if !errors.Is(infoErr, ErrIDConflict) && !errors.Is(infoErr, ErrQueueBusy) {
+				errs = append(errs, fmt.Errorf("prune %s: %w", entry.Name(), infoErr))
 			}
 
-			envelope, loadErr := q.loadAcceptedDir(filepath.Join(namespace, entry.Name()), entry.Name())
-			if loadErr != nil {
-				q.endTransition(entry.Name())
+			continue
+		}
 
-				errs = append(errs, fmt.Errorf("prune %s: %w", entry.Name(), loadErr))
-
-				continue
-			}
-
-			if envelope.DSNSourceID == "" && envelope.DSNID != "" {
-				if _, existed := initialDead[envelope.DSNID]; existed {
-					q.endTransition(entry.Name())
-
-					continue
-				}
-			}
-
-			linkedDSNID, linkErr := q.claimLinkedDeadDSN(envelope)
-			if linkErr != nil {
-				q.endTransitions(entry.Name(), linkedDSNID)
-
-				if !errors.Is(linkErr, ErrIDConflict) && !errors.Is(linkErr, ErrQueueBusy) {
-					errs = append(errs, fmt.Errorf("prune %s: %w", entry.Name(), linkErr))
-				}
-
-				continue
-			}
-
-			deleteErr := q.deleteStoredLocked(namespace, entry.Name(), prefix+sanitize(entry.Name()))
-
-			q.endTransitions(entry.Name(), linkedDSNID)
-
-			if deleteErr != nil {
-				errs = append(errs, fmt.Errorf("prune %s: %w", entry.Name(), deleteErr))
-
-				continue
-			}
-
+		if deleted {
 			count++
-
-			continue
 		}
-
-		deleteErr := q.deleteStoredLocked(namespace, entry.Name(), prefix+sanitize(entry.Name()))
-		if deleteErr != nil {
-			errs = append(errs, fmt.Errorf("prune %s: %w", entry.Name(), deleteErr))
-
-			continue
-		}
-
-		count++
 	}
 
 	return count, errors.Join(errs...)
+}
+
+func (q *Queue) pruneDeadCandidate(id string, retention time.Duration, now time.Time, initialDead map[string]struct{}) (bool, error) {
+	err := q.beginTransition(id)
+	if err != nil {
+		return false, err
+	}
+
+	linkedDSNID := ""
+
+	defer func() {
+		q.endTransitions(id, linkedDSNID)
+	}()
+
+	err = q.startMutation()
+	if err != nil {
+		return false, err
+	}
+
+	defer q.finishMutation()
+
+	path := filepath.Join(q.dead, id)
+
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	if now.Sub(info.ModTime()) < retention {
+		return false, nil
+	}
+
+	if !info.IsDir() {
+		cause := corruptionf("stray file in dead")
+
+		err = q.quarantineFile(path, id+"-dead-stray")
+		if err != nil {
+			q.recordQuarantineFailure(id, path, cause, err)
+
+			return false, err
+		}
+
+		q.noteRemoved(id)
+
+		q.mu.Lock()
+		q.Corrupt = append(q.Corrupt, fmt.Errorf("dead %s: %w", id, cause))
+		q.mu.Unlock()
+
+		return false, nil
+	}
+
+	envelope, err := q.loadAcceptedDir(path, id)
+	if err != nil {
+		if !IsCorruption(err) {
+			return false, err
+		}
+
+		cause := err
+
+		err = q.quarantineDir(path, id+"-invalid-dead")
+		if err != nil {
+			q.recordQuarantineFailure(id, path, cause, err)
+
+			return false, err
+		}
+
+		q.noteRemoved(id)
+
+		q.mu.Lock()
+		q.Corrupt = append(q.Corrupt, fmt.Errorf("dead %s: %w", id, cause))
+		q.mu.Unlock()
+
+		return false, nil
+	}
+
+	if envelope.DSNSourceID == "" && envelope.DSNID != "" {
+		if _, existed := initialDead[envelope.DSNID]; existed {
+			return false, nil
+		}
+	}
+
+	linkedDSNID, err = q.claimLinkedDeadDSN(envelope)
+	if err != nil {
+		return false, err
+	}
+
+	err = q.deleteStoredLocked(q.dead, id, sanitize(id))
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+func (q *Queue) pruneCorruptCandidate(name string, retention time.Duration, now time.Time, prefix string) (bool, error) {
+	err := q.startMutation()
+	if err != nil {
+		return false, err
+	}
+
+	defer q.finishMutation()
+
+	path := filepath.Join(q.corr, name)
+
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	if now.Sub(storedAt(true, name, info.ModTime())) < retention {
+		return false, nil
+	}
+
+	err = q.deleteStoredLocked(q.corr, name, prefix+sanitize(name))
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+func storedAt(corrupt bool, name string, fallback time.Time) time.Time {
+	if !corrupt {
+		return fallback
+	}
+
+	dot := strings.LastIndexByte(name, '.')
+	if dot < 0 {
+		return fallback
+	}
+
+	stamp, err := strconv.ParseInt(name[dot+1:], 10, 64)
+	if err != nil {
+		return fallback
+	}
+
+	return time.Unix(0, stamp)
 }

@@ -37,10 +37,12 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 		sawEightBitCapErr bool
 	)
 
-	for _, host := range hosts {
+	for _, candidate := range hosts {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+
+		host := candidate.host
 
 		// Hold global only around MX I/O.
 		trace = d.newDebugTrace()
@@ -54,7 +56,7 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 
 		d.debugf("delivery %s acquired global capacity for %s: %s\n", envelope.ID, host, trace)
 
-		done, err := d.send(ctx, envelope, host, indexes)
+		done, err := d.send(ctx, envelope, candidate, indexes)
 
 		d.releaseGlobal()
 

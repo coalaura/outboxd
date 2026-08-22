@@ -112,7 +112,24 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 		groups[recipient.Domain] = append(groups[recipient.Domain], i)
 	}
 
+	if admittedDomain != "" && len(groupOrder) > 1 && groupOrder[0] != admittedDomain {
+		for i, domain := range groupOrder[1:] {
+			if domain != admittedDomain {
+				continue
+			}
+
+			index := i + 1
+			copy(groupOrder[1:index+1], groupOrder[:index])
+			groupOrder[0] = admittedDomain
+
+			break
+		}
+	}
+
+	envelope.PreferredDomain = ""
+
 	diagnostics := make([]string, 0, len(groupOrder))
+	blockedDomain := ""
 
 	for _, domain := range groupOrder {
 		indexes := groups[domain]
@@ -122,7 +139,7 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 
 		if heldDomain != domain {
 			if !d.domains.tryAcquire(domain) {
-				diagnostics = append(diagnostics, normalizeDiagnostic(fmt.Sprintf("%s: delivery concurrency unavailable", domain)))
+				blockedDomain = domain
 
 				break
 			}
@@ -197,6 +214,17 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 		return nil
 	case errors.Is(outcomeCause, errLifetime):
 		return d.expirePending(envelope)
+	case blockedDomain != "":
+		envelope.NextAttempt = time.Now()
+
+		err = d.queue.RetryDeferred(envelope)
+		if err != nil {
+			return fmt.Errorf("defer %s for domain capacity: %w", envelope.ID, err)
+		}
+
+		d.parkAdmission(envelope, admissionDomain, blockedDomain)
+
+		return nil
 	case envelope.Attempts >= d.cfg.Delivery.MaxAttempts:
 		for i := range envelope.Recipients {
 			recipient := &envelope.Recipients[i]

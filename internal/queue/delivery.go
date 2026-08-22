@@ -143,6 +143,17 @@ func (q *Queue) RequeueAfter(envelope *Envelope, delay time.Duration) {
 // it remains under ready/ and is returned to the schedule so a subsequent
 // Open recovers it. The error is returned to the caller.
 func (q *Queue) Retry(envelope *Envelope) error {
+	return q.retry(envelope, true)
+}
+
+// RetryDeferred persists a checked-out envelope without rescheduling it.
+// It is used when delivery is waiting for external capacity. On error, the
+// durable version is rescheduled so the entry remains recoverable.
+func (q *Queue) RetryDeferred(envelope *Envelope) error {
+	return q.retry(envelope, false)
+}
+
+func (q *Queue) retry(envelope *Envelope, reschedule bool) error {
 	if envelope == nil {
 		return errNilEnvelope
 	}
@@ -190,7 +201,7 @@ func (q *Queue) Retry(envelope *Envelope) error {
 		}
 	}()
 
-	publish := func() {
+	publish := func(schedule bool) {
 		if mutationHeld {
 			q.finishMutation()
 
@@ -201,7 +212,10 @@ func (q *Queue) Retry(envelope *Envelope) error {
 		delete(q.transitioning, envelope.ID)
 		delete(q.requeues, envelope.ID)
 
-		added := q.scheduleLocked(envelope)
+		added := false
+		if schedule {
+			added = q.scheduleLocked(envelope)
+		}
 		q.mu.Unlock()
 
 		owned = false
@@ -223,21 +237,21 @@ func (q *Queue) Retry(envelope *Envelope) error {
 			envelope = durable
 		}
 
-		publish()
+		publish(true)
 
 		return err
 	}
 
 	meta, err := marshalEnvelope(envelope)
 	if err != nil {
-		publish()
+		publish(true)
 
 		return err
 	}
 
 	release, err := q.holdPhysical(disk.AllocationSize(int64(len(meta))+disk.AllocationSize(0))+disk.AllocationSize(0), false)
 	if err != nil {
-		publish()
+		publish(true)
 
 		return err
 	}
@@ -253,13 +267,13 @@ func (q *Queue) Retry(envelope *Envelope) error {
 		// Keep the durable entry schedulable. Only a temp file that could not be
 		// removed consumes additional cached usage.
 		if !errors.Is(err, ErrIDConflict) {
-			publish()
+			publish(true)
 		}
 
 		return err
 	}
 
-	publish()
+	publish(reschedule)
 
 	return nil
 }
