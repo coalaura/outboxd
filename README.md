@@ -1,5 +1,8 @@
 # outboxd
 
+[![codecov](https://codecov.io/gh/coalaura/outboxd/graph/badge.svg?token=0UH3AOB8ST)](https://codecov.io/gh/coalaura/outboxd)&nbsp;
+[![golang](https://img.shields.io/badge/built%20in-go-5AC2D9?logo=go)](https://go.dev)
+
 outboxd is a single-binary outbound mail server for applications and services that need reliable, properly signed email delivery without painfully assembling and maintaining a multi-service mail stack.
 
 It accepts authenticated SMTP submission from configured users, durably queues mail, delivers directly to recipient MX servers, DKIM-signs messages and can optionally even apply OpenPGP/MIME signatures per sender.
