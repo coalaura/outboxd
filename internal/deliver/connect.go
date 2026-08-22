@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
-	"time"
 )
 
 func (d *Deliverer) effectiveTLS() outboundTLS {
@@ -22,17 +21,19 @@ func (d *Deliverer) effectiveTLS() outboundTLS {
 }
 
 func (d *Deliverer) connect(ctx context.Context, host string, noExtensions bool) (*Client, error) {
-	lookupStarted := time.Now()
+	trace := d.newDebugTrace()
+
 	ips, err := d.lookupHostIPs(ctx, host)
-	lookupElapsed := time.Since(lookupStarted).Round(time.Millisecond)
+
+	trace.mark("ip_lookup")
 
 	if err != nil {
-		d.debugf("delivery IP lookup for %s failed in %s\n", host, lookupElapsed)
+		d.debugf("delivery IP lookup for %s failed: %s\n", host, trace)
 
 		return nil, err
 	}
 
-	d.debugf("delivery IP lookup for %s returned %d address(es) in %s\n", host, len(ips), lookupElapsed)
+	d.debugf("delivery IP lookup for %s returned %d address(es): %s\n", host, len(ips), trace)
 
 	if len(ips) == 0 {
 		return nil, errNoUsableIP
@@ -57,7 +58,7 @@ func (d *Deliverer) connect(ctx context.Context, host string, noExtensions bool)
 }
 
 func (d *Deliverer) dialAndSession(ctx context.Context, mxHost string, ip net.IP, noExtensions bool) (*Client, error) {
-	started := time.Now()
+	trace := d.newDebugTrace()
 
 	// Policy is fixed before dialing. Never reconnect with a weaker verification policy.
 	policy := d.effectiveTLS()
@@ -83,14 +84,14 @@ func (d *Deliverer) dialAndSession(ctx context.Context, mxHost string, ip net.IP
 
 	dialCtx, cancel := context.WithTimeout(ctx, d.connTO)
 
-	dialStarted := time.Now()
 	conn, err := dialer.DialContext(dialCtx, network, addr)
-	dialElapsed := time.Since(dialStarted).Round(time.Millisecond)
+
+	trace.mark("dial")
 
 	cancel()
 
 	if err != nil {
-		d.debugf("delivery TCP dial to %s (%s) failed in %s\n", mxHost, ip, dialElapsed)
+		d.debugf("delivery TCP dial to %s (%s) failed: %s\n", mxHost, ip, trace)
 
 		return nil, err
 	}
@@ -99,43 +100,50 @@ func (d *Deliverer) dialAndSession(ctx context.Context, mxHost string, ip net.IP
 
 	client.bindContext(ctx)
 
-	greetStarted := time.Now()
 	err = client.Greet()
-	greetElapsed := time.Since(greetStarted).Round(time.Millisecond)
+
+	trace.mark("greeting")
 
 	if err != nil {
 		client.Close()
 
-		d.debugf("delivery SMTP greeting from %s (%s) failed in %s\n", mxHost, ip, greetElapsed)
+		d.debugf("delivery SMTP greeting from %s (%s) failed: %s\n", mxHost, ip, trace)
 
 		return nil, err
 	}
 
-	helloStarted := time.Now()
 	err = client.EHLO(d.cfg.Server.Hostname)
 	if err != nil {
 		code := smtpCode(err)
 		if !policy.allowPlaintext || !noExtensions || (code != 500 && code != 502 && code != 504) {
+			trace.mark("hello")
+
 			client.Close()
+
+			d.debugf("delivery SMTP hello with %s (%s) failed: %s\n", mxHost, ip, trace)
 
 			return nil, err
 		}
 
 		err = client.HELO(d.cfg.Server.Hostname)
 		if err != nil {
+			trace.mark("hello")
+
 			client.Close()
+
+			d.debugf("delivery SMTP hello with %s (%s) failed: %s\n", mxHost, ip, trace)
 
 			return nil, err
 		}
 
-		helloElapsed := time.Since(helloStarted).Round(time.Millisecond)
+		trace.mark("hello")
 
-		d.debugf("delivery SMTP session with %s (%s) ready: dial=%s greeting=%s hello=%s tls=false total=%s\n", mxHost, ip, dialElapsed, greetElapsed, helloElapsed, time.Since(started).Round(time.Millisecond))
+		d.debugf("delivery SMTP session with %s (%s) ready: tls=false %s\n", mxHost, ip, trace)
 
 		return client, nil
 	}
 
-	helloElapsed := time.Since(helloStarted).Round(time.Millisecond)
+	trace.mark("hello")
 
 	hasTLS, _ := client.Extension("STARTTLS")
 	if !hasTLS {
@@ -145,34 +153,38 @@ func (d *Deliverer) dialAndSession(ctx context.Context, mxHost string, ip net.IP
 			return nil, errTLSRequired
 		}
 
-		d.debugf("delivery SMTP session with %s (%s) ready: dial=%s greeting=%s hello=%s tls=false total=%s\n", mxHost, ip, dialElapsed, greetElapsed, helloElapsed, time.Since(started).Round(time.Millisecond))
+		d.debugf("delivery SMTP session with %s (%s) ready: tls=false %s\n", mxHost, ip, trace)
 
 		return client, nil
 	}
 
 	// STARTTLS is advertised: attempt once with the pre-chosen verification policy.
 	// Failure must not downgrade to plaintext or reconnect insecurely.
-	tlsStarted := time.Now()
 	err = d.upgradeTLS(client, mxHost, policy)
-	tlsElapsed := time.Since(tlsStarted).Round(time.Millisecond)
+
+	trace.mark("starttls")
 
 	if err != nil {
 		client.Close()
+
+		d.debugf("delivery STARTTLS with %s (%s) failed: %s\n", mxHost, ip, trace)
 
 		return nil, fmt.Errorf("%w: %v", errTLSFailed, err)
 	}
 
-	postEHLOStarted := time.Now()
 	err = client.EHLO(d.cfg.Server.Hostname)
-	postEHLOElapsed := time.Since(postEHLOStarted).Round(time.Millisecond)
+
+	trace.mark("post_ehlo")
 
 	if err != nil {
 		client.Close()
 
+		d.debugf("delivery post-TLS EHLO with %s (%s) failed: %s\n", mxHost, ip, trace)
+
 		return nil, err
 	}
 
-	d.debugf("delivery SMTP session with %s (%s) ready: dial=%s greeting=%s hello=%s starttls=%s post_ehlo=%s tls=true total=%s\n", mxHost, ip, dialElapsed, greetElapsed, helloElapsed, tlsElapsed, postEHLOElapsed, time.Since(started).Round(time.Millisecond))
+	d.debugf("delivery SMTP session with %s (%s) ready: tls=true %s\n", mxHost, ip, trace)
 
 	return client, nil
 }

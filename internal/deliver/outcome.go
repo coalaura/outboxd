@@ -66,10 +66,13 @@ func (d *Deliverer) complete(envelope *queue.Envelope) error {
 		return fmt.Errorf("dsn %s: %w", envelope.ID, err)
 	}
 
-	finishStarted := time.Now()
+	trace := d.newDebugTrace()
+
 	err = d.queue.Finish(envelope)
 
-	d.debugf("delivery %s durable queue completion took %s\n", envelope.ID, time.Since(finishStarted).Round(time.Millisecond))
+	trace.mark("queue_finish")
+
+	d.debugf("delivery %s durable queue completion: %s\n", envelope.ID, trace)
 
 	if err != nil {
 		if errors.Is(err, queue.ErrCleanup) {

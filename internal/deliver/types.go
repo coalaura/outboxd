@@ -18,10 +18,6 @@ type Logger interface {
 	Println(values ...any)
 }
 
-type debugLogger interface {
-	Debugf(format string, values ...any)
-}
-
 // Resolver looks up MX and address records.
 type Resolver interface {
 	LookupMX(ctx context.Context, name string) ([]*net.MX, error)
@@ -59,10 +55,11 @@ type Signer interface {
 
 // Deliverer drains the queue towards destination MX servers.
 type Deliverer struct {
-	cfg    *config.Config
-	queue  *queue.Queue
-	log    Logger
-	signer Signer
+	cfg      *config.Config
+	queue    *queue.Queue
+	log      Logger
+	signer   Signer
+	debugLog debugLogger
 
 	resolver Resolver
 	dialer   Dialer
@@ -107,13 +104,6 @@ type Deliverer struct {
 	// fatal signals Run to stop on queue persistence failure
 	mu    sync.Mutex
 	fatal error
-}
-
-func (d *Deliverer) debugf(format string, values ...any) {
-	logger, ok := d.log.(debugLogger)
-	if ok {
-		logger.Debugf(format, values...)
-	}
 }
 
 func (n netResolver) LookupMX(ctx context.Context, name string) ([]*net.MX, error) {

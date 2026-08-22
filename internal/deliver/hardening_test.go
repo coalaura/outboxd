@@ -88,12 +88,37 @@ func (l *captureLog) String() string {
 func TestOptionalDebugLogger(t *testing.T) {
 	logger := new(captureLog)
 
-	deliverer := &Deliverer{log: logger}
+	deliverer := &Deliverer{log: logger, debugLog: logger}
 
 	deliverer.debugf("delivery timing: %s\n", time.Second)
 
 	if got := logger.String(); got != "delivery timing: 1s\n" {
 		t.Fatalf("debug log=%q", got)
+	}
+}
+
+func TestDebugTrace(t *testing.T) {
+	logger := new(captureLog)
+
+	deliverer := &Deliverer{log: logger, debugLog: logger}
+
+	trace := deliverer.newDebugTrace()
+
+	trace.mark("phase")
+
+	deliverer.debugf("trace: %s\n", trace)
+
+	output := logger.String()
+	if !strings.Contains(output, "phase=") || !strings.Contains(output, "total=") {
+		t.Fatalf("trace log=%q", output)
+	}
+
+	disabled := (&Deliverer{}).newDebugTrace()
+
+	disabled.mark("ignored")
+
+	if disabled != nil {
+		t.Fatalf("disabled trace initialized: %+v", disabled)
 	}
 }
 

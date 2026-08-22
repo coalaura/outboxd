@@ -33,6 +33,12 @@ func New(cfg *config.Config, spool *queue.Queue, log Logger) *Deliverer {
 func NewWithSigner(cfg *config.Config, spool *queue.Queue, log Logger, signer Signer) *Deliverer {
 	defaults := config.Default().Delivery
 
+	var debugLog debugLogger
+
+	if cfg.LogLevel == "debug" {
+		debugLog, _ = log.(debugLogger)
+	}
+
 	userConcurrency := cfg.Delivery.UserConcurrency
 	if userConcurrency <= 0 {
 		userConcurrency = defaults.UserConcurrency
@@ -63,10 +69,11 @@ func NewWithSigner(cfg *config.Config, spool *queue.Queue, log Logger, signer Si
 	attemptLimit := max(cfg.Delivery.GlobalConcurrency*4, 8)
 
 	d := &Deliverer{
-		cfg:    cfg,
-		queue:  spool,
-		log:    log,
-		signer: signer,
+		cfg:      cfg,
+		queue:    spool,
+		log:      log,
+		signer:   signer,
+		debugLog: debugLog,
 
 		resolver: netResolver{r: net.DefaultResolver},
 		dialer:   &net.Dialer{Timeout: config.Duration(cfg.Delivery.ConnectionTimeout)},

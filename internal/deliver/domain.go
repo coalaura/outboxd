@@ -3,18 +3,19 @@ package deliver
 import (
 	"context"
 	"errors"
-	"time"
 
 	"github.com/coalaura/outboxd/internal/queue"
 )
 
 func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain string, indexes []int) error {
-	lookupStarted := time.Now()
+	trace := d.newDebugTrace()
+
 	hosts, err := d.hosts(ctx, domain)
-	lookupElapsed := time.Since(lookupStarted).Round(time.Millisecond)
+
+	trace.mark("mx_lookup")
 
 	if err != nil {
-		d.debugf("delivery %s MX lookup for %s failed in %s\n", envelope.ID, domain, lookupElapsed)
+		d.debugf("delivery %s MX lookup for %s failed: %s\n", envelope.ID, domain, trace)
 
 		if errors.Is(err, errNullMX) || errors.Is(err, errNoSuchDomain) {
 			d.reject(envelope, indexes, err.Error())
@@ -25,7 +26,7 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 		return err
 	}
 
-	d.debugf("delivery %s MX lookup for %s returned %d host(s) in %s\n", envelope.ID, domain, len(hosts), lookupElapsed)
+	d.debugf("delivery %s MX lookup for %s returned %d host(s): %s\n", envelope.ID, domain, len(hosts), trace)
 
 	var (
 		last              error
@@ -42,14 +43,16 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 		}
 
 		// Hold global only around MX I/O.
-		globalStarted := time.Now()
+		trace = d.newDebugTrace()
 
 		err = d.acquireGlobal(ctx)
 		if err != nil {
 			return err
 		}
 
-		d.debugf("delivery %s acquired global capacity for %s in %s\n", envelope.ID, host, time.Since(globalStarted).Round(time.Millisecond))
+		trace.mark("global_wait")
+
+		d.debugf("delivery %s acquired global capacity for %s: %s\n", envelope.ID, host, trace)
 
 		done, err := d.send(ctx, envelope, host, indexes)
 

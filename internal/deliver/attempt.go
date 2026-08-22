@@ -87,12 +87,12 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 	envelope.Attempts++
 	envelope.LastError = ""
 
-	attemptStarted := time.Now()
+	trace := d.newDebugTrace()
 
-	d.debugf("delivery %s attempt %d started: pending=%d age=%s\n", envelope.ID, envelope.Attempts, envelope.Pending(), time.Since(envelope.Created).Round(time.Millisecond))
+	d.debugf("delivery %s attempt %d started: pending=%d\n", envelope.ID, envelope.Attempts, envelope.Pending())
 
 	defer func() {
-		d.debugf("delivery %s attempt %d finished in %s\n", envelope.ID, envelope.Attempts, time.Since(attemptStarted).Round(time.Millisecond))
+		d.debugf("delivery %s attempt %d finished: %s\n", envelope.ID, envelope.Attempts, trace)
 	}()
 
 	groups := make(map[string][]int, len(envelope.Recipients))
