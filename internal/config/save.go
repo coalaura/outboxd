@@ -47,7 +47,7 @@ func (cfg *Config) marshal() ([]byte, error) {
 
 	comments := yaml.CommentMap{
 		"$.log_level":                            {yaml.HeadComment(` minimum log level: "debug", "print", "warn", or "error"; changes require a restart`)},
-		"$.server":                               {yaml.HeadComment(" authenticated SMTP submission server")},
+		"$.server":                               {yaml.HeadComment("\n# authenticated SMTP submission server")},
 		"$.server.hostname":                      {yaml.HeadComment(" public SMTP hostname used for EHLO, TLS, and reverse DNS")},
 		"$.server.domain":                        {yaml.HeadComment(" sending domain used for DKIM, SPF, and DMARC; prefer a dedicated subdomain")},
 		"$.server.max_message_bytes":             {yaml.HeadComment(" maximum accepted message size in bytes (bounded so one DATA worker fits the 512 MiB processing budget)")},
@@ -125,6 +125,7 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.delivery.submission_timeout":               {yaml.HeadComment(" timeout while waiting for the response after message data (maximum 30m; at least command_timeout)")},
 		"$.delivery.require_valid_mx_tls_certificate": {yaml.HeadComment(" legacy: when false with tls_mode=opportunistic, STARTTLS uses insecure verification on the first (only) attempt; prefer tls_mode=opportunistic_insecure. Never enables verified-then-insecure reconnect")},
 		"$.delivery.allow_private_destinations":       {yaml.HeadComment(" permit delivery to private/loopback MX addresses (default false)")},
+		"$.delivery.destination_allowlist":            {yaml.HeadComment(" exact destination IP addresses exempt from restricted-address filtering; prefer this to allowing all private destinations")},
 
 		"$.dns":                    {yaml.HeadComment("\n# values used to generate dns-records.txt (not outbound bind addresses)")},
 		"$.dns.public_ipv4":        {yaml.HeadComment(" static public IPv4 for A/SPF DNS generation")},
