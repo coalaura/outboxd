@@ -155,7 +155,7 @@ sudo systemctl status outboxd
 
 `dns`, `check` and `serve` load an existing DKIM key; they never create or replace one. Run `provision` if the key is missing. Stop the daemon before running `dns`, changing the DKIM key or generated DNS path or changing the config/data-directory path.
 
-## OpenPGP/MIME Signing
+## OpenPGP Signing And Key Discovery
 
 OpenPGP/MIME signing is optional globally and explicit per exact header `From` identity. Add an `openpgp.identities` entry with `sender`, `signing_key` and `signing: required`. The sender local part is case-sensitive and its domain is case-insensitive. A message whose `From` has no configured identity remains unsigned; a configured identity is never allowed to fall back to unsigned delivery.
 
@@ -163,7 +163,15 @@ Generate and configure an encrypted RSA-3072 key for an existing user's exact al
 
 `signing_key` accepts one armored or binary private-key entity and must contain the configured sender as a key identity plus a currently valid signing key. For an encrypted private key, set `passphrase_file` to a private file containing exactly one passphrase line. Do not put passphrases in the YAML or command line. Relative paths resolve below `server.data_directory`; absolute paths are allowed. Keys and passphrase files must be private regular files and may not be symlinks or reparse points.
 
-Signing produces RFC 3156 `multipart/signed` data before DKIM is applied. The exact canonical MIME entity placed in the first part is signed, with 8-bit MIME leaf bodies converted to quoted-printable. If key loading, canonicalization or signing fails, submission receives a temporary failure and the message is not DKIM-signed, queued or accepted. Normal `serve`, `check`, `dns` and `provision` operations never generate OpenPGP keys. outboxd does not encrypt messages, discover keys or support inline PGP. `check` validates configured OpenPGP keys without modifying them. Keys and passphrases are loaded only at startup, so rotation requires a restart.
+Signing produces RFC 3156 `multipart/signed` data before DKIM is applied. The exact canonical MIME entity placed in the first part is signed, with 8-bit MIME leaf bodies converted to quoted-printable. If key loading, canonicalization or signing fails, submission receives a temporary failure and the message is not DKIM-signed, queued or accepted. Normal `serve`, `check`, `dns` and `provision` operations never generate OpenPGP keys. outboxd does not encrypt messages or support inline PGP. `check` validates configured OpenPGP keys without modifying them. Keys and passphrases are loaded only at startup, so rotation requires a restart.
+
+outboxd derives a minimized public key containing the primary public key, exactly one active configured user ID and its self-signature, public subkeys and their binding signatures, and applicable revocations. It never publishes private packets, unrelated user IDs or third-party certifications. Three optional discovery mechanisms use these same bytes:
+
+- Run `outboxd -config /path/to/config.yml openpgp publish <new-output-directory>` to atomically create armored public-key files, a manifest, and static advanced and direct WKD trees with empty policy files. The destination must not already exist. Deploy the preferred advanced tree at `openpgpkey.<domain>` over HTTPS, or the direct tree at the sending domain, following the URLs in `MANIFEST.txt`. outboxd does not run an HTTP service.
+- Set `autocrypt: true` on an identity to add one folded Autocrypt Level 1 header to its signed messages. The public key must have a currently valid encryption key. `Autocrypt` must be present in `dkim.headers`, as it is in new configurations, so outboxd rejects a configuration that would publish an unauthenticated header. No `prefer-encrypt=mutual` claim is emitted because outboxd does not yet encrypt mail.
+- Set `dns.publish_openpgpkey: true` to include RFC 7929 OPENPGPKEY records in `outboxd dns` output. The guide provides standard base64 RDATA and generic TYPE61 presentation. Treat OPENPGPKEY as authenticated discovery only when the resolver reports a DNSSEC Secure result.
+
+Discovery is not a substitute for key trust. WKD authenticates publication through the domain's HTTPS deployment, Autocrypt provides in-band discovery and continuity rather than strong identity authentication, and OPENPGPKEY depends on DNSSEC. Publish fingerprints through an independent trusted channel when identity assurance matters.
 
 ## TLS Certificates
 
@@ -173,11 +181,12 @@ outboxd checks the configured certificate and key during TLS handshakes, rate-li
 
 ## DNS Checklist
 
-`outboxd dns` writes and prints the records to publish. It includes the DKIM record and guidance for SPF, DMARC and TLS-RPT. When reply rejection is enabled, it also includes MX records for each explicitly configured rejection domain; no MX records are generated for this feature while it is disabled.
+`outboxd dns` writes and prints the records to publish. It includes the DKIM record and guidance for SPF, DMARC and TLS-RPT, plus OPENPGPKEY records when explicitly enabled. When reply rejection is enabled, it also includes MX records for each explicitly configured rejection domain; no MX records are generated for this feature while it is disabled.
 
 - Publish A (and optionally AAAA) for `server.hostname` using `dns.public_ipv4` and `dns.public_ipv6`.
 - Set reverse DNS for each sending IP to `server.hostname` and ensure the hostname resolves back to the same IP.
 - Publish the generated DKIM TXT record.
+- If `dns.publish_openpgpkey` is enabled, publish each generated OPENPGPKEY record in a DNSSEC-signed zone.
 - Publish one SPF TXT record for each sending identity domain.
 - Start DMARC with `p=none`, inspect reports, then move to `quarantine` or `reject` when appropriate.
 - Use a separate service with an MX record wherever bounces or replies must actually be received. The optional outboxd MX endpoint only returns permanent SMTP rejections and does not receive or store mail.
@@ -223,6 +232,7 @@ outboxd [-config path] provision             # create config, data/spool and DKI
 outboxd [-config path] config update         # add current defaults to an existing config
 outboxd [-config path] user add <user> [sender...]
 outboxd [-config path] openpgp create <username> <sender>
+outboxd [-config path] openpgp publish <output-directory>
 outboxd [-config path] dns                   # write and print DNS instructions
 outboxd [-config path] check                 # verify local configuration and DNS
 outboxd [-config path] queue list

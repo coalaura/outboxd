@@ -12,6 +12,7 @@ require (
 	golang.org/x/crypto v0.54.0
 	golang.org/x/net v0.56.0
 	golang.org/x/sys v0.47.0
+	golang.org/x/text v0.40.0
 )
 
 require (
@@ -19,5 +20,4 @@ require (
 	github.com/coalaura/atom v0.1.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	golang.org/x/term v0.45.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
 )

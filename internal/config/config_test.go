@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -263,6 +264,21 @@ func TestOpenPGPIdentityValidation(t *testing.T) {
 	err = cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "must be required") {
 		t.Fatalf("optional Validate() error = %v", err)
+	}
+}
+
+func TestAutocryptRequiresDKIMCoverage(t *testing.T) {
+	cfg := Default()
+
+	cfg.OpenPGP.Identities = []OpenPGPIdentity{{Sender: "alice@example.com", SigningKey: "openpgp/alice.asc", Signing: "required", Autocrypt: true}}
+
+	cfg.DKIM.Headers = slices.DeleteFunc(cfg.DKIM.Headers, func(header string) bool {
+		return strings.EqualFold(header, "Autocrypt")
+	})
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "requires Autocrypt in dkim.headers") {
+		t.Fatalf("Validate() error = %v", err)
 	}
 }
 

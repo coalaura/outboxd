@@ -98,6 +98,7 @@ func Default() *Config {
 				"Content-Type",
 				"Content-Transfer-Encoding",
 				"Reply-To",
+				"Autocrypt",
 			},
 		},
 		Delivery: Delivery{

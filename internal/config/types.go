@@ -75,6 +75,7 @@ type OpenPGPIdentity struct {
 	SigningKey     string `yaml:"signing_key"`
 	PassphraseFile string `yaml:"passphrase_file,omitempty"`
 	Signing        string `yaml:"signing"`
+	Autocrypt      bool   `yaml:"autocrypt"`
 }
 
 // gost:preserve-layout
@@ -109,13 +110,14 @@ type Delivery struct {
 }
 
 type DNS struct {
-	PublicIPv4  string   `yaml:"public_ipv4"`
-	PublicIPv6  string   `yaml:"public_ipv6"`
-	DMARC       string   `yaml:"dmarc_policy"`
-	ReportURI   string   `yaml:"dmarc_report_uri"`
-	TLSRPTURI   string   `yaml:"tlsrpt_uri"`
-	SPFIncludes []string `yaml:"spf_includes"`
-	OutputFile  string   `yaml:"output_file"`
+	PublicIPv4        string   `yaml:"public_ipv4"`
+	PublicIPv6        string   `yaml:"public_ipv6"`
+	DMARC             string   `yaml:"dmarc_policy"`
+	ReportURI         string   `yaml:"dmarc_report_uri"`
+	TLSRPTURI         string   `yaml:"tlsrpt_uri"`
+	SPFIncludes       []string `yaml:"spf_includes"`
+	PublishOpenPGPKey bool     `yaml:"publish_openpgpkey"`
+	OutputFile        string   `yaml:"output_file"`
 }
 
 type User struct {

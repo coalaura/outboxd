@@ -15,6 +15,35 @@ func resetHooks(t *testing.T) {
 	t.Cleanup(func() { SetHooks(Hooks{}) })
 }
 
+func TestRenameNoReplacePreservesExistingTarget(t *testing.T) {
+	directory := t.TempDir()
+
+	source := filepath.Join(directory, "source")
+	target := filepath.Join(directory, "target")
+
+	err := os.Mkdir(source, 0700)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = os.Mkdir(target, 0700)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = RenameNoReplace(source, target)
+	if err == nil {
+		t.Fatal("RenameNoReplace() replaced an existing target")
+	}
+
+	for _, path := range []string{source, target} {
+		info, statErr := os.Stat(path)
+		if statErr != nil || !info.IsDir() {
+			t.Fatalf("directory %s was not preserved: info=%v err=%v", path, info, statErr)
+		}
+	}
+}
+
 func TestMkdirDurableSyncsEveryNewParent(t *testing.T) {
 	resetHooks(t)
 

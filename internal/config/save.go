@@ -99,8 +99,8 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.dkim.private_key_file": {yaml.HeadComment(" create-once signing key provisioned explicitly with 'outboxd provision'")},
 		"$.dkim.headers":          {yaml.HeadComment(" message headers included in the DKIM signature; From is mandatory")},
 
-		"$.openpgp":            {yaml.HeadComment("\n# optional RFC 3156 OpenPGP/MIME signing; configured identities are required-signing")},
-		"$.openpgp.identities": {yaml.HeadComment(" exact From identities and their generated or operator-managed private keys; sender local parts are case-sensitive, relative paths resolve below data_directory, and signing must be required")},
+		"$.openpgp":            {yaml.HeadComment("\n# optional RFC 3156 OpenPGP/MIME signing and key publication")},
+		"$.openpgp.identities": {yaml.HeadComment(" exact From identities and their generated or operator-managed private keys; sender local parts are case-sensitive, relative paths resolve below data_directory, signing must be required, and autocrypt publishes the minimized public key in signed messages")},
 
 		"$.delivery":                                  {yaml.HeadComment("\n# outbound SMTP delivery and retry policy")},
 		"$.delivery.tls_mode":                         {yaml.HeadComment(` destination TLS policy (chosen before connect; never verified-then-insecure fallback): "opportunistic" (verify STARTTLS when offered; plaintext only if allow_plaintext), "required" (STARTTLS required, verified), "opportunistic_insecure" (STARTTLS without cert verification — legacy/dev only)`)},
@@ -124,14 +124,15 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.delivery.require_valid_mx_tls_certificate": {yaml.HeadComment(" legacy: when false with tls_mode=opportunistic, STARTTLS uses insecure verification on the first (only) attempt; prefer tls_mode=opportunistic_insecure. Never enables verified-then-insecure reconnect")},
 		"$.delivery.allow_private_destinations":       {yaml.HeadComment(" permit delivery to private/loopback MX addresses (default false)")},
 
-		"$.dns":                  {yaml.HeadComment("\n# values used to generate dns-records.txt (not outbound bind addresses)")},
-		"$.dns.public_ipv4":      {yaml.HeadComment(" static public IPv4 for A/SPF DNS generation")},
-		"$.dns.public_ipv6":      {yaml.HeadComment(" static public IPv6 for AAAA/SPF DNS generation; omit until forward and reverse DNS are ready")},
-		"$.dns.dmarc_policy":     {yaml.HeadComment(` start with "none"; stage to "quarantine" then "reject" after verifying alignment`)},
-		"$.dns.dmarc_report_uri": {yaml.HeadComment(" DMARC aggregate-report URI (rua), for example mailto:dmarc@example.com")},
-		"$.dns.tlsrpt_uri":       {yaml.HeadComment(" SMTP TLS reporting URI (separate from DMARC); not proof of outbound TLS quality")},
-		"$.dns.spf_includes":     {yaml.HeadComment(" additional SPF include: domains for other legitimate senders")},
-		"$.dns.output_file":      {yaml.HeadComment(" generated DNS instructions; relative paths are below data_directory")},
+		"$.dns":                    {yaml.HeadComment("\n# values used to generate dns-records.txt (not outbound bind addresses)")},
+		"$.dns.public_ipv4":        {yaml.HeadComment(" static public IPv4 for A/SPF DNS generation")},
+		"$.dns.public_ipv6":        {yaml.HeadComment(" static public IPv6 for AAAA/SPF DNS generation; omit until forward and reverse DNS are ready")},
+		"$.dns.dmarc_policy":       {yaml.HeadComment(` start with "none"; stage to "quarantine" then "reject" after verifying alignment`)},
+		"$.dns.dmarc_report_uri":   {yaml.HeadComment(" DMARC aggregate-report URI (rua), for example mailto:dmarc@example.com")},
+		"$.dns.tlsrpt_uri":         {yaml.HeadComment(" SMTP TLS reporting URI (separate from DMARC); not proof of outbound TLS quality")},
+		"$.dns.spf_includes":       {yaml.HeadComment(" additional SPF include: domains for other legitimate senders")},
+		"$.dns.publish_openpgpkey": {yaml.HeadComment(" emit RFC 7929 OPENPGPKEY records for configured OpenPGP identities; useful only with DNSSEC")},
+		"$.dns.output_file":        {yaml.HeadComment(" generated DNS instructions; relative paths are below data_directory")},
 
 		"$.users": {yaml.HeadComment("\n# SMTP users; password_hash must contain an Argon2id hash, never plaintext; migration hashes must use m=19456,t=2,p=1, a 16-byte salt, and a 32-byte output")},
 	}

@@ -94,6 +94,40 @@ func TestSignProducesVerifiableRFC3156Message(t *testing.T) {
 	}
 }
 
+func TestSignAddsAutocryptOutsideSignedMIMEEntity(t *testing.T) {
+	signers, entity := testSigners(t, "alice@example.com")
+
+	public, err := publicIdentity(entity, "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signers.identities["alice@example.com"].autocrypt, err = autocryptField(public)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	message := []byte("From: Alice <alice@example.com>\r\nTo: Bob <bob@example.net>\r\nSubject: signed\r\naUtOcRyPt: addr=mallory@example.net;\r\n keydata=AAAA\r\nContent-Type: text/plain\r\n\r\nhello\r\n")
+
+	signed, ok, err := signers.Sign(context.Background(), "alice@example.com", message)
+	if err != nil || !ok {
+		t.Fatalf("Sign() = signed %v, err %v", ok, err)
+	}
+
+	headerEnd := bytes.Index(signed, []byte("\r\n\r\n"))
+	if headerEnd < 0 || bytes.Count(signed[:headerEnd], []byte("Autocrypt:")) != 1 {
+		t.Fatalf("outer headers do not contain exactly one Autocrypt field:\n%s", signed)
+	}
+
+	if bytes.Contains(signed[headerEnd+4:], []byte("Autocrypt:")) {
+		t.Fatal("Autocrypt field was included in the signed MIME entity")
+	}
+
+	if bytes.Contains(signed, []byte("mallory@example.net")) || bytes.Contains(signed, []byte("keydata=AAAA")) {
+		t.Fatal("submitted Autocrypt field was not replaced")
+	}
+}
+
 func TestSignLeavesUnconfiguredSenderUnchanged(t *testing.T) {
 	signers, _ := testSigners(t, "alice@example.com")
 

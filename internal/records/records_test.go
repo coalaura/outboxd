@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/coalaura/outboxd/internal/config"
+	pgpsign "github.com/coalaura/outboxd/internal/openpgp"
 )
 
 func TestSPFDedupeWhenHostnameEqualsDomain(t *testing.T) {
@@ -240,5 +241,62 @@ func TestReplyRejectionGuidanceIncludesUncoveredEnvelopeDomains(t *testing.T) {
 
 	if strings.Contains(text, "not covered by reply rejection (example.com") {
 		t.Fatalf("covered envelope domain included in guidance:\n%s", text)
+	}
+}
+
+func TestOpenPGPRecordsUseRFC7929OwnerAndBinaryRDATA(t *testing.T) {
+	identity := pgpsign.PublicIdentity{Sender: "Alice@EXAMPLE.com", Fingerprint: "AABB", Key: []byte{0x99, 0x01, 0x02, 0x03}}
+
+	records, err := buildOpenPGPRecords([]pgpsign.PublicIdentity{identity})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(records) != 1 {
+		t.Fatalf("OPENPGPKEY records = %d", len(records))
+	}
+
+	record := records[0]
+	wantOwner := "3bc51062973c458d5a6f2d8d64a023246354ad7e064b1e4e009ec8a0._openpgpkey.example.com."
+
+	if record.Name != wantOwner || record.Type != "OPENPGPKEY" || record.Value != "mQECAw==" {
+		t.Fatalf("OPENPGPKEY record = %+v", record)
+	}
+
+	cfg := config.Default()
+
+	cfg.Server.DataDirectory = t.TempDir()
+
+	_, body, err := Write(cfg, "v=DKIM1; p=x", identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	text := string(body)
+	if !strings.Contains(text, "generic TYPE61 \\# 4 99010203") || !strings.Contains(text, "DNSSEC Secure") {
+		t.Fatalf("OPENPGPKEY guidance is incomplete:\n%s", text)
+	}
+}
+
+func TestOpenPGPRecordsPreserveLocalPartCase(t *testing.T) {
+	records, err := buildOpenPGPRecords([]pgpsign.PublicIdentity{
+		{Sender: "Alice@example.com", Key: []byte("one")},
+		{Sender: "alice@example.com", Key: []byte("two")},
+	})
+
+	if err != nil || len(records) != 2 || records[0].Name == records[1].Name {
+		t.Fatalf("buildOpenPGPRecords() = %+v, error = %v", records, err)
+	}
+}
+
+func TestOpenPGPRecordsRejectOversizedRDATA(t *testing.T) {
+	_, err := buildOpenPGPRecords([]pgpsign.PublicIdentity{{Sender: "alice@example.com", Key: make([]byte, 65535)}})
+	if err != nil {
+		t.Fatalf("65535-byte OPENPGPKEY rejected: %v", err)
+	}
+
+	_, err = buildOpenPGPRecords([]pgpsign.PublicIdentity{{Sender: "alice@example.com", Key: make([]byte, 65536)}})
+	if err == nil || !strings.Contains(err.Error(), "65535") {
+		t.Fatalf("65536-byte OPENPGPKEY error = %v", err)
 	}
 }

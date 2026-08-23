@@ -2,6 +2,8 @@ package records
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/netip"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/coalaura/outboxd/internal/config"
 	"github.com/coalaura/outboxd/internal/disk"
+	pgpsign "github.com/coalaura/outboxd/internal/openpgp"
 )
 
 const maxString = 255
@@ -23,6 +26,7 @@ type Record struct {
 	Type    string
 	Value   string
 	Purpose string
+	Binary  []byte
 }
 
 // Build returns every DNS record needed for the configured placement.
@@ -128,7 +132,7 @@ func Build(cfg *config.Config, dkim string) []Record {
 }
 
 // Write renders the DNS instructions next to the other generated files.
-func Write(cfg *config.Config, dkim string) (string, []byte, error) {
+func Write(cfg *config.Config, dkim string, publicIdentities ...pgpsign.PublicIdentity) (string, []byte, error) {
 	err := config.ValidateDMARCReportURIList(cfg.DNS.ReportURI)
 	if err != nil {
 		return "", nil, fmt.Errorf("dns.dmarc_report_uri: %w", err)
@@ -192,11 +196,23 @@ func Write(cfg *config.Config, dkim string) (string, []byte, error) {
 	buffer.WriteString("- TLS-RPT (_smtp._tls) is optional and separate from DMARC rua\n")
 	buffer.WriteString("- TXT values above 255 characters are shown pre-split; keep the quoting as-is\n")
 
+	if len(publicIdentities) > 0 {
+		buffer.WriteString("- OPENPGPKEY authenticates key publication only when the DNS response is DNSSEC Secure; otherwise treat it as unauthenticated discovery\n")
+		buffer.WriteString("- OPENPGPKEY values are binary RDATA shown as standard base64 and generic TYPE61 presentation for provider compatibility\n")
+	}
+
 	if cfg.TLS.Mode == "self_signed" {
 		buffer.WriteString("- tls.mode is self_signed (development only); replace with a publicly trusted certificate for production clients\n")
 	}
 
 	records := Build(cfg, dkim)
+
+	openPGPRecords, err := buildOpenPGPRecords(publicIdentities)
+	if err != nil {
+		return "", nil, err
+	}
+
+	records = append(records, openPGPRecords...)
 
 	for i, record := range records {
 		buffer.WriteByte('\n')
@@ -205,7 +221,10 @@ func Write(cfg *config.Config, dkim string) (string, []byte, error) {
 		fmt.Fprintf(&buffer, "  name  %s\n", record.Name)
 		fmt.Fprintf(&buffer, "  type  %s\n", record.Type)
 
-		if record.Type == "TXT" {
+		if len(record.Binary) > 0 {
+			fmt.Fprintf(&buffer, "  value %s\n", base64.StdEncoding.EncodeToString(record.Binary))
+			fmt.Fprintf(&buffer, "  generic TYPE61 \\# %d %s\n", len(record.Binary), hex.EncodeToString(record.Binary))
+		} else if record.Type == "TXT" {
 			fmt.Fprintf(&buffer, "  value %s\n", quote(record.Value))
 		} else {
 			fmt.Fprintf(&buffer, "  value %s\n", record.Value)
@@ -225,6 +244,42 @@ func Write(cfg *config.Config, dkim string) (string, []byte, error) {
 	body := buffer.Bytes()
 
 	return path, body, disk.Write(path, body, 0644)
+}
+
+func buildOpenPGPRecords(identities []pgpsign.PublicIdentity) ([]Record, error) {
+	records := make([]Record, 0, len(identities))
+	owners := make(map[string][]byte, len(identities))
+
+	for _, identity := range identities {
+		if len(identity.Key) > 65535 {
+			return nil, fmt.Errorf("OPENPGPKEY for %s is %d bytes; DNS RDATA is limited to 65535 bytes", identity.Sender, len(identity.Key))
+		}
+
+		owner, err := pgpsign.OpenPGPKeyOwner(identity.Sender)
+		if err != nil {
+			return nil, err
+		}
+
+		if previous, ok := owners[owner]; ok {
+			if !bytes.Equal(previous, identity.Key) {
+				return nil, fmt.Errorf("OPENPGPKEY owner collision at %s", owner)
+			}
+
+			continue
+		}
+
+		owners[owner] = identity.Key
+
+		records = append(records, Record{
+			Name:    owner,
+			Type:    "OPENPGPKEY",
+			Value:   base64.StdEncoding.EncodeToString(identity.Key),
+			Purpose: fmt.Sprintf("OpenPGP public key discovery for %s (requires DNSSEC for authenticated discovery)", identity.Sender),
+			Binary:  append([]byte(nil), identity.Key...),
+		})
+	}
+
+	return records, nil
 }
 
 func uncoveredEnvelopeDomains(cfg *config.Config) []string {

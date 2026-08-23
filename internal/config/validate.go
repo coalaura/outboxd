@@ -212,6 +212,8 @@ func (cfg *Config) Validate() error {
 
 	openPGPSenders := make(map[string]struct{}, len(cfg.OpenPGP.Identities))
 
+	_, signsAutocrypt := seenDKIMHeaders["autocrypt"]
+
 	if len(cfg.OpenPGP.Identities) > MaxOpenPGPIdentities {
 		return fmt.Errorf("openpgp.identities must contain at most %d entries", MaxOpenPGPIdentities)
 	}
@@ -241,6 +243,10 @@ func (cfg *Config) Validate() error {
 
 		if identity.Signing != "required" {
 			return fmt.Errorf("openpgp.identities[%d].signing must be required", i)
+		}
+
+		if identity.Autocrypt && !signsAutocrypt {
+			return fmt.Errorf("openpgp.identities[%d].autocrypt requires Autocrypt in dkim.headers", i)
 		}
 	}
 

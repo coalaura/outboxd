@@ -30,8 +30,9 @@ const (
 var ErrMessageTooLarge = errors.New("signed message exceeds configured maximum size")
 
 type identity struct {
-	entity *pgp.Entity
-	gate   chan struct{}
+	entity    *pgp.Entity
+	autocrypt []byte
+	gate      chan struct{}
 }
 
 // Signers is an immutable startup snapshot of configured signing identities.
@@ -88,35 +89,10 @@ func Load(cfg *config.Config) (*Signers, error) {
 }
 
 func loadIdentity(cfg *config.Config, configured config.OpenPGPIdentity) (*identity, error) {
-	keyPath := cfg.ResolvePath(configured.SigningKey)
-	if !filepath.IsAbs(configured.SigningKey) {
-		err := cfg.CheckGeneratedParents(keyPath)
-		if err != nil {
-			return nil, fmt.Errorf("check signing key path: %w", err)
-		}
-	}
-
-	keyData, err := config.ReadCheckedFile(keyPath, true, false, maxKeyBytes)
+	entity, err := readEntity(cfg, configured)
 	if err != nil {
-		return nil, fmt.Errorf("read signing key: %w", err)
+		return nil, err
 	}
-
-	defer clear(keyData)
-
-	entities, err := pgp.ReadArmoredKeyRing(bytes.NewReader(keyData))
-	if err != nil {
-		entities, err = pgp.ReadKeyRing(bytes.NewReader(keyData))
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("parse signing key: %w", err)
-	}
-
-	if len(entities) != 1 {
-		return nil, fmt.Errorf("signing key must contain exactly one entity, got %d", len(entities))
-	}
-
-	entity := entities[0]
 
 	key, ok := entity.SigningKey(time.Now())
 	if !ok || key.PrivateKey == nil {
@@ -155,7 +131,21 @@ func loadIdentity(cfg *config.Config, configured config.OpenPGPIdentity) (*ident
 		return nil, fmt.Errorf("validate signing key: %w", err)
 	}
 
-	return &identity{entity: entity, gate: make(chan struct{}, 1)}, nil
+	loaded := &identity{entity: entity, gate: make(chan struct{}, 1)}
+
+	if configured.Autocrypt {
+		public, err := publicIdentity(entity, configured.Sender)
+		if err != nil {
+			return nil, err
+		}
+
+		loaded.autocrypt, err = autocryptField(public)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return loaded, nil
 }
 
 func validatePrivateComponents(entity *pgp.Entity, passphraseConfigured bool) (bool, error) {
@@ -281,7 +271,7 @@ func (s *Signers) Sign(ctx context.Context, sender string, data []byte) ([]byte,
 		return nil, false, err
 	}
 
-	outer, entity, err := splitMessage(data)
+	outer, entity, err := splitMessage(data, len(configured.autocrypt) != 0)
 	if err != nil {
 		return nil, false, err
 	}
@@ -324,6 +314,8 @@ func (s *Signers) Sign(ctx context.Context, sender string, data []byte) ([]byte,
 	}
 
 	armor := bytes.ReplaceAll(signature.Bytes(), []byte("\n"), []byte("\r\n"))
+
+	outer = append(outer, configured.autocrypt...)
 
 	result := buildSignedMessage(outer, entity, armor, boundary)
 
@@ -379,7 +371,7 @@ func buildSignedMessage(outer, entity, signature []byte, boundary string) []byte
 	return result.Bytes()
 }
 
-func splitMessage(data []byte) ([]byte, []byte, error) {
+func splitMessage(data []byte, replaceAutocrypt bool) ([]byte, []byte, error) {
 	headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
 	if headerEnd < 0 {
 		return nil, nil, errors.New("message has no header/body separator")
@@ -396,7 +388,7 @@ func splitMessage(data []byte) ([]byte, []byte, error) {
 		name := fieldName(field)
 		if strings.HasPrefix(name, "content-") {
 			entity.Write(field)
-		} else if name != "mime-version" {
+		} else if name != "mime-version" && !(replaceAutocrypt && name == "autocrypt") {
 			outer.Write(field)
 		}
 	}

@@ -476,6 +476,35 @@ func Rename(oldpath, newpath string) error {
 	return nil
 }
 
+// RenameNoReplace moves oldpath to newpath only when newpath does not exist,
+// then syncs the parent directory.
+func RenameNoReplace(oldpath, newpath string) error {
+	h := currentHooks()
+
+	if h.BeforeRename != nil {
+		err := h.BeforeRename(oldpath, newpath)
+		if err != nil {
+			return err
+		}
+	}
+
+	err := renameNoReplace(oldpath, newpath)
+	if err != nil {
+		return err
+	}
+
+	h = currentHooks()
+
+	if h.AfterRename != nil {
+		err = h.AfterRename(oldpath, newpath)
+		if err != nil {
+			return err
+		}
+	}
+
+	return Sync(filepath.Dir(newpath))
+}
+
 func commit(file *os.File, temp, path string, mode os.FileMode) error {
 	err := file.Chmod(mode)
 	if err != nil {

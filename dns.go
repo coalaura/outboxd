@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	pgpsign "github.com/coalaura/outboxd/internal/openpgp"
 	"github.com/coalaura/outboxd/internal/records"
 	"github.com/coalaura/outboxd/internal/sign"
 )
@@ -28,7 +29,16 @@ func dns(configPath string) error {
 		return fmt.Errorf("load DKIM key (run 'outboxd -config %s provision' first): %w", cfg.Path(), err)
 	}
 
-	_, body, err := records.Write(cfg, signer.Record())
+	var publicIdentities []pgpsign.PublicIdentity
+
+	if cfg.DNS.PublishOpenPGPKey {
+		publicIdentities, err = pgpsign.LoadPublic(cfg)
+		if err != nil {
+			return fmt.Errorf("load OpenPGP public keys: %w", err)
+		}
+	}
+
+	_, body, err := records.Write(cfg, signer.Record(), publicIdentities...)
 	if err != nil {
 		return err
 	}
