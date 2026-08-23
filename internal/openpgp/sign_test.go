@@ -22,6 +22,12 @@ import (
 	"github.com/coalaura/outboxd/internal/config"
 )
 
+type contentTransferEncodingCase struct {
+	name   string
+	entity string
+	want   string
+}
+
 func testSigners(t *testing.T, sender string) (*Signers, *pgp.Entity) {
 	t.Helper()
 
@@ -256,11 +262,7 @@ func TestCanonicalizeUsesDefaultContentType(t *testing.T) {
 }
 
 func TestCanonicalizeValidatesContentTransferEncodingBeforeFastPaths(t *testing.T) {
-	tests := []struct {
-		name   string
-		entity string
-		want   string
-	}{
+	tests := []contentTransferEncodingCase{
 		{name: "leaf unsupported seven bit", entity: "Content-Transfer-Encoding: x-unknown\r\n\r\nhello\r\n", want: "unsupported MIME"},
 		{name: "leaf empty", entity: "Content-Transfer-Encoding:\r\n\r\nhello\r\n", want: "Encoding is empty"},
 		{name: "leaf duplicate", entity: "Content-Transfer-Encoding: 7bit\r\nContent-Transfer-Encoding: 8bit\r\n\r\nhello\r\n", want: "duplicate Content-Transfer-Encoding"},

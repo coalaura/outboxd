@@ -64,6 +64,18 @@ type metadataFaultCase struct {
 	hooks func(string) disk.Hooks
 }
 
+type linkedDeadSourceOperation struct {
+	name string
+	run  func(*Queue, string) error
+}
+
+type linkedDeadSourceState struct {
+	name      string
+	namespace string
+	uncertain bool
+	wantError bool
+}
+
 func clearHooks(t *testing.T) {
 	t.Helper()
 
@@ -6276,10 +6288,7 @@ func TestPrunePreservesBlockedReadyDeadConflict(t *testing.T) {
 }
 
 func TestLinkedDeadSourceOperationsRequireCompletedDSN(t *testing.T) {
-	operations := []struct {
-		name string
-		run  func(*Queue, string) error
-	}{
+	operations := []linkedDeadSourceOperation{
 		{"revive", func(q *Queue, id string) error {
 			_, err := q.ReviveDead(id)
 			return err
@@ -6293,12 +6302,7 @@ func TestLinkedDeadSourceOperationsRequireCompletedDSN(t *testing.T) {
 		}},
 	}
 
-	states := []struct {
-		name      string
-		namespace string
-		uncertain bool
-		wantError bool
-	}{
+	states := []linkedDeadSourceState{
 		{"staged", dirDSN, false, true},
 		{"ready", dirReady, false, true},
 		{"dead", dirDead, false, true},

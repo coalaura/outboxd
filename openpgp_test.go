@@ -2,11 +2,13 @@ package main
 
 import "testing"
 
+type openPGPCommandCase struct {
+	args  []string
+	usage string
+}
+
 func TestOpenPGPCommandRequiresExactArguments(t *testing.T) {
-	tests := []struct {
-		args  []string
-		usage string
-	}{
+	tests := []openPGPCommandCase{
 		{args: nil, usage: "usage: outboxd openpgp <create|publish> ..."},
 		{args: []string{"create"}, usage: "usage: outboxd openpgp create <username> <sender>"},
 		{args: []string{"create", "alice"}, usage: "usage: outboxd openpgp create <username> <sender>"},

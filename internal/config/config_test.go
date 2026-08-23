@@ -46,6 +46,11 @@ type stringBoundaryCase struct {
 	valid bool
 }
 
+type replyRejectionValidationCase struct {
+	name string
+	set  func(*Config)
+}
+
 func writeYAML(t *testing.T, dir, name, body string) string {
 	t.Helper()
 
@@ -335,10 +340,7 @@ func TestReplyRejectionValidation(t *testing.T) {
 		t.Fatalf("domain not canonicalized: %q", cfg.ReplyRejection.Domains[0])
 	}
 
-	tests := []struct {
-		name string
-		set  func(*Config)
-	}{
+	tests := []replyRejectionValidationCase{
 		{"no domains", func(c *Config) {
 			c.ReplyRejection.Domains = nil
 		}},

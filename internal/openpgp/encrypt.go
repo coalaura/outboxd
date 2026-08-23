@@ -212,12 +212,7 @@ func readRecipientEntity(path string) (*pgp.Entity, []string, error) {
 			return nil, nil, fmt.Errorf("verify user ID self-signature: %w", err)
 		}
 
-		parsed, err := mail.ParseAddress(identity.Name)
-		if err != nil {
-			continue
-		}
-
-		address, err := mailbox.CanonicalAddress(parsed.Address)
+		address, err := recipientIdentityAddress(identity.Name)
 		if err != nil {
 			continue
 		}
@@ -238,6 +233,29 @@ func readRecipientEntity(path string) (*pgp.Entity, []string, error) {
 	sort.Strings(result)
 
 	return entity, result, nil
+}
+
+func recipientIdentityAddress(value string) (string, error) {
+	parsed, err := mail.ParseAddress(value)
+	if err == nil {
+		return mailbox.CanonicalAddress(parsed.Address)
+	}
+
+	open := strings.LastIndexByte(value, '<')
+	if open < 0 || !strings.HasSuffix(value, ">") {
+		return "", errors.New("user ID is not an RFC mailbox or terminal angle address")
+	}
+
+	if strings.ContainsAny(value[:open], "<>") {
+		return "", errors.New("user ID contains an ambiguous angle address")
+	}
+
+	address := value[open+1 : len(value)-1]
+	if address == "" || strings.TrimSpace(address) != address || strings.ContainsAny(address, "<>") {
+		return "", errors.New("user ID has an invalid terminal angle address")
+	}
+
+	return mailbox.CanonicalAddress(address)
 }
 
 // Encrypt wraps data in multipart/encrypted using the identity returned by

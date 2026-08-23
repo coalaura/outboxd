@@ -24,6 +24,16 @@ type captureLogger struct {
 	out strings.Builder
 }
 
+type listedOnlyRejectionCase struct {
+	recipient string
+	want      string
+}
+
+type rejectionLogCase struct {
+	recipient string
+	reason    string
+}
+
 func (l *captureLogger) Printf(format string, values ...any) {
 	l.mu.Lock()
 	fmt.Fprintf(&l.out, format, values...)
@@ -149,10 +159,7 @@ func readResponse(t *testing.T, reader *bufio.Reader, code string) {
 func TestListedOnlyRejections(t *testing.T) {
 	srv, _, _ := testServer(t, "listed_only")
 
-	tests := []struct {
-		recipient string
-		want      string
-	}{
+	tests := []listedOnlyRejectionCase{
 		{"noreply@example.com", "550 5.1.1 Contact support@example.com"},
 		{"updates@example.com", "550 5.1.1 This address does not accept replies"},
 		{"unknown@example.com", "550 5.1.1 Recipient does not exist"},
@@ -193,10 +200,7 @@ func TestRecipientRejectionsAreLogged(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tests := []struct {
-		recipient string
-		reason    string
-	}{
+	tests := []rejectionLogCase{
 		{"invalid", "invalid recipient address"},
 		{"user@elsewhere.example", "relaying denied"},
 		{"noreply@example.com", "configured recipient"},

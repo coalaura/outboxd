@@ -17,6 +17,11 @@ import (
 	"github.com/coalaura/outboxd/internal/config"
 )
 
+type recipientIdentityAddressCase struct {
+	identity string
+	want     string
+}
+
 func TestLoadRecipientsEncryptsRFC3156Message(t *testing.T) {
 	directory := filepath.Join(t.TempDir(), "recipients")
 
@@ -25,7 +30,7 @@ func TestLoadRecipientsEncryptsRFC3156Message(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	entity, err := pgp.NewEntity("Bob", "", "bob@exämple.NET", &packet.Config{Algorithm: packet.PubKeyAlgoEdDSA})
+	entity, err := pgp.NewEntity("bob@exämple.NET", "", "bob@exämple.NET", &packet.Config{Algorithm: packet.PubKeyAlgoEdDSA})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,6 +133,45 @@ func TestLoadRecipientsEncryptsRFC3156Message(t *testing.T) {
 func TestSupportedEncryptionAlgorithmRejectsElGamal(t *testing.T) {
 	if supportedEncryptionAlgorithm(packet.PubKeyAlgoElGamal) {
 		t.Fatal("ElGamal recipient key accepted")
+	}
+}
+
+func TestRecipientIdentityAddress(t *testing.T) {
+	tests := []recipientIdentityAddressCase{
+		{identity: "Joe <test@example.com>", want: "test@example.com"},
+		{identity: "test@example.com <test@example.com>", want: "test@example.com"},
+		{identity: "<test@example.com>", want: "test@example.com"},
+		{identity: "test@example.com", want: "test@example.com"},
+		{identity: "Joe <test@example.com>", want: "test@example.com"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.identity, func(t *testing.T) {
+			got, err := recipientIdentityAddress(test.identity)
+			if err != nil || got != test.want {
+				t.Fatalf("recipientIdentityAddress(%q) = %q, %v; want %q", test.identity, got, err, test.want)
+			}
+		})
+	}
+}
+
+func TestRecipientIdentityAddressRejectsAmbiguousText(t *testing.T) {
+	tests := []string{
+		"some arbitrary text laura@wiese2.org",
+		"foo <not-an-email>",
+		"foo <a@example.com> garbage",
+		"foo <a@example.com> <b@example.com>",
+		"foo <<a@example.com>>",
+		"foo < a@example.com >",
+	}
+
+	for _, identity := range tests {
+		t.Run(identity, func(t *testing.T) {
+			address, err := recipientIdentityAddress(identity)
+			if err == nil {
+				t.Fatalf("recipientIdentityAddress(%q) = %q, want error", identity, address)
+			}
+		})
 	}
 }
 
