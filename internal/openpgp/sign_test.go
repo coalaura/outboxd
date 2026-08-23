@@ -5,7 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"mime"
+	"mime/multipart"
+	"net/mail"
 	"os"
 	"path/filepath"
 	"strings"
@@ -76,7 +79,7 @@ func TestSignProducesVerifiableRFC3156Message(t *testing.T) {
 		t.Fatal("second MIME boundary not found")
 	}
 
-	firstPart := signed[firstStart : firstStart+second+2]
+	firstPart := signed[firstStart : firstStart+second]
 
 	sigStart := bytes.Index(signed[firstStart+second:], []byte("-----BEGIN PGP SIGNATURE-----"))
 	if sigStart < 0 {
@@ -91,6 +94,65 @@ func TestSignProducesVerifiableRFC3156Message(t *testing.T) {
 	_, err = pgp.CheckArmoredDetachedSignature(pgp.EntityList{entity}, bytes.NewReader(firstPart), bytes.NewReader(signed[sigStart:sigEnd]), nil)
 	if err != nil {
 		t.Fatalf("detached signature does not verify over emitted first part: %v", err)
+	}
+}
+
+func TestSignVerifiesEntityRecoveredByMultipartParser(t *testing.T) {
+	signers, entity := testSigners(t, "alice@example.com")
+
+	message := []byte("From: Alice <alice@example.com>\r\nTo: Bob <bob@example.net>\r\nSubject: signed\r\n\r\nHello from outboxd.\r\n")
+
+	signed, ok, err := signers.Sign(context.Background(), "alice@example.com", message)
+	if err != nil || !ok {
+		t.Fatalf("Sign() = signed %v, err %v", ok, err)
+	}
+
+	parsed, err := mail.ReadMessage(bytes.NewReader(signed))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mediaType, params, err := mime.ParseMediaType(parsed.Header.Get("Content-Type"))
+	if err != nil || mediaType != "multipart/signed" {
+		t.Fatalf("invalid multipart/signed Content-Type %q: %v", parsed.Header.Get("Content-Type"), err)
+	}
+
+	parts := multipart.NewReader(parsed.Body, params["boundary"])
+
+	first, err := parts.NextPart()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(first.Header) != 0 {
+		t.Fatalf("unexpected first-part headers: %v", first.Header)
+	}
+
+	body, err := io.ReadAll(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signaturePart, err := parts.NextPart()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signature, err := io.ReadAll(signaturePart)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recovered := append([]byte("\r\n"), body...)
+
+	_, err = pgp.CheckArmoredDetachedSignature(pgp.EntityList{entity}, bytes.NewReader(recovered), bytes.NewReader(signature), nil)
+	if err != nil {
+		t.Fatalf("detached signature does not verify over parsed first part: %v", err)
+	}
+
+	_, err = parts.NextPart()
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("NextPart() error = %v, want EOF", err)
 	}
 }
 
@@ -275,7 +337,7 @@ func TestCanonicalizeRejectsExcessiveMultipartNesting(t *testing.T) {
 	for depth := 0; depth <= maxMultipartDepth; depth++ {
 		boundary := fmt.Sprintf("boundary-%d", depth)
 
-		entity = []byte(fmt.Sprintf("Content-Type: multipart/mixed; boundary=%s\r\n\r\n--%s\r\n%s--%s--\r\n", boundary, boundary, entity, boundary))
+		entity = fmt.Appendf(nil, "Content-Type: multipart/mixed; boundary=%s\r\n\r\n--%s\r\n%s--%s--\r\n", boundary, boundary, entity, boundary)
 	}
 
 	_, err := canonicalizeEntity(entity, config.MaxMessageBytes)

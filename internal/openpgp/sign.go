@@ -281,10 +281,6 @@ func (s *Signers) Sign(ctx context.Context, sender string, data []byte) ([]byte,
 		return nil, false, err
 	}
 
-	if !bytes.HasSuffix(entity, []byte("\r\n")) {
-		entity = append(entity, '\r', '\n')
-	}
-
 	select {
 	case configured.gate <- struct{}{}:
 		defer func() {
@@ -358,7 +354,7 @@ func buildSignedMessage(outer, entity, signature []byte, boundary string) []byte
 	result.WriteString(boundary)
 	result.WriteString("\r\n")
 	result.Write(entity)
-	result.WriteString("--")
+	result.WriteString("\r\n--")
 	result.WriteString(boundary)
 	result.WriteString("\r\nContent-Type: application/pgp-signature; name=\"signature.asc\"\r\n")
 	result.WriteString("Content-Description: OpenPGP digital signature\r\n")
