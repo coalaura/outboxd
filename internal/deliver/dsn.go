@@ -31,7 +31,17 @@ func (d *Deliverer) ensureDSN(envelope *queue.Envelope) error {
 
 	dsnID := dsnEnvelopeID(envelope.ID, envelope.Incarnation, envelope.DSNGeneration)
 
-	reader, err := d.queue.Reader(envelope.ID)
+	var bodyIndex int
+
+	for i := range envelope.Recipients {
+		if envelope.Recipients[i].Status == queue.StatusFailed {
+			bodyIndex = envelope.Recipients[i].Body
+
+			break
+		}
+	}
+
+	reader, err := d.queue.ReaderVariant(envelope.ID, bodyIndex)
 	if err != nil {
 		return err
 	}

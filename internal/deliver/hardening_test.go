@@ -166,6 +166,10 @@ func servePlainSMTP(conn net.Conn, accepted chan<- struct{}, dataBytes chan<- st
 				}
 			}
 
+			if dataBytes != nil {
+				dataBytes <- body.String()
+			}
+
 			_, _ = io.WriteString(conn, "250 queued\r\n")
 		case strings.HasPrefix(line, "QUIT"):
 			_, _ = io.WriteString(conn, "221 bye\r\n")
@@ -377,6 +381,81 @@ func TestAttemptCancellationPreservesPartialMultiDomainProgress(t *testing.T) {
 	}
 }
 
+func TestAttemptSeparatesSameDomainBodyVariants(t *testing.T) {
+	q, err := queue.Open(t.TempDir(), queue.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
+
+	cfg := testDeliverCfg()
+
+	d := New(cfg, q, nopLogger{})
+
+	d.SetResolver(&fixedResolver{
+		mx:  map[string][]*net.MX{"example.com": {{Host: "mx.example.com."}}},
+		ips: map[string][]net.IP{"mx.example.com": {net.ParseIP("127.0.0.1")}},
+	})
+
+	data := make(chan string, 2)
+
+	var connections atomic.Int32
+
+	d.SetDialer(dialFn(func(context.Context, string, string) (net.Conn, error) {
+		connections.Add(1)
+
+		client, server := net.Pipe()
+
+		go servePlainSMTP(server, nil, data)
+
+		return client, nil
+	}))
+
+	first := []byte("From: sender@example.com\r\n\r\nfirst\r\n")
+	second := []byte("From: sender@example.com\r\n\r\nsecond\r\n")
+
+	body := append(append([]byte(nil), first...), second...)
+
+	now := time.Now()
+
+	envelope := hardeningEnvelope("same-domain-variants", now,
+		queue.Recipient{Address: "one@example.com", Domain: "example.com", Status: queue.StatusPending},
+		queue.Recipient{Address: "two@example.com", Domain: "example.com", Body: 1, Status: queue.StatusPending},
+	)
+
+	envelope.Bodies = []queue.Body{
+		queue.NewBody(0, first, false),
+		queue.NewBody(int64(len(first)), second, false),
+	}
+
+	err = q.Add(envelope, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	queued, err := q.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = d.attempt(context.Background(), queued)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if connections.Load() != 2 || queued.Recipients[0].Status != queue.StatusSent || queued.Recipients[1].Status != queue.StatusSent {
+		t.Fatalf("connections=%d recipients=%+v", connections.Load(), queued.Recipients)
+	}
+
+	got := []string{<-data, <-data}
+	if !strings.Contains(got[0], "first") || strings.Contains(got[0], "second") || !strings.Contains(got[1], "second") || strings.Contains(got[1], "first") {
+		t.Fatalf("delivered variants = %q", got)
+	}
+}
+
 type failingBody struct {
 	sent bool
 }
@@ -419,7 +498,7 @@ func TestDataCopyErrorAbortsWithoutTerminator(t *testing.T) {
 		return client, nil
 	}))
 
-	d.reader = func(string) (io.ReadCloser, error) { return io.NopCloser(&failingBody{}), nil }
+	d.reader = func(string, int) (io.ReadCloser, error) { return io.NopCloser(&failingBody{}), nil }
 
 	env := hardeningEnvelope("copy-error", time.Now(), queue.Recipient{
 		Address: "r@ex.com",
@@ -429,7 +508,7 @@ func TestDataCopyErrorAbortsWithoutTerminator(t *testing.T) {
 
 	env.Size = 100
 
-	_, err = d.send(context.Background(), env, mxCandidate{host: "mx.ex.com"}, []int{0})
+	_, err = d.send(context.Background(), env, mxCandidate{host: "mx.ex.com"}, 0, []int{0})
 	if err == nil || err.Error() != "spool read failed" {
 		t.Fatalf("body read error=%v", err)
 	}
@@ -473,7 +552,7 @@ func TestDataLengthMismatchAbortsWithoutTerminator(t *testing.T) {
 				return client, nil
 			}))
 
-			d.reader = func(string) (io.ReadCloser, error) {
+			d.reader = func(string, int) (io.ReadCloser, error) {
 				return io.NopCloser(strings.NewReader(tt.body)), nil
 			}
 
@@ -483,7 +562,7 @@ func TestDataLengthMismatchAbortsWithoutTerminator(t *testing.T) {
 
 			env.Size = 5
 
-			_, err = d.send(context.Background(), env, mxCandidate{host: "mx.ex.com"}, []int{0})
+			_, err = d.send(context.Background(), env, mxCandidate{host: "mx.ex.com"}, 0, []int{0})
 			if !errors.Is(err, tt.want) {
 				t.Fatalf("send error=%v want %v", err, tt.want)
 			}
@@ -1611,7 +1690,7 @@ func TestCandidateCeilings(t *testing.T) {
 
 	env := hardeningEnvelope("candidate-cap", time.Now(), queue.Recipient{Address: "r@test", Domain: "test", Status: queue.StatusPending})
 
-	err = d.domain(context.Background(), env, "test", []int{0})
+	err = d.domain(context.Background(), env, "test", 0, []int{0})
 	if err == nil {
 		t.Fatal("expected candidate failures")
 	}

@@ -24,10 +24,19 @@ const (
 // Status is the delivery state of a single recipient.
 type Status string
 
+// Body identifies one immutable message variant within the stored body file.
+type Body struct {
+	Offset   int64  `json:"offset"`
+	Size     int64  `json:"size"`
+	Digest   string `json:"digest"`
+	EightBit bool   `json:"eight_bit,omitempty"`
+}
+
 // Recipient is one envelope recipient and its delivery outcome.
 type Recipient struct {
 	Address      string `json:"address"`
 	Domain       string `json:"domain"`
+	Body         int    `json:"body,omitempty"`
 	Status       Status `json:"status"`
 	Detail       string `json:"detail,omitempty"`
 	Code         int    `json:"code,omitempty"`
@@ -42,6 +51,7 @@ type Envelope struct {
 	Username    string      `json:"username"`
 	Sender      string      `json:"sender"`
 	Recipients  []Recipient `json:"recipients"`
+	Bodies      []Body      `json:"bodies,omitempty"`
 	Size        int64       `json:"size"`
 	Created     time.Time   `json:"created"`
 	Attempts    int         `json:"attempts"`
@@ -97,10 +107,39 @@ func (e *Envelope) Failed() int {
 	return count
 }
 
+// MessageSize reports the immutable body size selected for one recipient.
+func (e *Envelope) MessageSize(recipient int) int64 {
+	if len(e.Bodies) == 0 {
+		return e.Size
+	}
+
+	return e.Bodies[e.Recipients[recipient].Body].Size
+}
+
+// MessageEightBit reports whether one recipient's body requires 8BITMIME.
+func (e *Envelope) MessageEightBit(recipient int) bool {
+	if len(e.Bodies) == 0 {
+		return e.EightBit
+	}
+
+	return e.Bodies[e.Recipients[recipient].Body].EightBit
+}
+
+// NewBody describes data at offset in a concatenated immutable body file.
+func NewBody(offset int64, data []byte, eightBit bool) Body {
+	return Body{
+		Offset:   offset,
+		Size:     int64(len(data)),
+		Digest:   bodyDigest(data),
+		EightBit: eightBit,
+	}
+}
+
 func cloneEnvelope(envelope *Envelope) *Envelope {
 	clone := *envelope
 
 	clone.Recipients = append([]Recipient(nil), envelope.Recipients...)
+	clone.Bodies = append([]Body(nil), envelope.Bodies...)
 	clone.index = -1
 
 	return &clone

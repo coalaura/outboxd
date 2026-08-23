@@ -3,6 +3,7 @@ package smtpd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"slices"
 	"time"
@@ -173,21 +174,22 @@ func (s *session) Data(r io.Reader) error {
 		prepared.EightBit = false
 	}
 
-	signature, err := s.server.signMessage(ctx, prepared.Data)
+	data, bodies, bodyIndexes, err := s.server.prepareVariants(ctx, prepared.Data, s.recipients, prepared.EightBit)
 	if err != nil {
 		if ctx.Err() != nil {
 			s.waitDataDeadlineClose()
+		} else if errors.Is(err, openpgp.ErrMessageTooLarge) {
+			return &smtp.SMTPError{
+				Code:         552,
+				EnhancedCode: smtp.EnhancedCode{5, 3, 4},
+				Message:      "Message too large after recipient encryption",
+			}
 		}
 
-		s.server.log.Printf("dkim signing failed: %v\n", err)
+		s.server.log.Printf("recipient message preparation failed: %v\n", err)
 
 		return errTemporaryFailure
 	}
-
-	data := make([]byte, 0, len(signature)+len(prepared.Data))
-
-	data = append(data, signature...)
-	data = append(data, prepared.Data...)
 
 	// Stored requirement is based on actual envelope/header needs, not client opt-in alone.
 	needUTF8 := prepared.NeedsUTF8 || needsUTF8(s.sender)
@@ -204,7 +206,7 @@ func (s *session) Data(r io.Reader) error {
 		Created:     time.Now(),
 		NextAttempt: time.Now(),
 		SMTPUTF8:    needUTF8,
-		EightBit:    prepared.EightBit,
+		EightBit:    bodies[0].EightBit,
 	}
 
 	for _, recipient := range s.recipients {
@@ -220,8 +222,13 @@ func (s *session) Data(r io.Reader) error {
 		envelope.Recipients = append(envelope.Recipients, queue.Recipient{
 			Address: recipient,
 			Domain:  domain,
+			Body:    bodyIndexes[len(envelope.Recipients)],
 			Status:  queue.StatusPending,
 		})
+	}
+
+	if len(bodies) > 1 {
+		envelope.Bodies = bodies
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -252,6 +259,67 @@ func (s *session) Data(r io.Reader) error {
 	}
 
 	return errTemporaryFailure
+}
+
+func (s *Server) prepareVariants(ctx context.Context, message []byte, recipients []string, eightBit bool) ([]byte, []queue.Body, []int, error) {
+	variants := make(map[string]int, len(recipients))
+	bodyIndexes := make([]int, len(recipients))
+	bodies := make([]queue.Body, 0, len(recipients))
+	bundle := make([]byte, 0, len(message))
+
+	for index, recipient := range recipients {
+		keyID, encrypted, err := s.openPGPRecipients.KeyID(recipient)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		variantKey := "plaintext"
+		if encrypted {
+			variantKey = "key:" + keyID
+		}
+
+		if bodyIndex, ok := variants[variantKey]; ok {
+			bodyIndexes[index] = bodyIndex
+
+			continue
+		}
+
+		variant := message
+		variantEightBit := eightBit
+
+		if encrypted {
+			variant, encrypted, err = s.openPGPRecipients.Encrypt(ctx, recipient, keyID, message)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			if !encrypted {
+				return nil, nil, nil, errors.New("recipient encryption key disappeared")
+			}
+
+			variantEightBit = false
+		}
+
+		signature, err := s.signMessage(ctx, variant)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("dkim signing: %w", err)
+		}
+
+		variant = append([]byte(signature), variant...)
+
+		if len(bodies) != 0 && int64(len(bundle))+int64(len(variant)) > s.cfg.Server.MaxMessageBytes {
+			return nil, nil, nil, fmt.Errorf("%w: all recipient variants exceed %d bytes", openpgp.ErrMessageTooLarge, s.cfg.Server.MaxMessageBytes)
+		}
+
+		bodyIndex := len(bodies)
+
+		bodies = append(bodies, queue.NewBody(int64(len(bundle)), variant, variantEightBit))
+		bundle = append(bundle, variant...)
+
+		variants[variantKey] = bodyIndex
+		bodyIndexes[index] = bodyIndex
+	}
+
+	return bundle, bodies, bodyIndexes, nil
 }
 
 func (s *session) waitDataDeadlineClose() {

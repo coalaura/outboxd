@@ -99,8 +99,10 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.dkim.private_key_file": {yaml.HeadComment(" create-once signing key provisioned explicitly with 'outboxd provision'")},
 		"$.dkim.headers":          {yaml.HeadComment(" message headers included in the DKIM signature; From is mandatory")},
 
-		"$.openpgp":            {yaml.HeadComment("\n# optional RFC 3156 OpenPGP/MIME signing and key publication")},
-		"$.openpgp.identities": {yaml.HeadComment(" exact From identities and their generated or operator-managed private keys; sender local parts are case-sensitive, relative paths resolve below data_directory, signing must be required, and autocrypt publishes the minimized public key in signed messages")},
+		"$.openpgp":                          {yaml.HeadComment("\n# optional RFC 3156 OpenPGP/MIME signing, recipient encryption, and key publication")},
+		"$.openpgp.identities":               {yaml.HeadComment(" exact From identities and their generated or operator-managed private keys; sender local parts are case-sensitive, relative paths resolve below data_directory, signing must be required, and autocrypt publishes the minimized public key in signed messages")},
+		"$.openpgp.recipient_keys_directory": {yaml.HeadComment(" private directory of static recipient .asc or .pgp public keys; active email identities determine exact recipients and configuration is loaded only at startup")},
+		"$.openpgp.require_encryption_for":   {yaml.HeadComment(" exact recipient addresses that must have a usable static key; recipient local parts are case-sensitive, domains use their ASCII IDNA form, and missing keys prevent startup")},
 
 		"$.delivery":                                  {yaml.HeadComment("\n# outbound SMTP delivery and retry policy")},
 		"$.delivery.tls_mode":                         {yaml.HeadComment(` destination TLS policy (chosen before connect; never verified-then-insecure fallback): "opportunistic" (verify STARTTLS when offered; plaintext only if allow_plaintext), "required" (STARTTLS required, verified), "opportunistic_insecure" (STARTTLS without cert verification — legacy/dev only)`)},

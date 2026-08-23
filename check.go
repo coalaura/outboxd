@@ -43,6 +43,11 @@ func runCheck(configPath string) error {
 		return fmt.Errorf("load OpenPGP signing keys: %w", err)
 	}
 
+	_, err = pgpsign.LoadRecipients(cfg)
+	if err != nil {
+		return fmt.Errorf("load OpenPGP recipient keys: %w", err)
+	}
+
 	err = certs.Check(cfg)
 	if err != nil {
 		return fmt.Errorf("check serving TLS certificate: %w", err)

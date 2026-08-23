@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"hash"
 	"io"
 	"os"
@@ -16,10 +17,12 @@ import (
 
 type trackedReader struct {
 	file      *os.File
+	reader    io.Reader
 	queue     *Queue
 	remaining int64
 	digest    string
 	hash      hash.Hash
+	whole     bool
 	verified  bool
 	once      sync.Once
 	err       error
@@ -31,15 +34,17 @@ func (r *trackedReader) Read(p []byte) (int, error) {
 	}
 
 	if r.remaining == 0 {
-		var extra [1]byte
+		if r.whole {
+			var extra [1]byte
 
-		n, err := r.file.Read(extra[:])
-		if n != 0 {
-			return 0, corruptionf("body size mismatch while reading: body grew")
-		}
+			n, err := r.file.Read(extra[:])
+			if n != 0 {
+				return 0, corruptionf("body size mismatch while reading: body grew")
+			}
 
-		if err != nil && !errors.Is(err, io.EOF) {
-			return 0, err
+			if err != nil && !errors.Is(err, io.EOF) {
+				return 0, err
+			}
 		}
 
 		actual := bodyDigestPrefix + hex.EncodeToString(r.hash.Sum(nil))
@@ -56,7 +61,7 @@ func (r *trackedReader) Read(p []byte) (int, error) {
 		p = p[:r.remaining]
 	}
 
-	n, err := r.file.Read(p)
+	n, err := r.reader.Read(p)
 	if n > 0 {
 		_, _ = r.hash.Write(p[:n])
 
@@ -82,6 +87,11 @@ func (r *trackedReader) Close() error {
 
 // Reader opens the stored message body for a ready entry.
 func (q *Queue) Reader(id string) (io.ReadCloser, error) {
+	return q.ReaderVariant(id, 0)
+}
+
+// ReaderVariant opens one immutable message variant for a ready entry.
+func (q *Queue) ReaderVariant(id string, bodyIndex int) (io.ReadCloser, error) {
 	err := q.beginOperation()
 	if err != nil {
 		return nil, err
@@ -107,14 +117,43 @@ func (q *Queue) Reader(id string) (io.ReadCloser, error) {
 		return nil, err
 	}
 
+	var (
+		reader    io.Reader = file
+		remaining           = env.Size
+		digest              = env.BodyDigest
+		whole               = true
+	)
+
+	if len(env.Bodies) != 0 {
+		if bodyIndex < 0 || bodyIndex >= len(env.Bodies) {
+			file.Close()
+
+			return nil, errors.New("invalid message body index")
+		}
+
+		body := env.Bodies[bodyIndex]
+
+		reader = io.NewSectionReader(file, body.Offset, body.Size)
+
+		remaining = body.Size
+		digest = body.Digest
+		whole = false
+	} else if bodyIndex != 0 {
+		file.Close()
+
+		return nil, errors.New("invalid message body index")
+	}
+
 	owned = false
 
 	return &trackedReader{
 		file:      file,
+		reader:    reader,
 		queue:     q,
-		remaining: env.Size,
-		digest:    env.BodyDigest,
+		remaining: remaining,
+		digest:    digest,
 		hash:      sha256.New(),
+		whole:     whole,
 	}, nil
 }
 
@@ -157,7 +196,12 @@ func (q *Queue) ReadBody(id string) ([]byte, error) {
 			q.afterBodyVerify()
 		}
 
-		return readBodyFromFile(file, env.Size, env.BodyDigest)
+		body, readErr := readBodyFromFile(file, env.Size, env.BodyDigest)
+		if readErr != nil {
+			return nil, readErr
+		}
+
+		return firstBodyVariant(env, body)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
@@ -185,19 +229,50 @@ func (q *Queue) ReadBody(id string) ([]byte, error) {
 		q.afterBodyVerify()
 	}
 
-	return readBodyFromFile(file, env.Size, env.BodyDigest)
+	body, err := readBodyFromFile(file, env.Size, env.BodyDigest)
+	if err != nil {
+		return nil, err
+	}
+
+	return firstBodyVariant(env, body)
 }
 
-func (q *Queue) openBody(path string, expected int64, digest string) (*os.File, error) {
+func firstBodyVariant(env *Envelope, data []byte) ([]byte, error) {
+	if len(env.Bodies) == 0 {
+		return data, nil
+	}
+
+	body := env.Bodies[0]
+
+	data = data[body.Offset : body.Offset+body.Size]
+	if bodyDigest(data) != body.Digest {
+		return nil, corruptionf("message body digest mismatch")
+	}
+
+	return data, nil
+}
+
+func verifyBodyData(env *Envelope, data []byte) error {
+	for i, body := range env.Bodies {
+		variant := data[body.Offset : body.Offset+body.Size]
+		if bodyDigest(variant) != body.Digest {
+			return fmt.Errorf("body[%d]: digest does not match data", i)
+		}
+	}
+
+	return nil
+}
+
+func (q *Queue) openBody(path string, env *Envelope) (*os.File, error) {
 	file, info, err := openRegular(path)
 	if err != nil {
 		return nil, err
 	}
 
-	if info.Size() != expected {
+	if info.Size() != env.Size {
 		file.Close()
 
-		return nil, corruptionf("body size mismatch: metadata=%d actual=%d", expected, info.Size())
+		return nil, corruptionf("body size mismatch: metadata=%d actual=%d", env.Size, info.Size())
 
 	}
 
@@ -212,13 +287,13 @@ func (q *Queue) openBody(path string, expected int64, digest string) (*os.File, 
 		return nil, err
 	}
 
-	if !info.Mode().IsRegular() || info.Size() != expected {
+	if !info.Mode().IsRegular() || info.Size() != env.Size {
 		file.Close()
 
-		return nil, corruptionf("body size mismatch: metadata=%d actual=%d", expected, info.Size())
+		return nil, corruptionf("body size mismatch: metadata=%d actual=%d", env.Size, info.Size())
 	}
 
-	err = verifyBodyHandle(file, expected, digest)
+	err = verifyEnvelopeBodyHandle(file, env)
 	if err != nil {
 		file.Close()
 
@@ -235,7 +310,7 @@ func (q *Queue) openAcceptedBody(dir, expectID string) (*Envelope, *os.File, err
 		return nil, nil, err
 	}
 
-	file, err := q.openBody(filepath.Join(dir, bodyName), env.Size, env.BodyDigest)
+	file, err := q.openBody(filepath.Join(dir, bodyName), env)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -264,7 +339,7 @@ func (q *Queue) openAcceptedBodyHandle(dir *os.File, expectID string) (*Envelope
 		q.afterBodyOpen()
 	}
 
-	err = verifyBodyHandle(file, env.Size, env.BodyDigest)
+	err = verifyEnvelopeBodyHandle(file, env)
 	if err != nil {
 		file.Close()
 
@@ -341,6 +416,58 @@ func verifyBodyHandle(file *os.File, expected int64, digest string) error {
 	actual := bodyDigestPrefix + hex.EncodeToString(hash.Sum(nil))
 	if actual != digest {
 		return corruptionf("body digest mismatch: metadata=%s actual=%s", digest, actual)
+	}
+
+	_, err = file.Seek(0, io.SeekStart)
+	return err
+}
+
+func verifyEnvelopeBodyHandle(file *os.File, env *Envelope) error {
+	if len(env.Bodies) == 0 {
+		return verifyBodyHandle(file, env.Size, env.BodyDigest)
+	}
+
+	_, err := file.Seek(0, io.SeekStart)
+	if err != nil {
+		return err
+	}
+
+	wholeHash := sha256.New()
+
+	for i, body := range env.Bodies {
+		variantHash := sha256.New()
+
+		written, copyErr := io.CopyN(io.MultiWriter(wholeHash, variantHash), file, body.Size)
+		if copyErr != nil {
+			if !errors.Is(copyErr, io.EOF) && !errors.Is(copyErr, io.ErrUnexpectedEOF) {
+				return copyErr
+			}
+
+			return corruptionf("body[%d] size mismatch while reading: metadata=%d actual=%d", i, body.Size, written)
+		}
+
+		if written != body.Size {
+			return corruptionf("body[%d] size mismatch while reading: metadata=%d actual=%d", i, body.Size, written)
+		}
+
+		actual := bodyDigestPrefix + hex.EncodeToString(variantHash.Sum(nil))
+		if actual != body.Digest {
+			return corruptionf("body[%d] digest mismatch: metadata=%s actual=%s", i, body.Digest, actual)
+		}
+	}
+
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+
+	if !info.Mode().IsRegular() || info.Size() != env.Size {
+		return corruptionf("body size mismatch while reading: metadata=%d actual=%d", env.Size, info.Size())
+	}
+
+	actual := bodyDigestPrefix + hex.EncodeToString(wholeHash.Sum(nil))
+	if actual != env.BodyDigest {
+		return corruptionf("body digest mismatch: metadata=%s actual=%s", env.BodyDigest, actual)
 	}
 
 	_, err = file.Seek(0, io.SeekStart)

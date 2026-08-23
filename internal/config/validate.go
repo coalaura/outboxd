@@ -250,6 +250,30 @@ func (cfg *Config) Validate() error {
 		}
 	}
 
+	if len(cfg.OpenPGP.RequireEncryptionFor) > MaxRecipients {
+		return fmt.Errorf("openpgp.require_encryption_for must contain at most %d entries", MaxRecipients)
+	}
+
+	requiredEncryption := make(map[string]struct{}, len(cfg.OpenPGP.RequireEncryptionFor))
+
+	for i, configured := range cfg.OpenPGP.RequireEncryptionFor {
+		recipient, err := mailbox.CanonicalAddress(configured)
+		if err != nil {
+			return fmt.Errorf("openpgp.require_encryption_for[%d]: %w", i, err)
+		}
+
+		if _, exists := requiredEncryption[recipient]; exists {
+			return fmt.Errorf("openpgp.require_encryption_for[%d]: duplicate recipient %q", i, recipient)
+		}
+
+		requiredEncryption[recipient] = struct{}{}
+		cfg.OpenPGP.RequireEncryptionFor[i] = recipient
+	}
+
+	if len(requiredEncryption) != 0 && cfg.OpenPGP.RecipientKeysDirectory == "" {
+		return errors.New("openpgp.recipient_keys_directory is required when require_encryption_for is not empty")
+	}
+
 	switch cfg.Delivery.TLSMode {
 	case "opportunistic", "required", "opportunistic_insecure":
 	default:

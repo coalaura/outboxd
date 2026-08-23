@@ -282,6 +282,41 @@ func TestAutocryptRequiresDKIMCoverage(t *testing.T) {
 	}
 }
 
+func TestOpenPGPRequiredRecipientValidation(t *testing.T) {
+	cfg := Default()
+
+	cfg.OpenPGP.RecipientKeysDirectory = "openpgp/recipients"
+	cfg.OpenPGP.RequireEncryptionFor = []string{"Alice@EXAMPLE.com", "bob@exämple.com"}
+
+	err := cfg.Validate()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := cfg.OpenPGP.RequireEncryptionFor[0]; got != "Alice@example.com" {
+		t.Fatalf("canonical required recipient = %q", got)
+	}
+
+	if got := cfg.OpenPGP.RequireEncryptionFor[1]; got != "bob@xn--exmple-cua.com" {
+		t.Fatalf("canonical IDNA required recipient = %q", got)
+	}
+
+	cfg.OpenPGP.RequireEncryptionFor = append(cfg.OpenPGP.RequireEncryptionFor, "Alice@example.com")
+
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "duplicate recipient") {
+		t.Fatalf("duplicate Validate() error = %v", err)
+	}
+
+	cfg.OpenPGP.RequireEncryptionFor = []string{"alice@example.com"}
+	cfg.OpenPGP.RecipientKeysDirectory = ""
+
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "recipient_keys_directory") {
+		t.Fatalf("missing directory Validate() error = %v", err)
+	}
+}
+
 func TestReplyRejectionValidation(t *testing.T) {
 	cfg := Default()
 

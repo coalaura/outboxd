@@ -131,17 +131,32 @@ func validateEnvelope(e *Envelope) error {
 		return errors.New("negative size")
 	}
 
-	if len(e.BodyDigest) != len(bodyDigestPrefix)+sha256.Size*2 || !strings.HasPrefix(e.BodyDigest, bodyDigestPrefix) {
+	if !validBodyDigest(e.BodyDigest) {
 		return errors.New("missing or invalid body digest")
 	}
 
-	digestBytes, err := hex.DecodeString(strings.TrimPrefix(e.BodyDigest, bodyDigestPrefix))
-	if err != nil {
-		return errors.New("invalid body digest")
+	if len(e.Bodies) > len(e.Recipients) {
+		return errors.New("more message bodies than recipients")
 	}
 
-	if bodyDigestPrefix+hex.EncodeToString(digestBytes) != e.BodyDigest {
-		return errors.New("non-canonical body digest")
+	usedBodies := make([]bool, len(e.Bodies))
+
+	var bodyEnd int64
+
+	for i, body := range e.Bodies {
+		if body.Offset != bodyEnd || body.Size <= 0 || body.Size > e.Size-body.Offset {
+			return fmt.Errorf("body[%d]: invalid range", i)
+		}
+
+		if !validBodyDigest(body.Digest) {
+			return fmt.Errorf("body[%d]: invalid digest", i)
+		}
+
+		bodyEnd += body.Size
+	}
+
+	if len(e.Bodies) != 0 && bodyEnd != e.Size {
+		return errors.New("message bodies do not cover stored body")
 	}
 
 	var needUTF8 bool
@@ -152,6 +167,18 @@ func validateEnvelope(e *Envelope) error {
 
 	for i := range e.Recipients {
 		r := &e.Recipients[i]
+
+		if len(e.Bodies) == 0 {
+			if r.Body != 0 {
+				return fmt.Errorf("recipient[%d]: body index without message bodies", i)
+			}
+		} else {
+			if r.Body < 0 || r.Body >= len(e.Bodies) {
+				return fmt.Errorf("recipient[%d]: invalid body index", i)
+			}
+
+			usedBodies[r.Body] = true
+		}
 
 		if len(r.Domain) > maxEnvelopeStringBytes {
 			return fmt.Errorf("recipient[%d]: domain too long", i)
@@ -224,6 +251,12 @@ func validateEnvelope(e *Envelope) error {
 		}
 	}
 
+	for i, used := range usedBodies {
+		if !used {
+			return fmt.Errorf("body[%d]: not referenced by a recipient", i)
+		}
+	}
+
 	// Non-ASCII envelope addresses require the SMTPUTF8 flag so outbound MAIL/RCPT
 	// never emit UTF-8 without the SMTPUTF8 MAIL parameter. ASCII envelopes may set
 	// the flag when headers independently require it; the flag is never cleared here.
@@ -236,6 +269,19 @@ func validateEnvelope(e *Envelope) error {
 	}
 
 	return nil
+}
+
+func validBodyDigest(digest string) bool {
+	if len(digest) != len(bodyDigestPrefix)+sha256.Size*2 || !strings.HasPrefix(digest, bodyDigestPrefix) {
+		return false
+	}
+
+	digestBytes, err := hex.DecodeString(strings.TrimPrefix(digest, bodyDigestPrefix))
+	if err != nil {
+		return false
+	}
+
+	return bodyDigestPrefix+hex.EncodeToString(digestBytes) == digest
 }
 
 func containsDisplayControl(s string) bool {

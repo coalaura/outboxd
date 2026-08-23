@@ -26,6 +26,7 @@ const (
 	MaxReplyConnectionsPerIP = 64
 	MaxAuthWorkers           = 8
 	MaxOpenPGPIdentities     = 1000
+	MaxOpenPGPRecipientKeys  = 1000
 	SPFDNSLookupLimit        = 10
 
 	MaxSMTPReadTimeout           = 30 * time.Minute

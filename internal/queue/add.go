@@ -142,6 +142,11 @@ func (q *Queue) AddContext(ctx context.Context, envelope *Envelope, data []byte)
 		return err
 	}
 
+	err = verifyBodyData(envelope, data)
+	if err != nil {
+		return err
+	}
+
 	meta, err := marshalEnvelope(envelope)
 	if err != nil {
 		return err

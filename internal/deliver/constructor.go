@@ -82,8 +82,8 @@ func NewWithSigner(cfg *config.Config, spool *queue.Queue, log Logger, signer Si
 		orderIPs:    shuffleIPs,
 		orderMX:     shuffleMX,
 		next:        spool.Next,
-		reader: func(id string) (io.ReadCloser, error) {
-			return spool.Reader(id)
+		reader: func(id string, body int) (io.ReadCloser, error) {
+			return spool.ReaderVariant(id, body)
 		},
 
 		active:  make(chan struct{}, attemptLimit),

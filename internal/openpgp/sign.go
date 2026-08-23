@@ -26,8 +26,8 @@ const (
 	maxMultipartDepth  = 32
 )
 
-// ErrMessageTooLarge reports deterministic expansion beyond max_message_bytes.
-var ErrMessageTooLarge = errors.New("signed message exceeds configured maximum size")
+// ErrMessageTooLarge reports deterministic OpenPGP expansion beyond max_message_bytes.
+var ErrMessageTooLarge = errors.New("OpenPGP message exceeds configured maximum size")
 
 type identity struct {
 	entity    *pgp.Entity

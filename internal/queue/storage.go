@@ -14,6 +14,14 @@ import (
 
 // storeReady reports whether an additional metadata temp file may remain.
 func (q *Queue) storeReady(envelope *Envelope) (bool, error) {
+	return q.storeReadyUpdate(envelope, false)
+}
+
+func (q *Queue) storeReadyDSNLink(envelope *Envelope) (bool, error) {
+	return q.storeReadyUpdate(envelope, true)
+}
+
+func (q *Queue) storeReadyUpdate(envelope *Envelope, allowDSNLink bool) (bool, error) {
 	nextRevision, err := incrementRevision(envelope.Revision)
 	if err != nil {
 		return false, err
@@ -21,7 +29,7 @@ func (q *Queue) storeReady(envelope *Envelope) (bool, error) {
 
 	dir := filepath.Join(q.ready, envelope.ID)
 
-	err = q.matchReady(envelope)
+	err = q.matchReadyUpdate(envelope, allowDSNLink)
 	if err != nil {
 		return false, err
 	}
@@ -85,6 +93,10 @@ func (q *Queue) storeReady(envelope *Envelope) (bool, error) {
 }
 
 func (q *Queue) matchReady(envelope *Envelope) error {
+	return q.matchReadyUpdate(envelope, false)
+}
+
+func (q *Queue) matchReadyUpdate(envelope *Envelope, allowDSNLink bool) error {
 	dir := filepath.Join(q.ready, envelope.ID)
 
 	err := acceptedDir(dir)
@@ -109,7 +121,88 @@ func (q *Queue) matchReady(envelope *Envelope) error {
 		return fmt.Errorf("%w: queue body identity changed", ErrIDConflict)
 	}
 
+	identityMatches := sameMessageIdentity(current, envelope)
+
+	if allowDSNLink {
+		identityMatches = sameMessageContent(current, envelope) && addsDSNLink(current, envelope)
+	}
+
+	if !identityMatches {
+		return fmt.Errorf("%w: queue message identity changed", ErrIDConflict)
+	}
+
 	return nil
+}
+
+func sameMessageIdentity(current, updated *Envelope) bool {
+	return sameMessageContent(current, updated) && sameDSNLinkage(current, updated)
+}
+
+func sameMessageContent(current, updated *Envelope) bool {
+	if current.Username != updated.Username || current.Sender != updated.Sender {
+		return false
+	}
+
+	if !current.Created.Equal(updated.Created) {
+		return false
+	}
+
+	if current.SMTPUTF8 != updated.SMTPUTF8 || current.EightBit != updated.EightBit {
+		return false
+	}
+
+	if len(current.Bodies) != len(updated.Bodies) || len(current.Recipients) != len(updated.Recipients) {
+		return false
+	}
+
+	for i := range current.Bodies {
+		if current.Bodies[i] != updated.Bodies[i] {
+			return false
+		}
+	}
+
+	for i := range current.Recipients {
+		before := current.Recipients[i]
+		after := updated.Recipients[i]
+
+		if before.Address != after.Address || before.Domain != after.Domain {
+			return false
+		}
+
+		if before.Body != after.Body {
+			return false
+		}
+	}
+
+	return true
+}
+
+func sameDSNLinkage(current, updated *Envelope) bool {
+	if current.DSNID != updated.DSNID {
+		return false
+	}
+
+	return sameDSNSourceLinkage(current, updated)
+}
+
+func sameDSNSourceLinkage(current, updated *Envelope) bool {
+	if current.DSNSourceID != updated.DSNSourceID || current.DSNSourceIncarnation != updated.DSNSourceIncarnation {
+		return false
+	}
+
+	if current.DSNSourceRevision != updated.DSNSourceRevision || current.DSNGeneration != updated.DSNGeneration {
+		return false
+	}
+
+	return true
+}
+
+func addsDSNLink(current, updated *Envelope) bool {
+	if current.DSNID != "" || updated.DSNID == "" {
+		return false
+	}
+
+	return sameDSNSourceLinkage(current, updated)
 }
 
 func (q *Queue) writeMeta(path string, envelope *Envelope) error {
@@ -161,7 +254,7 @@ func (q *Queue) loadDir(dir, expectID string) (*Envelope, error) {
 		return nil, corruptionf("body size mismatch: metadata=%d actual=%d", env.Size, info.Size())
 	}
 
-	err = verifyBodyHandle(file, env.Size, env.BodyDigest)
+	err = verifyEnvelopeBodyHandle(file, env)
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +283,7 @@ func (q *Queue) loadAcceptedDir(dir, expectID string) (*Envelope, error) {
 		return nil, corruptionf("body size mismatch: metadata=%d actual=%d", env.Size, info.Size())
 	}
 
-	err = verifyBodyHandle(file, env.Size, env.BodyDigest)
+	err = verifyEnvelopeBodyHandle(file, env)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +308,7 @@ func (q *Queue) loadAcceptedHandle(dir *os.File, expectID string) (*Envelope, er
 		return nil, corruptionf("body size mismatch: metadata=%d actual=%d", env.Size, info.Size())
 	}
 
-	err = verifyBodyHandle(file, env.Size, env.BodyDigest)
+	err = verifyEnvelopeBodyHandle(file, env)
 	if err != nil {
 		return nil, err
 	}

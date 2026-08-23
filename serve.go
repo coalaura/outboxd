@@ -66,6 +66,13 @@ func serve(configPath string) error {
 		return fmt.Errorf("load OpenPGP signing keys: %w", err)
 	}
 
+	log.Println("Loading OpenPGP recipient keys...")
+
+	pgpRecipients, err := pgpsign.LoadRecipients(cfg)
+	if err != nil {
+		return fmt.Errorf("load OpenPGP recipient keys: %w", err)
+	}
+
 	// Exclusive spool lock is daemon ownership: hold it before writing certs.
 	spool, err := queue.Open(cfg.ResolvePath("queue"), queue.Limits{
 		MaxMessages:         cfg.Server.MaxQueueMessages,
@@ -125,7 +132,7 @@ func serve(configPath string) error {
 	ctx, stop := terminationContext(context.Background())
 	defer stop()
 
-	submission := smtpd.NewWithOpenPGP(cfg, keeper, signer, pgpSigners, spool, log)
+	submission := smtpd.NewWithOpenPGP(cfg, keeper, signer, pgpSigners, pgpRecipients, spool, log)
 
 	err = submission.Listen()
 	if err != nil {

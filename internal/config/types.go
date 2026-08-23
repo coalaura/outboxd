@@ -67,7 +67,9 @@ type DKIM struct {
 }
 
 type OpenPGP struct {
-	Identities []OpenPGPIdentity `yaml:"identities"`
+	Identities             []OpenPGPIdentity `yaml:"identities"`
+	RecipientKeysDirectory string            `yaml:"recipient_keys_directory"`
+	RequireEncryptionFor   []string          `yaml:"require_encryption_for"`
 }
 
 type OpenPGPIdentity struct {

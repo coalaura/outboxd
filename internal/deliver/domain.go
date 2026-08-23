@@ -7,7 +7,7 @@ import (
 	"github.com/coalaura/outboxd/internal/queue"
 )
 
-func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain string, indexes []int) error {
+func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain string, body int, indexes []int) error {
 	trace := d.newDebugTrace()
 
 	hosts, err := d.hosts(ctx, domain)
@@ -56,7 +56,7 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 
 		d.debugf("delivery %s acquired global capacity for %s: %s\n", envelope.ID, host, trace)
 
-		done, err := d.send(ctx, envelope, candidate, indexes)
+		done, err := d.send(ctx, envelope, candidate, body, indexes)
 
 		d.releaseGlobal()
 

@@ -107,7 +107,7 @@ type Deliverer struct {
 	next func(context.Context) (*queue.Envelope, error)
 
 	// reader opens a queued message body. Tests may replace it.
-	reader func(string) (io.ReadCloser, error)
+	reader func(string, int) (io.ReadCloser, error)
 
 	// fatal signals Run to stop on queue persistence failure
 	mu    sync.Mutex

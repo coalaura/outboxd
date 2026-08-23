@@ -10,12 +10,15 @@ import (
 	"github.com/coalaura/outboxd/internal/queue"
 )
 
-func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, candidate mxCandidate, indexes []int) (bool, error) {
+func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, candidate mxCandidate, body int, indexes []int) (bool, error) {
 	trace := d.newDebugTrace()
 
 	host := candidate.host
 
-	client, err := d.connect(ctx, candidate, !envelope.SMTPUTF8 && !envelope.EightBit)
+	messageSize := envelope.MessageSize(indexes[0])
+	eightBit := envelope.MessageEightBit(indexes[0])
+
+	client, err := d.connect(ctx, candidate, !envelope.SMTPUTF8 && !eightBit)
 
 	trace.mark("connect")
 
@@ -34,7 +37,7 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, candidat
 		}
 	}
 
-	if envelope.EightBit {
+	if eightBit {
 		supported, _ := client.Extension("8BITMIME")
 		if !supported {
 			_ = client.Quit()
@@ -44,9 +47,9 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, candidat
 	}
 
 	err = client.Mail(envelope.Sender, MailOpts{
-		Size:     envelope.Size,
+		Size:     messageSize,
 		UTF8:     envelope.SMTPUTF8,
-		EightBit: envelope.EightBit,
+		EightBit: eightBit,
 	})
 
 	trace.mark("mail")
@@ -134,12 +137,12 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, candidat
 
 	openReader := d.reader
 	if openReader == nil {
-		openReader = func(id string) (io.ReadCloser, error) {
-			return d.queue.Reader(id)
+		openReader = func(id string, body int) (io.ReadCloser, error) {
+			return d.queue.ReaderVariant(id, body)
 		}
 	}
 
-	reader, err := openReader(envelope.ID)
+	reader, err := openReader(envelope.ID, body)
 
 	trace.mark("body_open")
 
@@ -163,7 +166,7 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, candidat
 		return false, err
 	}
 
-	written, err := io.Copy(dw, io.LimitReader(reader, envelope.Size+1))
+	written, err := io.Copy(dw, io.LimitReader(reader, messageSize+1))
 
 	trace.mark("body_write")
 
@@ -174,16 +177,16 @@ func (d *Deliverer) send(ctx context.Context, envelope *queue.Envelope, candidat
 		return false, err
 	}
 
-	if written != envelope.Size {
+	if written != messageSize {
 		// Closing DotWriter emits the DATA terminator, so body integrity failures
 		// must abort the transport directly.
 		_ = client.Close()
 
-		if written < envelope.Size {
-			return false, fmt.Errorf("%w: got %d, want %d", errBodyTooShort, written, envelope.Size)
+		if written < messageSize {
+			return false, fmt.Errorf("%w: got %d, want %d", errBodyTooShort, written, messageSize)
 		}
 
-		return false, fmt.Errorf("%w: got at least %d, want %d", errBodyTooLong, written, envelope.Size)
+		return false, fmt.Errorf("%w: got at least %d, want %d", errBodyTooLong, written, messageSize)
 	}
 
 	err = dw.Close()

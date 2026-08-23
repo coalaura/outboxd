@@ -397,7 +397,7 @@ func TestCandidateIPFallbackOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = d.domain(context.Background(), got, "ex.com", []int{0})
+	err = d.domain(context.Background(), got, "ex.com", 0, []int{0})
 	if err != nil {
 		t.Fatalf("domain: %v", err)
 	}
@@ -478,7 +478,7 @@ func TestDomainCapabilityAllSMTPUTF8Missing(t *testing.T) {
 		Created:    now, NextAttempt: now, SMTPUTF8: true,
 	}
 
-	err = d.domain(context.Background(), env, "ex.com", []int{0})
+	err = d.domain(context.Background(), env, "ex.com", 0, []int{0})
 	if err != nil {
 		t.Fatalf("domain err=%v", err)
 	}
@@ -541,7 +541,7 @@ func TestDomainCapabilityAll8BitMissing(t *testing.T) {
 		Created:    now, NextAttempt: now, EightBit: true,
 	}
 
-	err = d.domain(context.Background(), env, "ex.com", []int{0})
+	err = d.domain(context.Background(), env, "ex.com", 0, []int{0})
 	if err != nil {
 		t.Fatalf("domain err=%v", err)
 	}
@@ -625,7 +625,7 @@ func TestDomainMixedCapabilitiesCombined(t *testing.T) {
 		Created:    now, NextAttempt: now, SMTPUTF8: true, EightBit: true,
 	}
 
-	err = d.domain(context.Background(), env, "ex.com", []int{0})
+	err = d.domain(context.Background(), env, "ex.com", 0, []int{0})
 	if err != nil {
 		t.Fatalf("domain err=%v", err)
 	}
@@ -698,7 +698,7 @@ func TestDomainTempThenCapabilityKeepsPending(t *testing.T) {
 		Created:    now, NextAttempt: now, SMTPUTF8: true,
 	}
 
-	err = d.domain(context.Background(), env, "ex.com", []int{0})
+	err = d.domain(context.Background(), env, "ex.com", 0, []int{0})
 	if err == nil {
 		t.Fatal("expected temporary error from mixed outcomes")
 	}
@@ -760,7 +760,7 @@ func TestDomainTempThenPrivateKeepsPending(t *testing.T) {
 		Created:    now, NextAttempt: now,
 	}
 
-	err = d.domain(context.Background(), env, "ex.com", []int{0})
+	err = d.domain(context.Background(), env, "ex.com", 0, []int{0})
 	if err == nil {
 		t.Fatal("expected temporary error when any candidate is retryable")
 	}
@@ -821,7 +821,7 @@ func TestDomainPrivateThenTempKeepsPending(t *testing.T) {
 		Created:    now, NextAttempt: now,
 	}
 
-	err = d.domain(context.Background(), env, "ex.com", []int{0})
+	err = d.domain(context.Background(), env, "ex.com", 0, []int{0})
 	if err == nil {
 		t.Fatal("expected temporary error")
 	}
@@ -894,7 +894,7 @@ func TestDomainCapabilityThenTempKeepsPending(t *testing.T) {
 		Created:    now, NextAttempt: now, SMTPUTF8: true,
 	}
 
-	err = d.domain(context.Background(), env, "ex.com", []int{0})
+	err = d.domain(context.Background(), env, "ex.com", 0, []int{0})
 	if err == nil {
 		t.Fatal("expected temporary error")
 	}

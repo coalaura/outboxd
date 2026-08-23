@@ -10,6 +10,11 @@ import (
 	"github.com/coalaura/outboxd/internal/queue"
 )
 
+type groupKey struct {
+	domain string
+	body   int
+}
+
 func (d *Deliverer) attempt(ctx context.Context, envelope *queue.Envelope) error {
 	owner := deliveryOwner(envelope)
 	if !d.users.tryAcquire(owner) {
@@ -95,8 +100,8 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 		d.debugf("delivery %s attempt %d finished: %s\n", envelope.ID, envelope.Attempts, trace)
 	}()
 
-	groups := make(map[string][]int, len(envelope.Recipients))
-	groupOrder := make([]string, 0, len(envelope.Recipients))
+	groups := make(map[groupKey][]int, len(envelope.Recipients))
+	groupOrder := make([]groupKey, 0, len(envelope.Recipients))
 
 	for i := range envelope.Recipients {
 		recipient := &envelope.Recipients[i]
@@ -104,23 +109,25 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 			continue
 		}
 
-		_, ok := groups[recipient.Domain]
+		key := groupKey{domain: recipient.Domain, body: recipient.Body}
+
+		_, ok := groups[key]
 		if !ok {
-			groupOrder = append(groupOrder, recipient.Domain)
+			groupOrder = append(groupOrder, key)
 		}
 
-		groups[recipient.Domain] = append(groups[recipient.Domain], i)
+		groups[key] = append(groups[key], i)
 	}
 
-	if admittedDomain != "" && len(groupOrder) > 1 && groupOrder[0] != admittedDomain {
-		for i, domain := range groupOrder[1:] {
-			if domain != admittedDomain {
+	if admittedDomain != "" && len(groupOrder) > 1 && groupOrder[0].domain != admittedDomain {
+		for i, key := range groupOrder[1:] {
+			if key.domain != admittedDomain {
 				continue
 			}
 
 			index := i + 1
 			copy(groupOrder[1:index+1], groupOrder[:index])
-			groupOrder[0] = admittedDomain
+			groupOrder[0] = key
 
 			break
 		}
@@ -131,8 +138,10 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 	diagnostics := make([]string, 0, len(groupOrder))
 	blockedDomain := ""
 
-	for _, domain := range groupOrder {
-		indexes := groups[domain]
+	for _, key := range groupOrder {
+		domain := key.domain
+
+		indexes := groups[key]
 		if ctx.Err() != nil {
 			break
 		}
@@ -153,7 +162,7 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 			previousDetails[i] = envelope.Recipients[index].Detail
 		}
 
-		err := d.domain(ctx, envelope, domain, indexes)
+		err := d.domain(ctx, envelope, domain, key.body, indexes)
 
 		d.domains.release(domain)
 

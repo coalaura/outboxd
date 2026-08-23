@@ -63,6 +63,23 @@ func Address(value string) (string, error) {
 	return parsed.Address, nil
 }
 
+// CanonicalAddress parses a bare SMTP mailbox and converts its domain to the
+// ASCII routing form while preserving the local part exactly.
+func CanonicalAddress(value string) (string, error) {
+	address, err := Address(value)
+	if err != nil {
+		return "", err
+	}
+
+	domain, err := DomainOf(address)
+	if err != nil {
+		return "", err
+	}
+
+	at := strings.LastIndexByte(address, '@')
+	return address[:at+1] + domain, nil
+}
+
 // ValidateAddress enforces SMTP mailbox and DNS-representation octet limits.
 // It intentionally accepts single-label and address-literal domains; routing
 // callers can apply RoutingDomain's stricter DNS requirements afterwards.

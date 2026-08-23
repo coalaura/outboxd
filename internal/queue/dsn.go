@@ -116,6 +116,10 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 		return fmt.Errorf("%w: source body identity changed", ErrIDConflict)
 	}
 
+	if !sameMessageContent(durableSource, source) {
+		return fmt.Errorf("%w: source message identity changed", ErrIDConflict)
+	}
+
 	if durableSource.DSNID != "" {
 		if durableSource.DSNID != dsn.ID {
 			return fmt.Errorf("%w: source links %s", ErrIDConflict, durableSource.DSNID)
@@ -169,6 +173,11 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 	dsn.DSNSourceRevision = expectedSourceRevision
 
 	err = validateEnvelope(dsn)
+	if err != nil {
+		return err
+	}
+
+	err = verifyBodyData(dsn, data)
 	if err != nil {
 		return err
 	}
@@ -321,7 +330,7 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 	// persistent allocation into committed usage before linking the source.
 	commitPhysical(persistentPhysical)
 
-	retainedSourceTemp, storeErr := q.storeReady(linked)
+	retainedSourceTemp, storeErr := q.storeReadyDSNLink(linked)
 	if retainedSourceTemp {
 		commitPhysical(sourceTempPhysical)
 	}

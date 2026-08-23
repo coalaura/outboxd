@@ -20,6 +20,9 @@ import (
 	"testing"
 	"time"
 
+	pgp "github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
 	"github.com/coalaura/outboxd/internal/certs"
 	"github.com/coalaura/outboxd/internal/config"
 	"github.com/coalaura/outboxd/internal/openpgp"
@@ -929,6 +932,137 @@ func TestOpenPGPTransformRunsBeforeDKIM(t *testing.T) {
 
 	if entry.EightBit {
 		t.Fatal("OpenPGP/MIME queue entry incorrectly requires 8BITMIME")
+	}
+}
+
+func TestRecipientEncryptionQueuesAtomicVariants(t *testing.T) {
+	const password = "recipient-encryption-password"
+
+	srv, cfg, spool, _, pool := testServerWithUser(t, password)
+
+	directory := cfg.ResolvePath("openpgp/recipients")
+
+	err := os.MkdirAll(directory, 0700)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entity, err := pgp.NewEntity("Bob", "", "bob@example.com", &packet.Config{Algorithm: packet.PubKeyAlgoEdDSA})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var public bytes.Buffer
+
+	armored, err := armor.Encode(&public, pgp.PublicKeyType, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = entity.Serialize(armored)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = armored.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = os.WriteFile(filepath.Join(directory, "bob.asc"), public.Bytes(), 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.OpenPGP.RecipientKeysDirectory = "openpgp/recipients"
+
+	recipients, err := openpgp.LoadRecipients(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv.openPGPRecipients = recipients
+
+	runTestSubmission(t, srv)
+
+	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
+	defer cl.close()
+
+	cl.authPlain(t, "alice", password)
+
+	cl.cmd(t, "MAIL FROM:<Alice.Sender@test.example> BODY=8BITMIME", 250)
+	cl.cmd(t, "RCPT TO:<bob@example.com>", 250)
+	cl.cmd(t, "RCPT TO:<plain@example.com>", 250)
+	cl.cmd(t, "DATA", 354)
+
+	_, _ = io.WriteString(cl.conn, "From: Alice.Sender@test.example\r\nTo: bob@example.com, plain@example.com\r\nSubject: secret\r\n\r\ncaf\xc3\xa9\r\n.\r\n")
+
+	cl.readCode(t, 250)
+
+	envelope, err := spool.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(envelope.Bodies) != 2 || envelope.Recipients[0].Body == envelope.Recipients[1].Body {
+		t.Fatalf("queued bodies=%+v recipients=%+v", envelope.Bodies, envelope.Recipients)
+	}
+
+	if envelope.MessageEightBit(0) || !envelope.MessageEightBit(1) {
+		t.Fatalf("variant 8-bit requirements: encrypted=%v plaintext=%v", envelope.MessageEightBit(0), envelope.MessageEightBit(1))
+	}
+
+	encryptedReader, err := spool.ReaderVariant(envelope.ID, envelope.Recipients[0].Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encrypted, err := io.ReadAll(encryptedReader)
+	closeErr := encryptedReader.Close()
+
+	if err != nil || closeErr != nil {
+		t.Fatalf("read encrypted variant: read %v, close %v", err, closeErr)
+	}
+
+	plaintextReader, err := spool.ReaderVariant(envelope.ID, envelope.Recipients[1].Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	plaintext, err := io.ReadAll(plaintextReader)
+	closeErr = plaintextReader.Close()
+
+	if err != nil || closeErr != nil {
+		t.Fatalf("read plaintext variant: read %v, close %v", err, closeErr)
+	}
+
+	if !bytes.Contains(encrypted, []byte("multipart/encrypted")) || bytes.Contains(encrypted, []byte("caf\xc3\xa9")) {
+		t.Fatalf("unexpected encrypted variant:\n%s", encrypted)
+	}
+
+	if !bytes.Contains(plaintext, []byte("caf\xc3\xa9")) {
+		t.Fatalf("unexpected plaintext variant:\n%s", plaintext)
+	}
+
+	if !bytes.HasPrefix(encrypted, []byte("DKIM-Signature:")) || !bytes.HasPrefix(plaintext, []byte("DKIM-Signature:")) {
+		t.Fatal("DKIM signature missing from final recipient variant")
+	}
+
+	cl.cmd(t, "MAIL FROM:<Alice.Sender@test.example> BODY=8BITMIME", 250)
+	cl.cmd(t, "RCPT TO:<bob@example.com>", 250)
+	cl.cmd(t, "DATA", 354)
+
+	_, _ = io.WriteString(cl.conn, "From: Alice.Sender@test.example\r\nTo: bob@example.com\r\nSubject: secret\r\n\r\ncaf\xc3\xa9\r\n.\r\n")
+
+	cl.readCode(t, 250)
+
+	single, err := spool.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(single.Bodies) != 0 || single.EightBit {
+		t.Fatalf("single encrypted body metadata: bodies=%+v eight_bit=%v", single.Bodies, single.EightBit)
 	}
 }
 

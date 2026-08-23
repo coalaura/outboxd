@@ -38,13 +38,14 @@ type Logger interface {
 
 // Server runs both submission listeners against a shared backend.
 type Server struct {
-	cfg         *config.Config
-	queue       *queue.Queue
-	signer      *sign.Signer
-	log         Logger
-	queueAdd    func(context.Context, *queue.Envelope, []byte) error
-	openPGPSign func(context.Context, string, []byte) ([]byte, bool, error)
-	signMessage func(context.Context, []byte) (string, error)
+	cfg               *config.Config
+	queue             *queue.Queue
+	signer            *sign.Signer
+	log               Logger
+	queueAdd          func(context.Context, *queue.Envelope, []byte) error
+	openPGPSign       func(context.Context, string, []byte) ([]byte, bool, error)
+	openPGPRecipients *pgpsign.Recipients
+	signMessage       func(context.Context, []byte) (string, error)
 
 	connLimit   *connectionLimiter
 	connections *connectionTracker
@@ -171,11 +172,11 @@ func (s *Server) dataTimeout() time.Duration {
 
 // New builds the submission server.
 func New(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signer, spool *queue.Queue, log Logger) *Server {
-	return NewWithOpenPGP(cfg, keeper, signer, nil, spool, log)
+	return NewWithOpenPGP(cfg, keeper, signer, nil, nil, spool, log)
 }
 
-// NewWithOpenPGP builds the submission server with optional OpenPGP/MIME signing.
-func NewWithOpenPGP(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signer, pgpSigners *pgpsign.Signers, spool *queue.Queue, log Logger) *Server {
+// NewWithOpenPGP builds the submission server with optional OpenPGP/MIME transforms.
+func NewWithOpenPGP(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signer, pgpSigners *pgpsign.Signers, pgpRecipients *pgpsign.Recipients, spool *queue.Queue, log Logger) *Server {
 	authWorkers := cfg.Server.AuthWorkers
 	if authWorkers <= 0 {
 		authWorkers = 4
@@ -211,6 +212,7 @@ func NewWithOpenPGP(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signe
 	}
 
 	srv.openPGPSign = pgpSigners.Sign
+	srv.openPGPRecipients = pgpRecipients
 
 	srv.signMessage = func(ctx context.Context, data []byte) (string, error) {
 		if err := ctx.Err(); err != nil {

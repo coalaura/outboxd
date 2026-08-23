@@ -212,6 +212,11 @@ func (q *Queue) exportStored(namespace, id string, w io.Writer) error {
 		return err
 	}
 
+	body, err = firstBodyVariant(env, body)
+	if err != nil {
+		return err
+	}
+
 	_, err = io.Copy(w, bytes.NewReader(body))
 	return err
 }

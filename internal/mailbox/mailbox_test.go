@@ -53,6 +53,17 @@ func TestDomainOfUnicode(t *testing.T) {
 	}
 }
 
+func TestCanonicalAddressPreservesLocalPartAndNormalizesDomain(t *testing.T) {
+	got, err := mailbox.CanonicalAddress("User@exämple.COM")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got != "User@xn--exmple-cua.com" {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestRoutingDomainRejects(t *testing.T) {
 	cases := []string{
 		"",
