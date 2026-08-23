@@ -76,8 +76,8 @@ func Create(configPath, username, sender string) (*CreatedKey, error) {
 
 	base := strings.ToLower(generated.fingerprint)
 
-	keyRelative := filepath.ToSlash(filepath.Join("openpgp", base+".private.asc"))
-	passRelative := filepath.ToSlash(filepath.Join("openpgp", base+".passphrase"))
+	keyRelative := filepath.ToSlash(filepath.Join("openpgp", "senders", base+".private.asc"))
+	passRelative := filepath.ToSlash(filepath.Join("openpgp", "senders", base+".passphrase"))
 
 	keyPath, err := latest.ResolveGeneratedPath(keyRelative)
 	if err != nil {
@@ -101,7 +101,17 @@ func Create(configPath, username, sender string) (*CreatedKey, error) {
 		return nil, fmt.Errorf("prepare private data directory: %w", err)
 	}
 
-	err = disk.EnsurePrivateRoot(filepath.Dir(keyPath))
+	senderDirectory := filepath.Dir(keyPath)
+
+	_, err = os.Lstat(senderDirectory)
+
+	senderDirectoryCreated := errors.Is(err, os.ErrNotExist)
+
+	if err != nil && !senderDirectoryCreated {
+		return nil, fmt.Errorf("inspect private OpenPGP sender directory: %w", err)
+	}
+
+	err = disk.EnsurePrivateRoot(senderDirectory)
 	if err != nil {
 		return nil, fmt.Errorf("prepare private OpenPGP directory: %w", err)
 	}
@@ -111,6 +121,18 @@ func Create(configPath, username, sender string) (*CreatedKey, error) {
 		return nil, fmt.Errorf("check generated OpenPGP path: %w", err)
 	}
 
+	rollback := func(paths ...string) error {
+		result := rollbackGenerated(paths...)
+		if senderDirectoryCreated {
+			directoryErr := removeDurable(senderDirectory)
+			if directoryErr != nil {
+				result = errors.Join(result, fmt.Errorf("remove generated directory %s: %w", senderDirectory, directoryErr))
+			}
+		}
+
+		return result
+	}
+
 	err = disk.WriteExclusive(keyPath, generated.armoredKey, 0600)
 	if err != nil {
 		writeErr := fmt.Errorf("write OpenPGP private key: %w", err)
@@ -118,7 +140,7 @@ func Create(configPath, username, sender string) (*CreatedKey, error) {
 			return nil, writeErr
 		}
 
-		return nil, errors.Join(writeErr, rollbackGenerated(keyPath))
+		return nil, errors.Join(writeErr, rollback(keyPath))
 	}
 
 	passBody := make([]byte, len(generated.passphrase)+1)
@@ -133,10 +155,10 @@ func Create(configPath, username, sender string) (*CreatedKey, error) {
 	if err != nil {
 		writeErr := fmt.Errorf("write OpenPGP passphrase file: %w", err)
 		if errors.Is(err, os.ErrExist) {
-			return nil, errors.Join(writeErr, rollbackGenerated(keyPath))
+			return nil, errors.Join(writeErr, rollback(keyPath))
 		}
 
-		return nil, errors.Join(writeErr, rollbackGenerated(passPath, keyPath))
+		return nil, errors.Join(writeErr, rollback(passPath, keyPath))
 	}
 
 	identity := config.OpenPGPIdentity{
@@ -150,12 +172,12 @@ func Create(configPath, username, sender string) (*CreatedKey, error) {
 
 	err = latest.Init()
 	if err != nil {
-		return nil, errors.Join(err, rollbackGenerated(passPath, keyPath))
+		return nil, errors.Join(err, rollback(passPath, keyPath))
 	}
 
 	_, err = Load(latest)
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("validate generated OpenPGP key: %w", err), rollbackGenerated(passPath, keyPath))
+		return nil, errors.Join(fmt.Errorf("validate generated OpenPGP key: %w", err), rollback(passPath, keyPath))
 	}
 
 	err = latest.Save()
@@ -169,7 +191,7 @@ func Create(configPath, username, sender string) (*CreatedKey, error) {
 			return nil, fmt.Errorf("config was replaced but durability confirmation failed; generated key files were preserved: %w", err)
 		}
 
-		return nil, errors.Join(err, rollbackGenerated(passPath, keyPath))
+		return nil, errors.Join(err, rollback(passPath, keyPath))
 	}
 
 	return &CreatedKey{

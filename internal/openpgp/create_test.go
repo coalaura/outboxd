@@ -27,6 +27,10 @@ func TestCreateGeneratesEncryptedConfiguredKey(t *testing.T) {
 		t.Fatalf("unexpected created key: %+v", created)
 	}
 
+	if !strings.HasPrefix(created.SigningKey, "openpgp/senders/") || !strings.HasPrefix(created.PassphraseFile, "openpgp/senders/") {
+		t.Fatalf("generated files are outside the sender directory: %+v", created)
+	}
+
 	loaded, err := config.LoadFile(path)
 	if err != nil {
 		t.Fatal(err)
