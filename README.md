@@ -177,10 +177,6 @@ outboxd derives a minimized public key containing the primary public key, exactl
 
 Discovery is not a substitute for key trust. WKD authenticates publication through the domain's HTTPS deployment, Autocrypt provides in-band discovery and continuity rather than strong identity authentication, and OPENPGPKEY depends on DNSSEC. Publish fingerprints through an independent trusted channel when identity assurance matters.
 
-## Todo
-
-- Optional recipient WKD lookup via `openpgp.use_wkd` and `openpgp.wkd_cache_directory` (`openpgp/cache`). Required recipients still prefer a local key; if none is present and WKD is enabled, discovery is attempted and a missing key fails. Encryption is never opportunistic.
-
 ## TLS Certificates
 
 Certificate deployment is intentionally left to the operator so outboxd can be used with any certificate authority or existing automation. The `outboxd` service account must be able to read both configured files. On Unix, the private key must have no group or other permission bits; use mode `0600` and ownership that permits the service account to read it. Do not weaken the key permissions to make an external certificate directory accessible. Copying or deploying certificate material into a private location such as `/opt/outboxd/data/tls` is one compatible approach, but outboxd does not prescribe or install that automation.
@@ -262,6 +258,11 @@ The application defaults to `config.yml` in the working directory. The supplied 
 `queue list`, `queue show` and `queue export` are read-only and may run while the daemon is serving. `queue retry` makes an existing message immediately due without clearing its attempt or recipient history. Retry and delete require the daemon to be stopped so they cannot race delivery. Deletion is crash-safe and refuses messages with linked DSN state.
 
 After replacing the binary, run `config update` as root with group `outboxd` to atomically rewrite an existing configuration in the current documented format, then rerun `setup.sh` to restore its service-readable ownership and mode. Configured values are retained and fields omitted by older versions receive current defaults. The command requires an existing valid configuration, does not provision keys or other assets and requires a daemon restart before the updated startup configuration takes effect. The canonical rewrite replaces custom YAML formatting and comments with outboxd's generated documentation.
+
+## Todo
+
+- Simple permission fix command, attempting to resolve any permission and ownership issues.
+- Optional recipient WKD lookup via `openpgp.use_wkd` and `openpgp.wkd_cache_directory` (`openpgp/cache`). Required recipients still prefer a local key; if none is present and WKD is enabled, discovery is attempted and a missing key fails. Encryption is never opportunistic.
 
 ## Security Notes
 
