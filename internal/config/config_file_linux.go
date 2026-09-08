@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -53,7 +54,7 @@ func validateConfigPermissions(info os.FileInfo) error {
 	}
 
 	uid, gid, ok := configFileOwner(info)
-	if !ok || uid != 0 || permissions != 0440 || !processHasGroup(gid) {
+	if !ok || uid != 0 || permissions != 0440 || os.Geteuid() != 0 && !processHasGroup(gid) {
 		return fmt.Errorf("permissions %04o allow group or other access", permissions)
 	}
 
@@ -79,11 +80,5 @@ func processHasGroup(gid int) bool {
 		return false
 	}
 
-	for _, group := range groups {
-		if group == gid {
-			return true
-		}
-	}
-
-	return false
+	return slices.Contains(groups, gid)
 }

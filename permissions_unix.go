@@ -14,7 +14,7 @@ func prepareConfigPermissions(path string) error {
 	return repairUnixFile(path, -1, -1, 0600)
 }
 
-func repairDeploymentPermissions(configPath, lockPath, dataPath string) error {
+func repairDeploymentPermissions(configPath, ownershipLockPath, mutationLockPath, dataPath string) error {
 	info, err := os.Stat(dataPath)
 	if err != nil {
 		return fmt.Errorf("inspect data directory owner: %w", err)
@@ -28,9 +28,14 @@ func repairDeploymentPermissions(configPath, lockPath, dataPath string) error {
 	uid := int(stat.Uid)
 	gid := int(stat.Gid)
 
-	err = repairUnixFile(lockPath, uid, gid, 0600)
+	err = repairUnixFile(ownershipLockPath, uid, gid, 0600)
 	if err != nil {
 		return fmt.Errorf("repair configuration ownership lock: %w", err)
+	}
+
+	err = repairUnixFile(mutationLockPath, uid, gid, 0600)
+	if err != nil {
+		return fmt.Errorf("repair configuration mutation lock: %w", err)
 	}
 
 	configUID := uid

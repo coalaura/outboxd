@@ -8,10 +8,30 @@ import (
 	"testing"
 )
 
-func TestConfigFileOwnerFromFileInfo(t *testing.T) {
+func TestValidateConfigPermissionsAllowsRootProcess(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root")
+	}
+
 	path := filepath.Join(t.TempDir(), "config.yml")
 
-	err := os.WriteFile(path, []byte("server: {}\n"), 0600)
+	err := os.WriteFile(path, []byte("test"), 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gid := 65534
+
+	for processHasGroup(gid) {
+		gid++
+	}
+
+	err = os.Chown(path, 0, gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = os.Chmod(path, 0440)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -21,12 +41,8 @@ func TestConfigFileOwnerFromFileInfo(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	uid, gid, ok := configFileOwner(info)
-	if !ok {
-		t.Fatal("could not read Linux ownership from os.FileInfo")
-	}
-
-	if uid != uint32(os.Getuid()) || gid != os.Getgid() {
-		t.Fatalf("owner = %d:%d, want %d:%d", uid, gid, os.Getuid(), os.Getgid())
+	err = validateConfigPermissions(info)
+	if err != nil {
+		t.Fatalf("root process rejected root-owned 0440 config: %v", err)
 	}
 }

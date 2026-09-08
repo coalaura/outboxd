@@ -43,6 +43,24 @@ func repairPermissions(configPath string) error {
 
 	defer ownership.Close()
 
+	mutationLockPath := path + ".lock"
+
+	info, err = os.Lstat(mutationLockPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	if err == nil && !info.Mode().IsRegular() {
+		return fmt.Errorf("configuration mutation lock is not a regular file: %s", mutationLockPath)
+	}
+
+	mutation, err := disk.LockForRepair(mutationLockPath)
+	if err != nil {
+		return fmt.Errorf("configuration mutation lock %s: %w: stop configuration updates before repairing permissions", mutationLockPath, err)
+	}
+
+	defer mutation.Close()
+
 	err = prepareConfigPermissions(path)
 	if err != nil {
 		return fmt.Errorf("prepare config permissions: %w", err)
@@ -70,7 +88,7 @@ func repairPermissions(configPath string) error {
 		return fmt.Errorf("repair private data directory: %w", err)
 	}
 
-	err = repairDeploymentPermissions(path, lockPath, cfg.ResolvedDataDir())
+	err = repairDeploymentPermissions(path, lockPath, mutationLockPath, cfg.ResolvedDataDir())
 	if err != nil {
 		return err
 	}

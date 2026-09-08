@@ -36,8 +36,14 @@ func TestRepairPermissionsRepairsManagedDACLs(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	err = os.WriteFile(configPath+".lock", nil, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	damagedPaths := []string{
 		configPath,
+		configPath + ".lock",
 		configPath + ".outboxd.lock",
 		cfg.ResolvedDataDir(),
 		cfg.ResolvePath("queue"),
@@ -59,9 +65,13 @@ func TestRepairPermissionsRepairsManagedDACLs(t *testing.T) {
 		t.Fatalf("repaired config cannot be loaded: %v", err)
 	}
 
-	err = config.CheckFile(configPath+".outboxd.lock", true)
-	if err != nil {
-		t.Fatalf("repaired config lock is invalid: %v", err)
+	lockPaths := []string{configPath + ".lock", configPath + ".outboxd.lock"}
+
+	for _, lockPath := range lockPaths {
+		err = config.CheckFile(lockPath, true)
+		if err != nil {
+			t.Errorf("repaired config lock %s is invalid: %v", lockPath, err)
+		}
 	}
 
 	err = disk.ValidatePrivateTree(cfg.ResolvedDataDir())

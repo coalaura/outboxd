@@ -51,8 +51,14 @@ func TestRepairPermissionsRepairsManagedTree(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	err = os.WriteFile(configPath+".lock", nil, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	damagedModes := map[string]os.FileMode{
 		configPath:                                       0666,
+		configPath + ".lock":                             0644,
 		configPath + ".outboxd.lock":                     0644,
 		cfg.ResolvedDataDir():                            0755,
 		cfg.ResolvePath("queue"):                         0755,
@@ -121,6 +127,24 @@ func TestRepairPermissionsRepairsManagedTree(t *testing.T) {
 
 	if configInfo.Mode().Perm() != wantConfigMode {
 		t.Fatalf("config mode=%04o, want %04o", configInfo.Mode().Perm(), wantConfigMode)
+	}
+
+	lockPaths := []string{configPath + ".lock", configPath + ".outboxd.lock"}
+
+	for _, lockPath := range lockPaths {
+		lockInfo, statErr := os.Stat(lockPath)
+		if statErr != nil {
+			t.Fatal(statErr)
+		}
+
+		if lockInfo.Mode().Perm() != 0600 {
+			t.Errorf("%s mode=%04o, want 0600", lockPath, lockInfo.Mode().Perm())
+		}
+
+		lockOwner := lockInfo.Sys().(*syscall.Stat_t)
+		if lockOwner.Uid != dataOwner.Uid || lockOwner.Gid != dataOwner.Gid {
+			t.Errorf("%s owner=%d:%d, want %d:%d", lockPath, lockOwner.Uid, lockOwner.Gid, dataOwner.Uid, dataOwner.Gid)
+		}
 	}
 
 	_, err = sign.Load(cfg)
