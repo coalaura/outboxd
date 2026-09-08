@@ -1,0 +1,1675 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#11111b">
+        <meta name="color-scheme" content="dark">
+        <meta name="description" content="outboxd — a single-binary outbound mail server for applications that need reliable, properly authenticated email delivery.">
+        <title>outboxd — outbound mail, done properly</title>
+
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;450;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+        <style>
+            :root {
+                --base: #11111b;
+                --mantle: #181825;
+                --crust: #0d0d14;
+                --surface-0: #1e1e2e;
+                --surface-1: #313244;
+                --surface-2: #45475a;
+                --overlay-0: #6c7086;
+                --overlay-1: #7f849c;
+                --subtext-0: #a6adc8;
+                --subtext-1: #bac2de;
+                --text: #cdd6f4;
+                --lavender: #b4befe;
+                --blue: #89b4fa;
+                --sapphire: #74c7ec;
+                --teal: #94e2d5;
+                --green: #a6e3a1;
+                --yellow: #f9e2af;
+                --peach: #fab387;
+                --red: #f38ba8;
+                --mauve: #cba6f7;
+                --pink: #f5c2e7;
+
+                --line: rgba(205, 214, 244, 0.12);
+                --line-strong: rgba(205, 214, 244, 0.21);
+                --grid: rgba(205, 214, 244, 0.035);
+                --max: 1180px;
+                --mono: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+                --sans: "Geist", Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            }
+
+            * {
+                box-sizing: border-box;
+            }
+
+            html {
+                scroll-behavior: smooth;
+                background: var(--base);
+            }
+
+            body {
+                margin: 0;
+                color: var(--text);
+                background:
+                    linear-gradient(var(--grid) 1px, transparent 1px),
+                    linear-gradient(90deg, var(--grid) 1px, transparent 1px),
+                    radial-gradient(circle at 78% 8%, rgba(137, 180, 250, 0.08), transparent 28rem),
+                    radial-gradient(circle at 12% 28%, rgba(203, 166, 247, 0.06), transparent 25rem),
+                    var(--base);
+                background-size: 40px 40px, 40px 40px, auto, auto, auto;
+                font-family: var(--sans);
+                font-size: 16px;
+                line-height: 1.6;
+                -webkit-font-smoothing: antialiased;
+                text-rendering: optimizeLegibility;
+            }
+
+            ::selection {
+                color: var(--base);
+                background: var(--lavender);
+            }
+
+            a {
+                color: inherit;
+                text-decoration: none;
+            }
+
+            button,
+            input {
+                font: inherit;
+            }
+
+            button {
+                color: inherit;
+            }
+
+            .shell {
+                width: min(calc(100% - 40px), var(--max));
+                margin: 0 auto;
+            }
+
+            .mono {
+                font-family: var(--mono);
+            }
+
+            .eyebrow {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                margin-bottom: 18px;
+                color: var(--overlay-1);
+                font-family: var(--mono);
+                font-size: 12px;
+                font-weight: 500;
+                letter-spacing: 0.12em;
+                text-transform: uppercase;
+            }
+
+            .eyebrow::before {
+                width: 22px;
+                height: 1px;
+                content: "";
+                background: var(--blue);
+                box-shadow: 8px 0 0 rgba(137, 180, 250, 0.35);
+            }
+
+            .topbar {
+                position: sticky;
+                z-index: 50;
+                top: 0;
+                border-bottom: 1px solid var(--line);
+                background: rgba(17, 17, 27, 0.84);
+                backdrop-filter: blur(18px);
+            }
+
+            .nav {
+                display: flex;
+                min-height: 62px;
+                align-items: center;
+                justify-content: space-between;
+                gap: 32px;
+            }
+
+            .brand {
+                display: inline-flex;
+                align-items: center;
+                gap: 12px;
+                font-family: var(--mono);
+                font-size: 15px;
+                font-weight: 600;
+                letter-spacing: -0.02em;
+            }
+
+            .brand-mark {
+                position: relative;
+                width: 24px;
+                height: 18px;
+                border: 1px solid var(--line-strong);
+                background: var(--mantle);
+            }
+
+            .brand-mark::before,
+            .brand-mark::after {
+                position: absolute;
+                height: 1px;
+                content: "";
+                background: var(--blue);
+                transform-origin: left center;
+            }
+
+            .brand-mark::before {
+                top: 4px;
+                left: 4px;
+                width: 9px;
+                transform: rotate(31deg);
+            }
+
+            .brand-mark::after {
+                top: 9px;
+                left: 11px;
+                width: 8px;
+                transform: rotate(-31deg);
+            }
+
+            .nav-links {
+                display: flex;
+                align-items: center;
+                gap: 26px;
+                color: var(--subtext-0);
+                font-family: var(--mono);
+                font-size: 12px;
+            }
+
+            .nav-links a {
+                transition: color 140ms ease;
+            }
+
+            .nav-links a:hover {
+                color: var(--text);
+            }
+
+            .github-link {
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                padding: 7px 10px;
+                border: 1px solid var(--line-strong);
+                color: var(--text) !important;
+                background: rgba(30, 30, 46, 0.5);
+            }
+
+            .hero {
+                position: relative;
+                padding: 112px 0 72px;
+                overflow: hidden;
+            }
+
+            .hero::after {
+                position: absolute;
+                z-index: -1;
+                top: 105px;
+                right: max(5vw, calc((100vw - var(--max)) / 2 - 50px));
+                content: "@";
+                color: rgba(205, 214, 244, 0.025);
+                font-family: var(--mono);
+                font-size: clamp(260px, 34vw, 560px);
+                font-weight: 600;
+                line-height: 0.7;
+                pointer-events: none;
+            }
+
+            .hero-layout {
+                display: grid;
+                align-items: start;
+                grid-template-columns: minmax(0, 1.08fr) minmax(360px, 0.92fr);
+                gap: 72px;
+            }
+
+            .hero h1 {
+                max-width: 780px;
+                margin: 0;
+                color: #e6e9ff;
+                font-size: clamp(54px, 8vw, 104px);
+                font-weight: 500;
+                letter-spacing: -0.065em;
+                line-height: 0.91;
+            }
+
+            .hero h1 .muted-word {
+                color: var(--overlay-0);
+            }
+
+            .hero-copy {
+                max-width: 690px;
+                margin: 32px 0 0;
+                color: var(--subtext-1);
+                font-size: clamp(18px, 2vw, 21px);
+                letter-spacing: -0.015em;
+                line-height: 1.58;
+            }
+
+            .hero-copy strong {
+                color: var(--text);
+                font-weight: 500;
+            }
+
+            .hero-actions {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 10px;
+                margin-top: 34px;
+            }
+
+            .button {
+                display: inline-flex;
+                min-height: 44px;
+                align-items: center;
+                justify-content: center;
+                gap: 10px;
+                padding: 0 16px;
+                border: 1px solid var(--line-strong);
+                font-family: var(--mono);
+                font-size: 13px;
+                font-weight: 500;
+                transition: transform 130ms ease, border-color 130ms ease, background 130ms ease;
+            }
+
+            .button:hover {
+                border-color: rgba(180, 190, 254, 0.48);
+                transform: translateY(-1px);
+            }
+
+            .button-primary {
+                border-color: var(--lavender);
+                color: var(--base);
+                background: var(--lavender);
+            }
+
+            .button-primary:hover {
+                background: #c4cbff;
+            }
+
+            .button-quiet {
+                background: rgba(30, 30, 46, 0.55);
+            }
+
+            .hero-meta {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 18px 26px;
+                margin-top: 34px;
+                color: var(--overlay-1);
+                font-family: var(--mono);
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 0.08em;
+            }
+
+            .hero-meta span {
+                position: relative;
+                padding-left: 14px;
+            }
+
+            .hero-meta span::before {
+                position: absolute;
+                top: 0.72em;
+                left: 0;
+                width: 4px;
+                height: 4px;
+                content: "";
+                background: var(--green);
+                transform: translateY(-50%);
+            }
+
+            .terminal {
+                position: relative;
+                margin-top: 18px;
+                border: 1px solid var(--line-strong);
+                background: rgba(13, 13, 20, 0.9);
+                box-shadow: 18px 18px 0 rgba(49, 50, 68, 0.16);
+            }
+
+            .terminal::before {
+                position: absolute;
+                inset: -1px auto auto -1px;
+                width: 66px;
+                height: 2px;
+                content: "";
+                background: var(--blue);
+            }
+
+            .terminal-head {
+                display: flex;
+                min-height: 43px;
+                align-items: center;
+                justify-content: space-between;
+                padding: 0 15px;
+                border-bottom: 1px solid var(--line);
+                color: var(--overlay-1);
+                font-family: var(--mono);
+                font-size: 11px;
+            }
+
+            .terminal-dots {
+                display: flex;
+                gap: 6px;
+            }
+
+            .terminal-dots i {
+                display: block;
+                width: 5px;
+                height: 5px;
+                background: var(--surface-2);
+            }
+
+            .terminal-body {
+                min-height: 390px;
+                padding: 22px 21px 24px;
+                overflow: hidden;
+                font-family: var(--mono);
+                font-size: 12px;
+                line-height: 1.9;
+            }
+
+            .line {
+                display: grid;
+                grid-template-columns: 42px minmax(0, 1fr);
+                gap: 12px;
+            }
+
+            .line-no {
+                color: var(--surface-2);
+                user-select: none;
+            }
+
+            .terminal .prompt {
+                color: var(--mauve);
+            }
+
+            .terminal .cmd {
+                color: var(--text);
+            }
+
+            .terminal .ok {
+                color: var(--green);
+            }
+
+            .terminal .dim {
+                color: var(--overlay-0);
+            }
+
+            .terminal .key {
+                color: var(--sapphire);
+            }
+
+            .terminal .value {
+                color: var(--yellow);
+            }
+
+            .terminal .secure {
+                color: var(--teal);
+            }
+
+            .terminal-status {
+                display: grid;
+                grid-template-columns: repeat(3, 1fr);
+                border-top: 1px solid var(--line);
+            }
+
+            .terminal-status div {
+                padding: 12px 14px;
+                border-right: 1px solid var(--line);
+            }
+
+            .terminal-status div:last-child {
+                border-right: 0;
+            }
+
+            .terminal-status small {
+                display: block;
+                margin-bottom: 3px;
+                color: var(--overlay-0);
+                font-family: var(--mono);
+                font-size: 9px;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+            }
+
+            .terminal-status strong {
+                color: var(--subtext-1);
+                font-family: var(--mono);
+                font-size: 11px;
+                font-weight: 500;
+            }
+
+            .section {
+                padding: 96px 0;
+                border-top: 1px solid var(--line);
+            }
+
+            .section-head {
+                display: grid;
+                align-items: end;
+                grid-template-columns: minmax(0, 1fr) minmax(280px, 0.72fr);
+                gap: 80px;
+                margin-bottom: 50px;
+            }
+
+            .section h2 {
+                max-width: 760px;
+                margin: 0;
+                color: #e6e9ff;
+                font-size: clamp(36px, 5vw, 58px);
+                font-weight: 500;
+                letter-spacing: -0.045em;
+                line-height: 1.03;
+            }
+
+            .section-lead {
+                margin: 0;
+                color: var(--subtext-0);
+                font-size: 16px;
+                line-height: 1.75;
+            }
+
+            .route {
+                display: grid;
+                grid-template-columns: 1fr 60px 1.2fr 60px 1fr;
+                align-items: stretch;
+                border-top: 1px solid var(--line-strong);
+                border-bottom: 1px solid var(--line-strong);
+            }
+
+            .route-node {
+                position: relative;
+                min-height: 200px;
+                padding: 28px 26px;
+                background: rgba(24, 24, 37, 0.34);
+            }
+
+            .route-node.active {
+                background:
+                    linear-gradient(135deg, rgba(137, 180, 250, 0.08), transparent 60%),
+                    rgba(30, 30, 46, 0.52);
+                box-shadow: inset 0 2px 0 var(--blue);
+            }
+
+            .route-node .index {
+                display: block;
+                margin-bottom: 36px;
+                color: var(--overlay-0);
+                font-family: var(--mono);
+                font-size: 10px;
+                letter-spacing: 0.12em;
+            }
+
+            .route-node h3 {
+                margin: 0 0 8px;
+                color: var(--text);
+                font-family: var(--mono);
+                font-size: 16px;
+                font-weight: 500;
+            }
+
+            .route-node p {
+                margin: 0;
+                color: var(--overlay-1);
+                font-size: 13px;
+                line-height: 1.65;
+            }
+
+            .route-arrow {
+                position: relative;
+                display: grid;
+                place-items: center;
+                color: var(--surface-2);
+                font-family: var(--mono);
+                font-size: 20px;
+            }
+
+            .route-arrow::before {
+                position: absolute;
+                width: 100%;
+                height: 1px;
+                content: "";
+                background: var(--line);
+            }
+
+            .route-arrow span {
+                position: relative;
+                padding: 0 8px;
+                background: var(--base);
+            }
+
+            .feature-grid {
+                display: grid;
+                grid-template-columns: repeat(3, 1fr);
+                border-top: 1px solid var(--line-strong);
+                border-left: 1px solid var(--line-strong);
+            }
+
+            .feature {
+                min-height: 252px;
+                padding: 28px;
+                border-right: 1px solid var(--line-strong);
+                border-bottom: 1px solid var(--line-strong);
+                background: rgba(24, 24, 37, 0.18);
+                transition: background 160ms ease;
+            }
+
+            .feature:hover {
+                background: rgba(30, 30, 46, 0.52);
+            }
+
+            .feature-icon {
+                display: grid;
+                width: 34px;
+                height: 34px;
+                margin-bottom: 40px;
+                border: 1px solid var(--line-strong);
+                place-items: center;
+                color: var(--lavender);
+                font-family: var(--mono);
+                font-size: 14px;
+            }
+
+            .feature h3 {
+                margin: 0 0 10px;
+                color: var(--text);
+                font-size: 16px;
+                font-weight: 500;
+                letter-spacing: -0.015em;
+            }
+
+            .feature p {
+                margin: 0;
+                color: var(--overlay-1);
+                font-size: 13px;
+                line-height: 1.7;
+            }
+
+            .feature-tags {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 6px;
+                margin-top: 20px;
+            }
+
+            .feature-tags span {
+                padding: 3px 6px;
+                border: 1px solid var(--line);
+                color: var(--overlay-1);
+                font-family: var(--mono);
+                font-size: 9px;
+                letter-spacing: 0.04em;
+            }
+
+            .pgp-layout {
+                display: grid;
+                grid-template-columns: minmax(320px, 0.85fr) minmax(0, 1.15fr);
+                gap: 0;
+                border: 1px solid var(--line-strong);
+                background: rgba(24, 24, 37, 0.3);
+            }
+
+            .pgp-copy {
+                padding: 44px;
+                border-right: 1px solid var(--line-strong);
+            }
+
+            .pgp-copy h3 {
+                margin: 0 0 18px;
+                color: var(--text);
+                font-size: 28px;
+                font-weight: 500;
+                letter-spacing: -0.035em;
+            }
+
+            .pgp-copy p {
+                margin: 0 0 24px;
+                color: var(--subtext-0);
+                font-size: 14px;
+                line-height: 1.8;
+            }
+
+            .check-list {
+                display: grid;
+                gap: 0;
+                border-top: 1px solid var(--line);
+            }
+
+            .check-item {
+                display: grid;
+                grid-template-columns: 28px minmax(0, 1fr);
+                align-items: start;
+                padding: 13px 0;
+                border-bottom: 1px solid var(--line);
+                color: var(--subtext-1);
+                font-size: 12px;
+            }
+
+            .check-item::before {
+                content: "✓";
+                color: var(--green);
+                font-family: var(--mono);
+            }
+
+            .message-stack {
+                position: relative;
+                min-height: 490px;
+                padding: 42px;
+                overflow: hidden;
+                background:
+                    linear-gradient(var(--grid) 1px, transparent 1px),
+                    linear-gradient(90deg, var(--grid) 1px, transparent 1px),
+                    rgba(13, 13, 20, 0.55);
+                background-size: 28px 28px;
+            }
+
+            .message-card {
+                position: relative;
+                width: min(100%, 530px);
+                margin-left: auto;
+                border: 1px solid var(--line-strong);
+                background: rgba(17, 17, 27, 0.96);
+                box-shadow: -12px 12px 0 rgba(49, 50, 68, 0.14);
+            }
+
+            .message-card.secondary {
+                position: absolute;
+                right: 72px;
+                bottom: 50px;
+                width: 68%;
+                opacity: 0.48;
+                transform: translate(-30px, 24px);
+            }
+
+            .message-head {
+                display: flex;
+                justify-content: space-between;
+                gap: 20px;
+                padding: 13px 16px;
+                border-bottom: 1px solid var(--line);
+                color: var(--overlay-1);
+                font-family: var(--mono);
+                font-size: 10px;
+            }
+
+            .message-body {
+                padding: 18px 16px 20px;
+                font-family: var(--mono);
+                font-size: 11px;
+                line-height: 1.85;
+            }
+
+            .message-body .header {
+                display: grid;
+                grid-template-columns: 104px minmax(0, 1fr);
+                gap: 10px;
+                color: var(--subtext-0);
+            }
+
+            .message-body .header b {
+                color: var(--surface-2);
+                font-weight: 500;
+            }
+
+            .message-body hr {
+                height: 1px;
+                margin: 16px 0;
+                border: 0;
+                background: var(--line);
+            }
+
+            .message-body .cipher {
+                color: var(--surface-2);
+                word-break: break-all;
+            }
+
+            .message-body .signed {
+                color: var(--green);
+            }
+
+            .layer-label {
+                position: absolute;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                color: var(--overlay-0);
+                font-family: var(--mono);
+                font-size: 9px;
+                letter-spacing: 0.09em;
+                text-transform: uppercase;
+            }
+
+            .layer-label::before {
+                width: 20px;
+                height: 1px;
+                content: "";
+                background: currentColor;
+            }
+
+            .layer-1 {
+                top: 19px;
+                left: 18px;
+                color: var(--teal);
+            }
+
+            .layer-2 {
+                top: 51px;
+                left: 18px;
+                color: var(--mauve);
+            }
+
+            .layer-3 {
+                top: 83px;
+                left: 18px;
+                color: var(--blue);
+            }
+
+            .dns-grid {
+                display: grid;
+                grid-template-columns: 0.72fr 1.28fr;
+                gap: 0;
+                border: 1px solid var(--line-strong);
+            }
+
+            .dns-summary {
+                padding: 42px;
+                border-right: 1px solid var(--line-strong);
+                background: rgba(24, 24, 37, 0.28);
+            }
+
+            .dns-summary strong {
+                display: block;
+                margin-bottom: 14px;
+                color: var(--text);
+                font-size: 22px;
+                font-weight: 500;
+                letter-spacing: -0.025em;
+            }
+
+            .dns-summary p {
+                margin: 0;
+                color: var(--subtext-0);
+                font-size: 13px;
+                line-height: 1.8;
+            }
+
+            .dns-records {
+                padding: 10px 0;
+                background: rgba(13, 13, 20, 0.7);
+                font-family: var(--mono);
+                font-size: 11px;
+            }
+
+            .record {
+                display: grid;
+                grid-template-columns: 54px 110px minmax(0, 1fr);
+                gap: 14px;
+                padding: 13px 18px;
+                border-bottom: 1px solid var(--line);
+            }
+
+            .record:last-child {
+                border-bottom: 0;
+            }
+
+            .record-type {
+                color: var(--mauve);
+            }
+
+            .record-name {
+                color: var(--sapphire);
+            }
+
+            .record-value {
+                color: var(--subtext-0);
+                overflow-wrap: anywhere;
+            }
+
+            .install-grid {
+                display: grid;
+                grid-template-columns: 0.75fr 1.25fr;
+                gap: 70px;
+                align-items: start;
+            }
+
+            .install-copy h2 {
+                margin-bottom: 24px;
+            }
+
+            .install-copy p {
+                margin: 0 0 24px;
+                color: var(--subtext-0);
+                font-size: 15px;
+                line-height: 1.8;
+            }
+
+            .install-steps {
+                display: grid;
+                gap: 10px;
+            }
+
+            .install-step {
+                display: grid;
+                grid-template-columns: 44px minmax(0, 1fr);
+                border-top: 1px solid var(--line);
+                padding-top: 16px;
+            }
+
+            .install-step span:first-child {
+                color: var(--surface-2);
+                font-family: var(--mono);
+                font-size: 11px;
+            }
+
+            .install-step strong {
+                display: block;
+                margin-bottom: 3px;
+                color: var(--text);
+                font-size: 13px;
+                font-weight: 500;
+            }
+
+            .install-step small {
+                color: var(--overlay-1);
+                font-size: 12px;
+            }
+
+            .code-panel {
+                border: 1px solid var(--line-strong);
+                background: rgba(13, 13, 20, 0.92);
+            }
+
+            .code-tabs {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                min-height: 45px;
+                border-bottom: 1px solid var(--line);
+            }
+
+            .code-tabs-labels {
+                display: flex;
+                align-self: stretch;
+            }
+
+            .code-tab {
+                display: flex;
+                align-items: center;
+                padding: 0 15px;
+                border-right: 1px solid var(--line);
+                color: var(--overlay-0);
+                font-family: var(--mono);
+                font-size: 10px;
+            }
+
+            .code-tab.active {
+                color: var(--text);
+                background: var(--surface-0);
+                box-shadow: inset 0 -1px 0 var(--blue);
+            }
+
+            .copy-button {
+                display: inline-flex;
+                min-height: 31px;
+                align-items: center;
+                margin-right: 7px;
+                padding: 0 10px;
+                border: 1px solid var(--line);
+                background: transparent;
+                color: var(--overlay-1);
+                cursor: pointer;
+                font-family: var(--mono);
+                font-size: 10px;
+                transition: color 130ms ease, border-color 130ms ease;
+            }
+
+            .copy-button:hover {
+                border-color: var(--line-strong);
+                color: var(--text);
+            }
+
+            pre {
+                margin: 0;
+                padding: 26px;
+                overflow-x: auto;
+                color: var(--subtext-1);
+                font-family: var(--mono);
+                font-size: 12px;
+                line-height: 1.85;
+                tab-size: 2;
+            }
+
+            .code-comment {
+                color: var(--surface-2);
+            }
+
+            .code-key {
+                color: var(--blue);
+            }
+
+            .code-string {
+                color: var(--green);
+            }
+
+            .code-value {
+                color: var(--peach);
+            }
+
+            .code-command {
+                color: var(--text);
+            }
+
+            .code-prompt {
+                color: var(--mauve);
+            }
+
+            .install-command {
+                position: relative;
+                margin-bottom: 12px;
+                border: 1px solid var(--line-strong);
+                background: var(--crust);
+            }
+
+            .install-command pre {
+                padding-right: 105px;
+            }
+
+            .install-command .copy-button {
+                position: absolute;
+                top: 50%;
+                right: 7px;
+                margin: 0;
+                transform: translateY(-50%);
+            }
+
+            .small-note {
+                color: var(--overlay-0) !important;
+                font-family: var(--mono);
+                font-size: 10px !important;
+                line-height: 1.7 !important;
+            }
+
+            .final {
+                position: relative;
+                padding: 105px 0 88px;
+                border-top: 1px solid var(--line);
+                overflow: hidden;
+            }
+
+            .final-grid {
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) auto;
+                align-items: end;
+                gap: 60px;
+            }
+
+            .final h2 {
+                max-width: 820px;
+                margin: 0;
+                color: #e6e9ff;
+                font-size: clamp(42px, 6vw, 76px);
+                font-weight: 500;
+                letter-spacing: -0.052em;
+                line-height: 0.98;
+            }
+
+            .final h2 span {
+                color: var(--overlay-0);
+            }
+
+            .final p {
+                max-width: 690px;
+                margin: 26px 0 0;
+                color: var(--subtext-0);
+                font-size: 16px;
+            }
+
+            footer {
+                border-top: 1px solid var(--line);
+                background: rgba(13, 13, 20, 0.45);
+            }
+
+            .footer-grid {
+                display: flex;
+                min-height: 92px;
+                align-items: center;
+                justify-content: space-between;
+                gap: 30px;
+                color: var(--overlay-0);
+                font-family: var(--mono);
+                font-size: 10px;
+            }
+
+            .footer-links {
+                display: flex;
+                gap: 22px;
+            }
+
+            .footer-links a:hover {
+                color: var(--text);
+            }
+
+            .reveal {
+                opacity: 0;
+                transform: translateY(14px);
+                transition: opacity 520ms ease, transform 520ms ease;
+            }
+
+            .reveal.visible {
+                opacity: 1;
+                transform: none;
+            }
+
+            @media (prefers-reduced-motion: reduce) {
+                html {
+                    scroll-behavior: auto;
+                }
+
+                *,
+                *::before,
+                *::after {
+                    scroll-behavior: auto !important;
+                    transition-duration: 0.01ms !important;
+                    animation-duration: 0.01ms !important;
+                    animation-iteration-count: 1 !important;
+                }
+
+                .reveal {
+                    opacity: 1;
+                    transform: none;
+                }
+            }
+
+            @media (max-width: 940px) {
+
+                .hero-layout,
+                .section-head,
+                .pgp-layout,
+                .dns-grid,
+                .install-grid,
+                .final-grid {
+                    grid-template-columns: 1fr;
+                }
+
+                .hero-layout {
+                    gap: 52px;
+                }
+
+                .section-head {
+                    gap: 24px;
+                }
+
+                .feature-grid {
+                    grid-template-columns: repeat(2, 1fr);
+                }
+
+                .pgp-copy,
+                .dns-summary {
+                    border-right: 0;
+                    border-bottom: 1px solid var(--line-strong);
+                }
+
+                .route {
+                    grid-template-columns: 1fr;
+                }
+
+                .route-arrow {
+                    min-height: 52px;
+                }
+
+                .route-arrow::before {
+                    width: 1px;
+                    height: 100%;
+                }
+
+                .route-arrow span {
+                    transform: rotate(90deg);
+                }
+
+                .nav-links a:not(.github-link) {
+                    display: none;
+                }
+            }
+
+            @media (max-width: 650px) {
+                .shell {
+                    width: min(calc(100% - 28px), var(--max));
+                }
+
+                .hero {
+                    padding-top: 76px;
+                }
+
+                .hero h1 {
+                    font-size: clamp(50px, 17vw, 76px);
+                }
+
+                .hero-copy {
+                    font-size: 17px;
+                }
+
+                .terminal {
+                    box-shadow: 8px 8px 0 rgba(49, 50, 68, 0.14);
+                }
+
+                .terminal-body {
+                    min-height: auto;
+                    padding: 17px 14px;
+                    font-size: 10px;
+                }
+
+                .line {
+                    grid-template-columns: 27px minmax(0, 1fr);
+                    gap: 6px;
+                }
+
+                .terminal-status {
+                    grid-template-columns: 1fr;
+                }
+
+                .terminal-status div {
+                    border-right: 0;
+                    border-bottom: 1px solid var(--line);
+                }
+
+                .terminal-status div:last-child {
+                    border-bottom: 0;
+                }
+
+                .section {
+                    padding: 74px 0;
+                }
+
+                .feature-grid {
+                    grid-template-columns: 1fr;
+                }
+
+                .feature {
+                    min-height: 220px;
+                }
+
+                .pgp-copy,
+                .message-stack,
+                .dns-summary {
+                    padding: 28px 22px;
+                }
+
+                .message-stack {
+                    min-height: 520px;
+                }
+
+                .layer-label {
+                    display: none;
+                }
+
+                .message-card {
+                    width: 100%;
+                }
+
+                .message-card.secondary {
+                    right: 22px;
+                    width: calc(100% - 44px);
+                }
+
+                .record {
+                    grid-template-columns: 42px minmax(0, 1fr);
+                }
+
+                .record-value {
+                    grid-column: 1 / -1;
+                    padding-left: 56px;
+                }
+
+                .install-grid {
+                    gap: 38px;
+                }
+
+                pre {
+                    padding: 20px 16px;
+                    font-size: 10px;
+                }
+
+                .install-command pre {
+                    padding-right: 16px;
+                    padding-bottom: 58px;
+                }
+
+                .install-command .copy-button {
+                    top: auto;
+                    right: 8px;
+                    bottom: 8px;
+                    transform: none;
+                }
+
+                .final {
+                    padding: 78px 0 68px;
+                }
+
+                .footer-grid {
+                    align-items: flex-start;
+                    flex-direction: column;
+                    padding: 25px 0;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <header class="topbar">
+            <div class="shell nav">
+                <a class="brand" href="#top" aria-label="outboxd home">
+                    <span class="brand-mark" aria-hidden="true"></span>
+                    <span>outboxd</span>
+                </a>
+
+                <nav class="nav-links" aria-label="Primary navigation">
+                    <a href="#delivery">delivery</a>
+                    <a href="#features">features</a>
+                    <a href="#openpgp">openpgp</a>
+                    <a href="#install">install</a>
+                    <a class="github-link" href="https://github.com/coalaura/outboxd" target="_blank" rel="noreferrer">
+                        github <span aria-hidden="true">↗</span>
+                    </a>
+                </nav>
+            </div>
+        </header>
+
+        <main id="top">
+            <section class="hero">
+                <div class="shell hero-layout">
+                    <div>
+                        <div class="eyebrow">single-binary outbound mail server</div>
+                        <h1>Mail delivery.<br><span class="muted-word">Not a mail stack.</span></h1>
+
+                        <p class="hero-copy">
+                            <strong>outboxd</strong> gives applications one focused SMTP server for reliable outbound email —
+                            authenticated submission, durable queues, direct MX delivery, DKIM, DNS guidance, TLS and even
+                            OpenPGP/MIME signing and recipient encryption when you configure the keys.
+                        </p>
+
+                        <div class="hero-actions">
+                            <a class="button button-primary" href="#install">install outboxd <span aria-hidden="true">↓</span></a>
+                            <a class="button button-quiet" href="https://github.com/coalaura/outboxd" target="_blank" rel="noreferrer">view source <span aria-hidden="true">↗</span></a>
+                        </div>
+
+                        <div class="hero-meta" aria-label="Project highlights">
+                            <span>one binary</span>
+                            <span>self-hosted</span>
+                            <span>direct-to-mx</span>
+                            <span>no inbound mailbox</span>
+                        </div>
+                    </div>
+
+                    <div class="terminal reveal" aria-label="Example outboxd delivery output">
+                        <div class="terminal-head">
+                            <span>mail.example.com · delivery</span>
+                            <span class="terminal-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+                        </div>
+                        <div class="terminal-body">
+                            <div class="line"><span class="line-no">01</span><span><span class="prompt">$</span> <span class="cmd">outboxd check</span></span></div>
+                            <div class="line"><span class="line-no">02</span><span><span class="ok">✓</span> config loaded</span></div>
+                            <div class="line"><span class="line-no">03</span><span><span class="ok">✓</span> TLS certificate valid</span></div>
+                            <div class="line"><span class="line-no">04</span><span><span class="ok">✓</span> DKIM signing key ready</span></div>
+                            <div class="line"><span class="line-no">05</span><span><span class="ok">✓</span> OpenPGP identity <span class="key">noreply@example.com</span></span></div>
+                            <div class="line"><span class="line-no">06</span><span class="dim">·</span></div>
+                            <div class="line"><span class="line-no">07</span><span><span class="key">submission</span> <span class="value">smtp://:587</span> STARTTLS</span></div>
+                            <div class="line"><span class="line-no">08</span><span><span class="key">submission</span> <span class="value">smtps://:465</span> implicit TLS</span></div>
+                            <div class="line"><span class="line-no">09</span><span class="dim">·</span></div>
+                            <div class="line"><span class="line-no">10</span><span><span class="secure">accepted</span> <span class="dim">queue=01J…91Q</span></span></div>
+                            <div class="line"><span class="line-no">11</span><span><span class="secure">signed</span> OpenPGP/MIME + DKIM</span></div>
+                            <div class="line"><span class="line-no">12</span><span><span class="secure">encrypted</span> recipient key matched</span></div>
+                            <div class="line"><span class="line-no">13</span><span><span class="secure">delivered</span> mx1.example.net:25 <span class="dim">250 2.0.0</span></span></div>
+                        </div>
+                        <div class="terminal-status">
+                            <div><small>submission</small><strong>AUTH + TLS</strong></div>
+                            <div><small>queue</small><strong>DURABLE</strong></div>
+                            <div><small>delivery</small><strong>DIRECT MX</strong></div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="section" id="delivery">
+                <div class="shell">
+                    <div class="section-head">
+                        <div>
+                            <div class="eyebrow">the whole path</div>
+                            <h2>Your app submits mail. outboxd handles the annoying parts.</h2>
+                        </div>
+                        <p class="section-lead">
+                            It is deliberately not an IMAP server, webmail client or inbound filtering stack. It does one job:
+                            take mail from trusted applications and get it delivered correctly.
+                        </p>
+                    </div>
+
+                    <div class="route reveal" aria-label="Outbound email delivery path">
+                        <article class="route-node">
+                            <span class="index">01 / SUBMIT</span>
+                            <h3>your application</h3>
+                            <p>Use ordinary authenticated SMTP on 587 with STARTTLS or 465 with implicit TLS.</p>
+                        </article>
+
+                        <div class="route-arrow" aria-hidden="true"><span>→</span></div>
+
+                        <article class="route-node active">
+                            <span class="index">02 / PROCESS</span>
+                            <h3>outboxd</h3>
+                            <p>Authenticate, canonicalize, optionally OpenPGP-sign/encrypt, DKIM-sign, queue and retry from one daemon.</p>
+                        </article>
+
+                        <div class="route-arrow" aria-hidden="true"><span>→</span></div>
+
+                        <article class="route-node">
+                            <span class="index">03 / DELIVER</span>
+                            <h3>recipient MX</h3>
+                            <p>Resolve the recipient domain and deliver directly over SMTP on port 25 — no relay service required.</p>
+                        </article>
+                    </div>
+                </div>
+            </section>
+
+            <section class="section" id="features">
+                <div class="shell">
+                    <div class="section-head">
+                        <div>
+                            <div class="eyebrow">batteries included</div>
+                            <h2>Almost everything outbound mail asks you to get right.</h2>
+                        </div>
+                        <p class="section-lead">
+                            The point is not to recreate Postfix plus a pile of sidecars. The point is to make the common application-mail setup small, explicit and understandable.
+                        </p>
+                    </div>
+
+                    <div class="feature-grid reveal">
+                        <article class="feature">
+                            <div class="feature-icon">MX</div>
+                            <h3>Direct delivery</h3>
+                            <p>Resolve recipient MX records and deliver straight to destination servers, with a durable on-disk queue in between.</p>
+                            <div class="feature-tags"><span>SMTP</span><span>QUEUE</span><span>RETRY</span></div>
+                        </article>
+
+                        <article class="feature">
+                            <div class="feature-icon">DK</div>
+                            <h3>DKIM built in</h3>
+                            <p>Provision a signing key once and have outgoing messages signed as part of the normal delivery path.</p>
+                            <div class="feature-tags"><span>DKIM</span><span>SIGNING</span><span>DNS</span></div>
+                        </article>
+
+                        <article class="feature">
+                            <div class="feature-icon">PG</div>
+                            <h3>OpenPGP/MIME</h3>
+                            <p>Sign exact sender identities and encrypt mail for recipients whose operator-trusted public keys are configured.</p>
+                            <div class="feature-tags"><span>RFC 3156</span><span>SIGN</span><span>ENCRYPT</span></div>
+                        </article>
+
+                        <article class="feature">
+                            <div class="feature-icon">AU</div>
+                            <h3>Authenticated submission</h3>
+                            <p>Per-user SMTP credentials with Argon2id password hashes, plus exact allowed sender identities.</p>
+                            <div class="feature-tags"><span>587</span><span>465</span><span>ARGON2ID</span></div>
+                        </article>
+
+                        <article class="feature">
+                            <div class="feature-icon">TLS</div>
+                            <h3>TLS that stays current</h3>
+                            <p>Serve your real certificate files; valid replacements are picked up automatically during handshakes without a daemon restart.</p>
+                            <div class="feature-tags"><span>STARTTLS</span><span>SMTPS</span><span>HOT RELOAD</span></div>
+                        </article>
+
+                        <article class="feature">
+                            <div class="feature-icon">DNS</div>
+                            <h3>DNS guidance generated</h3>
+                            <p>Print the DKIM record and the deployment guidance you need for SPF, DMARC, TLS-RPT and optional OPENPGPKEY publication.</p>
+                            <div class="feature-tags"><span>SPF</span><span>DMARC</span><span>TLS-RPT</span></div>
+                        </article>
+
+                        <article class="feature">
+                            <div class="feature-icon">WKD</div>
+                            <h3>Key discovery output</h3>
+                            <p>Publish minimized sender public keys through static WKD trees, Autocrypt headers or DNS OPENPGPKEY records.</p>
+                            <div class="feature-tags"><span>WKD</span><span>AUTOCRYPT</span><span>RFC 7929</span></div>
+                        </article>
+
+                        <article class="feature">
+                            <div class="feature-icon">↩</div>
+                            <h3>Reject replies cleanly</h3>
+                            <p>An optional rejection-only SMTP endpoint can reject mail to no-reply addresses without accepting or storing inbound DATA.</p>
+                            <div class="feature-tags"><span>OPTIONAL</span><span>NO INBOX</span><span>NO DATA</span></div>
+                        </article>
+
+                        <article class="feature">
+                            <div class="feature-icon">01</div>
+                            <h3>One configuration</h3>
+                            <p>One binary, one private data directory and one commented configuration file instead of a multi-service mail stack.</p>
+                            <div class="feature-tags"><span>GO</span><span>SINGLE BINARY</span><span>SYSTEMD</span></div>
+                        </article>
+                    </div>
+                </div>
+            </section>
+
+            <section class="section" id="openpgp">
+                <div class="shell">
+                    <div class="section-head">
+                        <div>
+                            <div class="eyebrow">not an afterthought</div>
+                            <h2>OpenPGP support all the way through the message pipeline.</h2>
+                        </div>
+                        <p class="section-lead">
+                            Configure signing per sender and recipient keys for encryption. outboxd builds the final MIME variant first, then applies DKIM last so the message that leaves the queue is exactly what was authenticated.
+                        </p>
+                    </div>
+
+                    <div class="pgp-layout reveal">
+                        <div class="pgp-copy">
+                            <h3>Signed when required. Encrypted when possible — or required.</h3>
+                            <p>
+                                Sender identities can require OpenPGP/MIME signing. Recipient keys are operator-supplied and matched to exact addresses; configured recipients are encrypted rather than silently falling back to plaintext.
+                            </p>
+
+                            <div class="check-list">
+                                <div class="check-item">RFC 3156 multipart/signed output</div>
+                                <div class="check-item">Per-sender signing identities</div>
+                                <div class="check-item">Static per-recipient public keys</div>
+                                <div class="check-item">Optional require-encryption policy</div>
+                                <div class="check-item">WKD, Autocrypt and OPENPGPKEY publication</div>
+                                <div class="check-item">DKIM applied after final message variants are built</div>
+                            </div>
+                        </div>
+
+                        <div class="message-stack" aria-label="Illustration of OpenPGP and DKIM message layers">
+                            <span class="layer-label layer-1">recipient encryption</span>
+                            <span class="layer-label layer-2">pgp signature</span>
+                            <span class="layer-label layer-3">dkim final</span>
+
+                            <div class="message-card secondary" aria-hidden="true">
+                                <div class="message-head"><span>variant / plaintext</span><span>queued</span></div>
+                                <div class="message-body">
+                                    <div class="cipher">Content-Type: text/plain; charset=utf-8<br><br>Deployment finished successfully.</div>
+                                </div>
+                            </div>
+
+                            <div class="message-card">
+                                <div class="message-head"><span>variant / encrypted</span><span class="signed">authenticated</span></div>
+                                <div class="message-body">
+                                    <div class="header"><b>From</b><span>noreply@example.com</span></div>
+                                    <div class="header"><b>To</b><span>alice@example.net</span></div>
+                                    <div class="header"><b>DKIM-Signature</b><span>v=1; a=rsa-sha256; d=example.com; …</span></div>
+                                    <hr>
+                                    <div class="header"><b>Content-Type</b><span>multipart/encrypted; protocol="application/pgp-encrypted"</span></div>
+                                    <div class="header"><b>Version</b><span>1</span></div>
+                                    <hr>
+                                    <div class="cipher">-----BEGIN PGP MESSAGE-----<br>hQGMA8nueQOJ6N4BAQwA…<br>qkDkgNs2w3dX6A8dXr4g…<br>WWHy2I3lu2Jt90uK5m+Q…<br>-----END PGP MESSAGE-----</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="section" id="dns">
+                <div class="shell">
+                    <div class="section-head">
+                        <div>
+                            <div class="eyebrow">dns without guesswork</div>
+                            <h2>Generate the records. Publish them. Check the deployment.</h2>
+                        </div>
+                        <p class="section-lead">
+                            outboxd prints the deployment information around your configured hostname, domain and key material, so the last mile is copying records into your DNS provider rather than reconstructing them by hand.
+                        </p>
+                    </div>
+
+                    <div class="dns-grid reveal">
+                        <div class="dns-summary">
+                            <strong>Authentication is part of the setup, not a later checklist.</strong>
+                            <p>
+                                DKIM is generated from the actual provisioned key. SPF, DMARC and TLS-RPT guidance is emitted alongside it, with optional OPENPGPKEY records when enabled.
+                            </p>
+                        </div>
+                        <div class="dns-records" aria-label="Example generated DNS records">
+                            <div class="record"><span class="record-type">A</span><span class="record-name">mail</span><span class="record-value">203.0.113.10</span></div>
+                            <div class="record"><span class="record-type">TXT</span><span class="record-name">@</span><span class="record-value">v=spf1 ip4:203.0.113.10 -all</span></div>
+                            <div class="record"><span class="record-type">TXT</span><span class="record-name">_dmarc</span><span class="record-value">v=DMARC1; p=none; rua=mailto:dmarc@example.com</span></div>
+                            <div class="record"><span class="record-type">TXT</span><span class="record-name">outboxd._domainkey</span><span class="record-value">v=DKIM1; k=rsa; p=MIIBIjANBgkqh…</span></div>
+                            <div class="record"><span class="record-type">TXT</span><span class="record-name">_smtp._tls</span><span class="record-value">v=TLSRPTv1; rua=mailto:tlsrpt@example.com</span></div>
+                            <div class="record"><span class="record-type">TYPE61</span><span class="record-name">&lt;hash&gt;._openpgpkey</span><span class="record-value">\# … optional OPENPGPKEY RDATA</span></div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="section" id="install">
+                <div class="shell install-grid">
+                    <div class="install-copy">
+                        <div class="eyebrow">install</div>
+                        <h2>One daemon. One setup.</h2>
+                        <p>
+                            The guided installer sets up the Linux service layout, downloads and verifies the release, provisions the essentials and walks through DNS output.
+                        </p>
+
+                        <div class="install-steps">
+                            <div class="install-step"><span>01</span>
+                                <div><strong>Install</strong><small>Run the guided Linux installer or unpack a release yourself.</small></div>
+                            </div>
+                            <div class="install-step"><span>02</span>
+                                <div><strong>Configure</strong><small>Set hostname, sending domain, public IP, TLS and SMTP users.</small></div>
+                            </div>
+                            <div class="install-step"><span>03</span>
+                                <div><strong>Provision</strong><small>Create the queue, private state and create-once DKIM material.</small></div>
+                            </div>
+                            <div class="install-step"><span>04</span>
+                                <div><strong>Publish + check</strong><small>Copy the generated DNS guidance, run the deployment checks and start the service.</small></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div>
+                        <div class="install-command reveal">
+                            <pre><span class="code-prompt">$</span> <span class="code-command">curl -fsSL https://src.ws2.sh/outboxd/install.sh | sh</span></pre>
+                            <button class="copy-button" type="button" data-copy="curl -fsSL https://src.ws2.sh/outboxd/install.sh | sh">copy</button>
+                        </div>
+
+                        <p class="small-note">Network-delivered root installer: inspect the script before running it. Prefer release archives if you want a fully manual path.</p>
+
+                        <div class="code-panel reveal">
+                            <div class="code-tabs">
+                                <div class="code-tabs-labels">
+                                    <div class="code-tab active">config.yml</div>
+                                    <div class="code-tab">minimal</div>
+                                </div>
+                                <button class="copy-button" type="button" data-copy-target="config-example">copy</button>
+                            </div>
+                            <pre id="config-example"><span class="code-key">server</span>:
+  <span class="code-key">hostname</span>: <span class="code-string">mail.example.com</span>
+  <span class="code-key">domain</span>: <span class="code-string">example.com</span>
+  <span class="code-key">data_directory</span>: <span class="code-string">/opt/outboxd/data</span>
+
+<span class="code-key">tls</span>:
+  <span class="code-key">mode</span>: <span class="code-string">files</span>
+  <span class="code-key">certificate_file</span>: <span class="code-string">/opt/outboxd/data/tls/fullchain.pem</span>
+  <span class="code-key">private_key_file</span>: <span class="code-string">/opt/outboxd/data/tls/privkey.pem</span>
+
+<span class="code-key">dns</span>:
+  <span class="code-key">public_ipv4</span>: <span class="code-string">203.0.113.10</span></pre>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="final">
+                <div class="shell final-grid">
+                    <div>
+                        <div class="eyebrow">outbound mail, done properly</div>
+                        <h2>Keep the app simple.<br><span>Let outboxd speak SMTP.</span></h2>
+                        <p>
+                            For transactional mail, notifications, error reports and application delivery — without turning one outbound requirement into an entire mail platform.
+                        </p>
+                    </div>
+                    <div class="hero-actions">
+                        <a class="button button-primary" href="https://github.com/coalaura/outboxd" target="_blank" rel="noreferrer">github <span aria-hidden="true">↗</span></a>
+                        <a class="button button-quiet" href="#install">install <span aria-hidden="true">↑</span></a>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <footer>
+            <div class="shell footer-grid">
+                <span>outboxd · built for applications that send mail</span>
+                <div class="footer-links">
+                    <a href="https://github.com/coalaura/outboxd" target="_blank" rel="noreferrer">source ↗</a>
+                    <a href="#top">back to top ↑</a>
+                </div>
+            </div>
+        </footer>
+
+        <script>
+            const copyButtons = document.querySelectorAll('[data-copy], [data-copy-target]');
+
+            for (const button of copyButtons) {
+                button.addEventListener('click', async () => {
+                    let text = button.dataset.copy;
+
+                    if (!text && button.dataset.copyTarget) {
+                        const target = document.getElementById(button.dataset.copyTarget);
+                        text = target ? target.innerText : '';
+                    }
+
+                    if (!text) return;
+
+                    try {
+                        await navigator.clipboard.writeText(text);
+                        const previous = button.textContent;
+                        button.textContent = 'copied';
+                        window.setTimeout(() => { button.textContent = previous; }, 1300);
+                    } catch {
+                        button.textContent = 'select + copy';
+                    }
+                });
+            }
+
+            const revealElements = document.querySelectorAll('.reveal');
+
+            if ('IntersectionObserver' in window && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+                const observer = new IntersectionObserver((entries) => {
+                    for (const entry of entries) {
+                        if (!entry.isIntersecting) continue;
+                        entry.target.classList.add('visible');
+                        observer.unobserve(entry.target);
+                    }
+                }, { threshold: 0.12 });
+
+                for (const element of revealElements) observer.observe(element);
+            } else {
+                for (const element of revealElements) element.classList.add('visible');
+            }
+        </script>
+    </body>
+</html>
