@@ -64,6 +64,14 @@ func main() {
 		log.MustExit(user(configPath, args[1:]))
 	case "openpgp":
 		log.MustExit(openPGPCommand(configPath, args[1:]))
+	case "permissions":
+		if len(args) != 1 {
+			log.MustExit(errors.New("usage: outboxd permissions"))
+
+			return
+		}
+
+		log.MustExit(repairPermissions(configPath))
 	case "dns":
 		if len(args) != 1 {
 			log.MustExit(errors.New("usage: outboxd dns"))
@@ -103,7 +111,7 @@ func main() {
 
 		log.MustExit(serve(configPath))
 	default:
-		log.MustExit(fmt.Errorf("unknown command %q, expected version, config, user, openpgp, provision, dns, check, queue, dead, corrupt, or serve (default)", args[0]))
+		log.MustExit(fmt.Errorf("unknown command %q, expected version, config, user, openpgp, permissions, provision, dns, check, queue, dead, corrupt, or serve (default)", args[0]))
 	}
 }
 

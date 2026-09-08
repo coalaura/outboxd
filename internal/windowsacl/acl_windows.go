@@ -9,6 +9,8 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+const dataAccess = windows.FILE_READ_DATA | windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA
+
 var broadSIDs = []string{
 	"S-1-1-0",      // Everyone
 	"S-1-5-2",      // Network
@@ -50,6 +52,108 @@ func Protect(path string, directory bool) error {
 	}
 
 	return nil
+}
+
+// Repair replaces path's owner and DACL with the private descriptor for the
+// current user. It is reserved for the explicit permission-repair command.
+func Repair(path string, directory bool) error {
+	sd, err := privateDescriptor(directory)
+	if err != nil {
+		return err
+	}
+
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		return fmt.Errorf("read private DACL: %w", err)
+	}
+
+	user, err := currentUserSID()
+	if err != nil {
+		return err
+	}
+
+	existing, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+	if err != nil {
+		return fmt.Errorf("read owner for %q: %w", path, err)
+	}
+
+	owner, _, err := existing.Owner()
+	if err != nil {
+		return fmt.Errorf("read owner for %q: %w", path, err)
+	}
+
+	information := windows.SECURITY_INFORMATION(windows.DACL_SECURITY_INFORMATION | windows.PROTECTED_DACL_SECURITY_INFORMATION)
+
+	var repairedOwner *windows.SID
+
+	if owner == nil || !owner.Equals(user) {
+		information |= windows.OWNER_SECURITY_INFORMATION
+		repairedOwner = user
+	}
+
+	err = windows.SetNamedSecurityInfo(
+		path,
+		windows.SE_FILE_OBJECT,
+		information,
+		repairedOwner,
+		nil,
+		dacl,
+		nil,
+	)
+
+	if err != nil {
+		return fmt.Errorf("repair owner and DACL for %q: %w", path, err)
+	}
+
+	return nil
+}
+
+// RepairHandle replaces an open object's owner and DACL with the private
+// descriptor for the current user.
+func RepairHandle(handle windows.Handle, directory bool) error {
+	sd, err := privateDescriptor(directory)
+	if err != nil {
+		return err
+	}
+
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		return fmt.Errorf("read private DACL: %w", err)
+	}
+
+	user, err := currentUserSID()
+	if err != nil {
+		return err
+	}
+
+	existing, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+	if err != nil {
+		return fmt.Errorf("read owner: %w", err)
+	}
+
+	owner, _, err := existing.Owner()
+	if err != nil {
+		return fmt.Errorf("read owner: %w", err)
+	}
+
+	information := windows.SECURITY_INFORMATION(windows.DACL_SECURITY_INFORMATION | windows.PROTECTED_DACL_SECURITY_INFORMATION)
+
+	var repairedOwner *windows.SID
+
+	if owner == nil || !owner.Equals(user) {
+		information |= windows.OWNER_SECURITY_INFORMATION
+		repairedOwner = user
+	}
+
+	return windows.SetSecurityInfo(
+		handle,
+		windows.SE_FILE_OBJECT,
+		information,
+		repairedOwner,
+		nil,
+		dacl,
+		nil,
+	)
 }
 
 // SecurityAttributes returns a protected DACL suitable for secure creation.
@@ -148,6 +252,7 @@ func ValidateHandle(handle windows.Handle, path string, managed bool, requirePro
 		}
 
 		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+
 		if managed {
 			if !sid.Equals(user) && !sid.Equals(system) && !sid.Equals(administrators) {
 				return fmt.Errorf("%q DACL grants unexpected principal %s", path, sid.String())
@@ -195,7 +300,5 @@ func isBroadSID(sid *windows.SID) bool {
 }
 
 func dangerousAccess(mask windows.ACCESS_MASK) bool {
-	const dataAccess = windows.FILE_READ_DATA | windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA
-
 	return mask&(dataAccess|windows.GENERIC_READ|windows.GENERIC_WRITE|windows.GENERIC_ALL|windows.WRITE_DAC|windows.WRITE_OWNER) != 0
 }

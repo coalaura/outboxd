@@ -237,6 +237,7 @@ outboxd [-config path] config update         # add current defaults to an existi
 outboxd [-config path] user add <user> [sender...]
 outboxd [-config path] openpgp create <username> <sender>
 outboxd [-config path] openpgp publish <output-directory>
+outboxd [-config path] permissions           # repair config and managed data permissions
 outboxd [-config path] dns                   # write and print DNS instructions
 outboxd [-config path] check                 # verify local configuration and DNS
 outboxd [-config path] queue list
@@ -257,11 +258,12 @@ The application defaults to `config.yml` in the working directory. The supplied 
 
 `queue list`, `queue show` and `queue export` are read-only and may run while the daemon is serving. `queue retry` makes an existing message immediately due without clearing its attempt or recipient history. Retry and delete require the daemon to be stopped so they cannot race delivery. Deletion is crash-safe and refuses messages with linked DSN state.
 
+`permissions` requires the daemon to be stopped. It repairs the configuration, its ownership lock and all regular files and directories beneath `server.data_directory`, including queue, DKIM, generated TLS and OpenPGP material. On Unix, the data directory's existing owner and group identify the service account; managed directories become `0700` and files become `0600`. When run as root on Linux, the config becomes `root:<service-group>` with mode `0440`; otherwise it becomes service-owned with mode `0600`. On Windows, run it as the service account to replace managed DACLs with outboxd's protected private DACL. The command rejects links, reparse points, mount crossings and non-regular objects, and never changes external operator-managed certificate or key paths.
+
 After replacing the binary, run `config update` as root with group `outboxd` to atomically rewrite an existing configuration in the current documented format, then rerun `setup.sh` to restore its service-readable ownership and mode. Configured values are retained and fields omitted by older versions receive current defaults. The command requires an existing valid configuration, does not provision keys or other assets and requires a daemon restart before the updated startup configuration takes effect. The canonical rewrite replaces custom YAML formatting and comments with outboxd's generated documentation.
 
 ## Todo
 
-- Simple permission fix command, attempting to resolve any permission and ownership issues.
 - Optional recipient WKD lookup via `openpgp.use_wkd` and `openpgp.wkd_cache_directory` (`openpgp/cache`). Required recipients still prefer a local key; if none is present and WKD is enabled, discovery is attempted and a missing key fails. Encryption is never opportunistic.
 
 ## Security Notes
