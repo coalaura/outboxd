@@ -86,6 +86,7 @@ func TestLockCreatesProtectedFileAndRejectsPermissiveFile(t *testing.T) {
 	}
 
 	path := filepath.Join(root, ".lock")
+
 	lock, err := Lock(path)
 	if err != nil {
 		t.Fatal(err)

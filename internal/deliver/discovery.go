@@ -56,6 +56,7 @@ func (d *Deliverer) lookupHostIPs(ctx context.Context, host string) ([]net.IP, e
 	addrs, err := d.resolver.LookupNetIP(lookupCtx, network, host)
 
 	cancel()
+
 	if err != nil {
 		return nil, err
 	}

@@ -8,6 +8,20 @@ import (
 	"time"
 )
 
+const (
+	concurrentReserveBudgetN    = 50
+	concurrentFailuresLockoutN  = 20
+	concurrentCapacityBoundaryN = 50
+	sweepOnceCapN               = 8
+	reclaimsExpiredCapN         = 4
+	floodRealClockCapN          = 16
+	floodRealClockCount         = 2000
+	existingCapacityFloodCapN   = 16
+	smallCapacityCapN           = 10
+	smallCapacityRemaining      = 3
+	smallCapacityAttempts       = 20
+)
+
 type authLimiterEvictionCase struct {
 	ip   string
 	seen time.Time
@@ -28,8 +42,6 @@ func checkAgg(t *testing.T, l *authLimiter) {
 func TestAuthLimiterConcurrentReserveBudget(t *testing.T) {
 	l := newAuthLimiter()
 
-	const n = 50
-
 	start := make(chan struct{})
 
 	var (
@@ -37,7 +49,7 @@ func TestAuthLimiterConcurrentReserveBudget(t *testing.T) {
 		okCount atomic.Int32
 	)
 
-	for range n {
+	for range concurrentReserveBudgetN {
 		wg.Go(func() {
 			<-start
 
@@ -65,9 +77,7 @@ func TestAuthLimiterConcurrentFailuresLockout(t *testing.T) {
 
 	start := make(chan struct{})
 
-	const n = 20
-
-	for range n {
+	for range concurrentFailuresLockoutN {
 		wg.Go(func() {
 			<-start
 
@@ -528,6 +538,7 @@ func TestAuthLimiterCapacityExistingIdentityContinues(t *testing.T) {
 	}
 
 	l2.canceled("203.0.113.9", "x")
+
 	l2.mu.Lock()
 
 	if len(l2.byIP) > maxAuthIPEntries || len(l2.byKey) > maxAuthKeyEntries {
@@ -666,8 +677,6 @@ func TestAuthLimiterConcurrentCapacityBoundary(t *testing.T) {
 	l := newAuthLimiter()
 
 	// Leave room for N concurrent new identities near empty.
-	const n = 50
-
 	start := make(chan struct{})
 
 	var (
@@ -675,7 +684,7 @@ func TestAuthLimiterConcurrentCapacityBoundary(t *testing.T) {
 		ok atomic.Int32
 	)
 
-	for i := range n {
+	for i := range concurrentCapacityBoundaryN {
 		wg.Go(func() {
 			<-start
 
@@ -688,8 +697,8 @@ func TestAuthLimiterConcurrentCapacityBoundary(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	if ok.Load() != int32(n) {
-		t.Fatalf("ok=%d want %d", ok.Load(), n)
+	if ok.Load() != int32(concurrentCapacityBoundaryN) {
+		t.Fatalf("ok=%d want %d", ok.Load(), concurrentCapacityBoundaryN)
 	}
 
 	l.mu.Lock()
@@ -760,7 +769,12 @@ func TestAuthLimiterCapacityEvictsOldestSafeState(t *testing.T) {
 		return now
 	}
 
-	for _, tc := range []authLimiterEvictionCase{{"192.0.2.1", now.Add(-time.Minute)}, {"192.0.2.2", now}} {
+	cases := []authLimiterEvictionCase{
+		{"192.0.2.1", now.Add(-time.Minute)},
+		{"192.0.2.2", now},
+	}
+
+	for _, tc := range cases {
 		l.mu.Lock()
 		l.byIP[tc.ip] = &attemptState{failures: 1, seen: tc.seen}
 		l.byKey[tc.ip+"\x00user"] = &attemptState{failures: 1, seen: tc.seen}
@@ -867,15 +881,13 @@ func TestAuthLimiterNewBelowCapacityNoFullSweep(t *testing.T) {
 func TestAuthLimiterCapacitySweepOnceThenReject(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 
-	const capN = 8
-
-	l := newAuthLimiterSized(capN, capN, entryExpiry, entryExpiry)
+	l := newAuthLimiterSized(sweepOnceCapN, sweepOnceCapN, entryExpiry, entryExpiry)
 
 	l.clock = func() time.Time {
 		return now
 	}
 
-	for i := range capN {
+	for i := range sweepOnceCapN {
 		ip := fmt.Sprintf("10.0.0.%d", i+1)
 		if !l.reserve(ip, "u") {
 			t.Fatalf("fill %d", i)
@@ -946,15 +958,13 @@ func TestAuthLimiterCapacitySweepOnceThenReject(t *testing.T) {
 func TestAuthLimiterCapacityReclaimsExpired(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 
-	const capN = 4
-
-	l := newAuthLimiterSized(capN, capN, entryExpiry, entryExpiry)
+	l := newAuthLimiterSized(reclaimsExpiredCapN, reclaimsExpiredCapN, entryExpiry, entryExpiry)
 
 	l.clock = func() time.Time {
 		return now
 	}
 
-	for i := range capN {
+	for i := range reclaimsExpiredCapN {
 		ip := fmt.Sprintf("10.1.0.%d", i+1)
 		if !l.reserve(ip, "u") {
 			t.Fatal("fill")
@@ -989,12 +999,10 @@ func TestAuthLimiterCapacityReclaimsExpired(t *testing.T) {
 }
 
 func TestAuthLimiterCapacityFloodRealClockBoundedSweeps(t *testing.T) {
-	const capN = 16
-
-	l := newAuthLimiterSized(capN, capN, entryExpiry, entryExpiry)
+	l := newAuthLimiterSized(floodRealClockCapN, floodRealClockCapN, entryExpiry, entryExpiry)
 
 	// Fill both maps with non-prunable (recent failure) entries.
-	for i := range capN {
+	for i := range floodRealClockCapN {
 		ip := fmt.Sprintf("10.50.0.%d", i+1)
 
 		if !l.reserve(ip, "u") {
@@ -1012,11 +1020,9 @@ func TestAuthLimiterCapacityFloodRealClockBoundedSweeps(t *testing.T) {
 
 	l.clock = time.Now
 
-	const flood = 2000
-
 	accepted := 0
 
-	for i := range flood {
+	for i := range floodRealClockCount {
 		if l.reserve(fmt.Sprintf("198.51.100.%d", i%250+1), fmt.Sprintf("flood%d", i)) {
 			accepted++
 
@@ -1040,11 +1046,9 @@ func TestAuthLimiterCapacityFloodRealClockBoundedSweeps(t *testing.T) {
 }
 
 func TestAuthLimiterExistingDuringCapacityFlood(t *testing.T) {
-	const capN = 16
+	l := newAuthLimiterSized(existingCapacityFloodCapN, existingCapacityFloodCapN, entryExpiry, entryExpiry)
 
-	l := newAuthLimiterSized(capN, capN, entryExpiry, entryExpiry)
-
-	for i := range capN {
+	for i := range existingCapacityFloodCapN {
 		ip := fmt.Sprintf("10.51.0.%d", i+1)
 		if !l.reserve(ip, "u") {
 			t.Fatalf("fill %d", i)
@@ -1095,18 +1099,13 @@ func TestAuthLimiterExistingDuringCapacityFlood(t *testing.T) {
 func TestAuthLimiterSmallCapacityConcurrentExact(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 
-	const (
-		capN      = 10
-		remaining = 3
-	)
-
-	l := newAuthLimiterSized(capN, capN, entryExpiry, entryExpiry)
+	l := newAuthLimiterSized(smallCapacityCapN, smallCapacityCapN, entryExpiry, entryExpiry)
 
 	l.clock = func() time.Time {
 		return now
 	}
 
-	for i := range capN - remaining {
+	for i := range smallCapacityCapN - smallCapacityRemaining {
 		ip := fmt.Sprintf("10.2.0.%d", i+1)
 
 		if !l.reserve(ip, "u") {
@@ -1116,8 +1115,6 @@ func TestAuthLimiterSmallCapacityConcurrentExact(t *testing.T) {
 		l.failed(ip, "u")
 	}
 
-	const attempts = 20
-
 	start := make(chan struct{})
 
 	var (
@@ -1125,7 +1122,7 @@ func TestAuthLimiterSmallCapacityConcurrentExact(t *testing.T) {
 		ok atomic.Int32
 	)
 
-	for i := range attempts {
+	for i := range smallCapacityAttempts {
 		wg.Go(func() {
 			<-start
 
@@ -1139,13 +1136,13 @@ func TestAuthLimiterSmallCapacityConcurrentExact(t *testing.T) {
 	wg.Wait()
 
 	got := ok.Load()
-	if got != int32(remaining+1) {
-		t.Fatalf("accepted=%d want %d (free slots plus one safe replacement)", got, remaining+1)
+	if got != int32(smallCapacityRemaining+1) {
+		t.Fatalf("accepted=%d want %d (free slots plus one safe replacement)", got, smallCapacityRemaining+1)
 	}
 
 	l.mu.Lock()
 
-	if len(l.byIP) > capN || len(l.byKey) > capN {
+	if len(l.byIP) > smallCapacityCapN || len(l.byKey) > smallCapacityCapN {
 		t.Fatalf("over capacity ips=%d keys=%d", len(l.byIP), len(l.byKey))
 	}
 
@@ -1156,6 +1153,7 @@ func TestAuthLimiterSmallCapacityConcurrentExact(t *testing.T) {
 		_, present := l.byIP[ip]
 		if !present {
 			l.mu.Unlock()
+
 			t.Fatalf("half-created identity without IP %q", k)
 		}
 	}
@@ -1238,6 +1236,7 @@ func TestAuthLimiterPeriodicPruneOnlyWhenDue(t *testing.T) {
 
 	// Advance past interval on next reserve.
 	now = now.Add(entryExpiry + time.Second)
+
 	if !l.reserve("40.40.40.42", "r") {
 		t.Fatal("r")
 	}

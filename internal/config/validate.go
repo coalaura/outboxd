@@ -80,6 +80,7 @@ func (cfg *Config) Validate() error {
 	if cfg.Server.MaxQueueMessages < 0 || cfg.Server.MaxQueueBytes < 0 || cfg.Server.MaxQueueMessagesPerUser < 0 || cfg.Server.MaxQueueBytesPerUser < 0 || cfg.Server.MinFreeDiskBytes < 0 {
 		return errors.New("queue caps and minimum free disk must not be negative")
 	}
+
 	if cfg.Server.MaxSpoolBytes <= 0 {
 		return errors.New("server.max_spool_bytes must be positive")
 	}
@@ -139,6 +140,7 @@ func (cfg *Config) Validate() error {
 	if connection > lifetime || command > lifetime || submission > lifetime {
 		return errors.New("delivery connection, command, and submission timeouts must be <= maximum_lifetime")
 	}
+
 	if dnsTimeout > attemptTimeout || submission > attemptTimeout {
 		return errors.New("delivery dns and SMTP timeouts must be <= attempt_timeout")
 	}

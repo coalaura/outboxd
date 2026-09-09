@@ -48,6 +48,7 @@ func LoadPublic(cfg *config.Config) ([]PublicIdentity, error) {
 
 func readEntity(cfg *config.Config, configured config.OpenPGPIdentity) (*pgp.Entity, error) {
 	keyPath := cfg.ResolvePath(configured.SigningKey)
+
 	if !filepath.IsAbs(configured.SigningKey) {
 		err := cfg.CheckGeneratedParents(keyPath)
 		if err != nil {
@@ -201,8 +202,9 @@ func autocryptField(identity PublicIdentity) ([]byte, error) {
 		return nil, errors.New("minimized public key cannot be parsed")
 	}
 
-	if _, ok := keyring[0].EncryptionKey(time.Now()); !ok {
-		return nil, errors.New("Autocrypt requires a currently valid encryption key")
+	_, ok := keyring[0].EncryptionKey(time.Now())
+	if !ok {
+		return nil, errors.New("autocrypt requires a currently valid encryption key")
 	}
 
 	encoded := base64.StdEncoding.EncodeToString(identity.Key)
@@ -210,6 +212,7 @@ func autocryptField(identity PublicIdentity) ([]byte, error) {
 	prefix := "Autocrypt: addr=" + identity.Sender + "; keydata="
 
 	var field strings.Builder
+
 	field.Grow(len(prefix) + len(encoded) + len(encoded)/76*3 + 2)
 
 	field.WriteString(prefix)
@@ -223,8 +226,9 @@ func autocryptField(identity PublicIdentity) ([]byte, error) {
 	}
 
 	field.WriteString("\r\n")
+
 	if field.Len() > maxAutocryptFieldBytes {
-		return nil, fmt.Errorf("Autocrypt field is %d bytes; maximum is %d", field.Len(), maxAutocryptFieldBytes)
+		return nil, fmt.Errorf("autocrypt field is %d bytes; maximum is %d", field.Len(), maxAutocryptFieldBytes)
 	}
 
 	return []byte(field.String()), nil

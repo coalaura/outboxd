@@ -30,13 +30,16 @@ func (q *Queue) Next(ctx context.Context) (*Envelope, error) {
 
 		if q.closing {
 			q.mu.Unlock()
+
 			return nil, ErrQueueClosed
 		}
 
 		wait := time.Hour
 
-		if next, ok := q.pending.NextAttempt(); ok {
-			if envelope := q.pending.PopDue(time.Now()); envelope != nil {
+		next, ok := q.pending.NextAttempt()
+		if ok {
+			envelope := q.pending.PopDue(time.Now())
+			if envelope != nil {
 				delete(q.scheduled, envelope.ID)
 
 				q.mu.Unlock()
@@ -213,9 +216,11 @@ func (q *Queue) retry(envelope *Envelope, reschedule bool) error {
 		delete(q.requeues, envelope.ID)
 
 		added := false
+
 		if schedule {
 			added = q.scheduleLocked(envelope)
 		}
+
 		q.mu.Unlock()
 
 		owned = false

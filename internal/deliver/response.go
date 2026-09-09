@@ -49,12 +49,13 @@ func (c *Client) readResponse(expect int) (int, string, error) {
 
 func (c *Client) readResponseLines(expect int) (int, []string, error) {
 	code, msg, err := c.text.ReadResponse(expect)
+
 	if c.bounded.exceededLimit() {
 		return code, nil, errSMTPResponseTooLarge
 	}
 
 	if err != nil {
-		tpErr, ok := err.(*textproto.Error)
+		tpErr, ok := errors.AsType[*textproto.Error](err)
 		if ok {
 			msg := normalizeDiagnostic(tpErr.Msg)
 
@@ -87,6 +88,7 @@ func (c *boundedResponseConn) reset() {
 func (c *boundedResponseConn) exceededLimit() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	return c.exceeded
 }
 
@@ -95,6 +97,7 @@ func (c *boundedResponseConn) Read(p []byte) (int, error) {
 
 	if c.remaining <= 0 {
 		c.mu.Unlock()
+
 		return 0, errSMTPResponseTooLarge
 	}
 
@@ -142,7 +145,8 @@ func parseExtensions(lines []string) map[string]string {
 }
 
 func smtpCode(err error) int {
-	if se, ok := errors.AsType[*SMTPError](err); ok {
+	se, ok := errors.AsType[*SMTPError](err)
+	if ok {
 		return se.Code
 	}
 
@@ -150,7 +154,8 @@ func smtpCode(err error) int {
 }
 
 func smtpEnhancedCode(err error) string {
-	if se, ok := errors.AsType[*SMTPError](err); ok {
+	se, ok := errors.AsType[*SMTPError](err)
+	if ok {
 		return se.EnhancedCode
 	}
 
@@ -190,7 +195,8 @@ func permanent(err error) bool {
 }
 
 func describe(err error) string {
-	if se, ok := errors.AsType[*SMTPError](err); ok {
+	se, ok := errors.AsType[*SMTPError](err)
+	if ok {
 		return normalizeDiagnostic(fmt.Sprintf("%d %s", se.Code, se.Message))
 	}
 
@@ -198,9 +204,10 @@ func describe(err error) string {
 }
 
 func normalizeDiagnostic(s string) string {
-	s = strings.ToValidUTF8(s, "�")
+	s = strings.ToValidUTF8(s, "\uFFFD")
 
 	var b strings.Builder
+
 	b.Grow(min(len(s), maxDiagnosticBytes))
 
 	var space bool

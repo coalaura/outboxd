@@ -66,6 +66,7 @@ func user(configPath string, arguments []string) error {
 	}
 
 	var out strings.Builder
+
 	out.Grow(256)
 
 	fmt.Fprintf(&out, "Added user %q to %q. Restart outboxd for this change to take effect.\n", escapeControl(entry.Username), cfg.Path())

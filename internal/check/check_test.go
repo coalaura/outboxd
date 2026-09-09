@@ -305,10 +305,12 @@ func TestDuplicateDKIMFails(t *testing.T) {
 func TestDMARCConfiguredPolicyMismatchFails(t *testing.T) {
 	cfg := baseCfg()
 
-	for _, test := range []dmarcConfiguredPolicyCase{
+	cases := []dmarcConfiguredPolicyCase{
 		{"none", Warn},
 		{"reject", Fail},
-	} {
+	}
+
+	for _, test := range cases {
 		r := &fakeResolver{txt: map[string][]string{
 			"_dmarc.example.com": {"v=DMARC1; p=" + test.policy + "; rua=mailto:dmarc@reports.example.net"},
 		}}
@@ -325,10 +327,12 @@ func TestNullMXFailsWithoutImplicitFallback(t *testing.T) {
 
 	cfg.Users = nil
 
-	for _, mxs := range [][]*net.MX{
+	mxGroups := [][]*net.MX{
 		{{Host: ".", Pref: 0}},
 		{{Host: ".", Pref: 0}, {Host: "mx.example.com.", Pref: 10}},
-	} {
+	}
+
+	for _, mxs := range mxGroups {
 		r := &fakeResolver{
 			mx:  map[string][]*net.MX{"example.com": mxs},
 			ips: map[string][]net.IPAddr{"example.com": {{IP: net.ParseIP("203.0.113.10")}}},
@@ -426,7 +430,7 @@ func TestReplyRejectionMXMustBeExplicit(t *testing.T) {
 	cfg.ReplyRejection.Enabled = true
 	cfg.ReplyRejection.Domains = []string{"example.com"}
 
-	for _, r := range []*fakeResolver{
+	resolvers := []*fakeResolver{
 		{
 			mx:  map[string][]*net.MX{},
 			ips: map[string][]net.IPAddr{"example.com": {{IP: net.ParseIP("203.0.113.10")}}},
@@ -435,7 +439,9 @@ func TestReplyRejectionMXMustBeExplicit(t *testing.T) {
 			err: map[string]error{"mx:example.com": errors.New("temporary DNS failure")},
 			ips: map[string][]net.IPAddr{"example.com": {{IP: net.ParseIP("203.0.113.10")}}},
 		},
-	} {
+	}
+
+	for _, r := range resolvers {
 		results := checkEnvelopeMX(context.Background(), r, cfg)
 		if len(results) != 1 || results[0].Level != Fail || !strings.Contains(results[0].Message, "explicit MX") {
 			t.Fatalf("results=%+v", results)

@@ -23,6 +23,7 @@ func (d *Deliverer) Run(ctx context.Context) error {
 
 	// Registered first so it runs last: cancel() must fire before we wait.
 	var wg sync.WaitGroup
+
 	defer wg.Wait()
 
 	ctx, cancel := context.WithCancel(ctx)

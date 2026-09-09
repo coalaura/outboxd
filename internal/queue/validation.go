@@ -95,6 +95,7 @@ func validateEnvelope(e *Envelope) error {
 		if e.DSNSourceRevision != 0 {
 			return errors.New("DSN source revision without source ID")
 		}
+
 		if e.DSNSourceIncarnation != "" {
 			return errors.New("DSN source incarnation without source ID")
 		}

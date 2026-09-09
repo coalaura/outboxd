@@ -44,6 +44,7 @@ func TestLoadIsReadOnly(t *testing.T) {
 	}
 
 	before, _ := os.ReadFile(path)
+
 	_, err = Load(cfg)
 	if err == nil {
 		t.Fatal("malformed key must fail")

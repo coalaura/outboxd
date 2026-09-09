@@ -252,7 +252,8 @@ func TestOpenPGPIdentityValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := cfg.OpenPGP.Identities[0].Sender; got != "Alice@example.com" {
+	got := cfg.OpenPGP.Identities[0].Sender
+	if got != "Alice@example.com" {
 		t.Fatalf("canonical sender = %q", got)
 	}
 
@@ -298,11 +299,13 @@ func TestOpenPGPRequiredRecipientValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := cfg.OpenPGP.RequireEncryptionFor[0]; got != "Alice@example.com" {
+	got := cfg.OpenPGP.RequireEncryptionFor[0]
+	if got != "Alice@example.com" {
 		t.Fatalf("canonical required recipient = %q", got)
 	}
 
-	if got := cfg.OpenPGP.RequireEncryptionFor[1]; got != "bob@xn--exmple-cua.com" {
+	got = cfg.OpenPGP.RequireEncryptionFor[1]
+	if got != "bob@xn--exmple-cua.com" {
 		t.Fatalf("canonical IDNA required recipient = %q", got)
 	}
 
@@ -502,25 +505,120 @@ func TestResourceBoundaries(t *testing.T) {
 	}
 
 	tests := []resourceBoundaryCase{
-		{"message too large", func(c *Config) { c.Server.MaxMessageBytes = MaxMessageBytes + 1 }},
-		{"recipients hard limit", func(c *Config) { c.Server.MaxRecipients = MaxRecipients + 1 }},
-		{"attempts", func(c *Config) { c.Delivery.MaxAttempts = MaxDeliveryAttempts + 1 }},
-		{"domain concurrency", func(c *Config) { c.Delivery.DomainConcurrency = MaxDomainConcurrency + 1 }},
-		{"global concurrency", func(c *Config) { c.Delivery.GlobalConcurrency = MaxGlobalConcurrency + 1 }},
-		{"user concurrency", func(c *Config) { c.Delivery.UserConcurrency = MaxUserConcurrency + 1 }},
-		{"MX candidates", func(c *Config) { c.Delivery.MaxMXCandidates = MaxMXCandidates + 1 }},
-		{"IP candidates", func(c *Config) { c.Delivery.MaxIPCandidatesPerMX = MaxIPCandidatesPerMX + 1 }},
-		{"connections", func(c *Config) { c.Server.MaxConnections = MaxConnections + 1 }},
-		{"connections per IP", func(c *Config) { c.Server.MaxConnectionsPerIP = MaxConnectionsPerIP + 1 }},
-		{"auth workers", func(c *Config) { c.Server.AuthWorkers = MaxAuthWorkers + 1 }},
-		{"negative queue messages", func(c *Config) { c.Server.MaxQueueMessages = -1 }},
-		{"negative queue bytes", func(c *Config) { c.Server.MaxQueueBytes = -1 }},
-		{"missing spool cap", func(c *Config) { c.Server.MaxSpoolBytes = 0 }},
-		{"missing emergency reserve", func(c *Config) { c.Server.SpoolEmergencyBytes = 0 }},
-		{"undersized emergency reserve", func(c *Config) { c.Server.SpoolEmergencyBytes = queue.MinimumSpoolEmergencyBytes - 1 }},
-		{"emergency consumes spool", func(c *Config) { c.Server.SpoolEmergencyBytes = c.Server.MaxSpoolBytes }},
-		{"zero dead retention", func(c *Config) { c.Server.DeadRetention = "0s" }},
-		{"zero corrupt retention", func(c *Config) { c.Server.CorruptRetention = "0s" }},
+		{
+			"message too large",
+			func(c *Config) {
+				c.Server.MaxMessageBytes = MaxMessageBytes + 1
+			},
+		},
+		{
+			"recipients hard limit",
+			func(c *Config) {
+				c.Server.MaxRecipients = MaxRecipients + 1
+			},
+		},
+		{
+			"attempts",
+			func(c *Config) {
+				c.Delivery.MaxAttempts = MaxDeliveryAttempts + 1
+			},
+		},
+		{
+			"domain concurrency",
+			func(c *Config) {
+				c.Delivery.DomainConcurrency = MaxDomainConcurrency + 1
+			},
+		},
+		{
+			"global concurrency",
+			func(c *Config) {
+				c.Delivery.GlobalConcurrency = MaxGlobalConcurrency + 1
+			},
+		},
+		{
+			"user concurrency",
+			func(c *Config) {
+				c.Delivery.UserConcurrency = MaxUserConcurrency + 1
+			},
+		},
+		{
+			"MX candidates",
+			func(c *Config) {
+				c.Delivery.MaxMXCandidates = MaxMXCandidates + 1
+			},
+		},
+		{
+			"IP candidates",
+			func(c *Config) {
+				c.Delivery.MaxIPCandidatesPerMX = MaxIPCandidatesPerMX + 1
+			},
+		},
+		{
+			"connections",
+			func(c *Config) {
+				c.Server.MaxConnections = MaxConnections + 1
+			},
+		},
+		{
+			"connections per IP",
+			func(c *Config) {
+				c.Server.MaxConnectionsPerIP = MaxConnectionsPerIP + 1
+			},
+		},
+		{
+			"auth workers",
+			func(c *Config) {
+				c.Server.AuthWorkers = MaxAuthWorkers + 1
+			},
+		},
+		{
+			"negative queue messages",
+			func(c *Config) {
+				c.Server.MaxQueueMessages = -1
+			},
+		},
+		{
+			"negative queue bytes",
+			func(c *Config) {
+				c.Server.MaxQueueBytes = -1
+			},
+		},
+		{
+			"missing spool cap",
+			func(c *Config) {
+				c.Server.MaxSpoolBytes = 0
+			},
+		},
+		{
+			"missing emergency reserve",
+			func(c *Config) {
+				c.Server.SpoolEmergencyBytes = 0
+			},
+		},
+		{
+			"undersized emergency reserve",
+			func(c *Config) {
+				c.Server.SpoolEmergencyBytes = queue.MinimumSpoolEmergencyBytes - 1
+			},
+		},
+		{
+			"emergency consumes spool",
+			func(c *Config) {
+				c.Server.SpoolEmergencyBytes = c.Server.MaxSpoolBytes
+			},
+		},
+		{
+			"zero dead retention",
+			func(c *Config) {
+				c.Server.DeadRetention = "0s"
+			},
+		},
+		{
+			"zero corrupt retention",
+			func(c *Config) {
+				c.Server.CorruptRetention = "0s"
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -582,13 +680,15 @@ func TestRateAndBurstBoundaries(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		for _, boundary := range []intBoundaryCase{
+		boundaries := []intBoundaryCase{
 			{"negative", -1, false},
 			{"zero", 0, tt.zero},
 			{"maximum", tt.max, true},
 			{"maximum plus one", tt.max + 1, false},
 			{"integer maximum", maxInt, false},
-		} {
+		}
+
+		for _, boundary := range boundaries {
 			t.Run(tt.name+"/"+boundary.name, func(t *testing.T) {
 				cfg := Default()
 
@@ -604,13 +704,15 @@ func TestRateAndBurstBoundaries(t *testing.T) {
 }
 
 func TestDeliveryAttemptBoundaries(t *testing.T) {
-	for _, tt := range []intBoundaryCase{
+	cases := []intBoundaryCase{
 		{"negative", -1, false},
 		{"zero", 0, false},
 		{"maximum", MaxDeliveryAttempts, true},
 		{"maximum plus one", MaxDeliveryAttempts + 1, false},
 		{"integer maximum", int(^uint(0) >> 1), false},
-	} {
+	}
+
+	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := Default()
 
@@ -668,13 +770,15 @@ func TestDurationBoundaries(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		for _, boundary := range []stringBoundaryCase{
+		boundaries := []stringBoundaryCase{
 			{"negative", "-1ns", false},
 			{"zero", "0s", false},
 			{"maximum", tt.max.String(), true},
 			{"maximum plus one", (tt.max + time.Nanosecond).String(), false},
 			{"overflow adjacent", "2562048h", false},
-		} {
+		}
+
+		for _, boundary := range boundaries {
 			t.Run(tt.name+"/"+boundary.name, func(t *testing.T) {
 				cfg := Default()
 
@@ -745,7 +849,8 @@ func TestResourceRelationships(t *testing.T) {
 
 			tt.set(cfg)
 
-			if err := cfg.Validate(); err == nil {
+			err := cfg.Validate()
+			if err == nil {
 				t.Fatal("expected validation failure")
 			}
 		})
@@ -753,10 +858,16 @@ func TestResourceRelationships(t *testing.T) {
 }
 
 func TestIPv4FieldsRejectMappedIPv6(t *testing.T) {
-	for _, set := range []func(*Config){
-		func(cfg *Config) { cfg.DNS.PublicIPv4 = "::ffff:192.0.2.1" },
-		func(cfg *Config) { cfg.Delivery.BindIPv4 = "::ffff:192.0.2.1" },
-	} {
+	mutators := []func(*Config){
+		func(cfg *Config) {
+			cfg.DNS.PublicIPv4 = "::ffff:192.0.2.1"
+		},
+		func(cfg *Config) {
+			cfg.Delivery.BindIPv4 = "::ffff:192.0.2.1"
+		},
+	}
+
+	for _, set := range mutators {
 		cfg := Default()
 
 		set(cfg)
@@ -803,11 +914,13 @@ func TestGeneratedAuthCommentsDocumentAuditedBounds(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, want := range []string{
+	wants := []string{
 		`minimum log level: "debug", "print", "warn", or "error"`,
 		"19 MiB each; maximum 8, 152 MiB total",
 		"migration hashes must use m=19456,t=2,p=1, a 16-byte salt, and a 32-byte output",
-	} {
+	}
+
+	for _, want := range wants {
 		if !bytes.Contains(data, []byte(want)) {
 			t.Fatalf("generated configuration does not document %q", want)
 		}
@@ -917,7 +1030,9 @@ func TestGeneratedPathsConfined(t *testing.T) {
 
 	inside := filepath.Join(cfg.Server.DataDirectory, "keys", "mail.key")
 
-	for _, path := range []string{"../escape", filepath.Join(dir, "outside"), cfg.Server.DataDirectory, "C:\\outside\\mail.key"} {
+	escapePaths := []string{"../escape", filepath.Join(dir, "outside"), cfg.Server.DataDirectory, "C:\\outside\\mail.key"}
+
+	for _, path := range escapePaths {
 		if runtime.GOOS != "windows" && strings.HasPrefix(path, "C:") {
 			continue
 		}
@@ -964,7 +1079,9 @@ func TestConcurrentSubprocessAddUser(t *testing.T) {
 	commands := make([]*exec.Cmd, 2)
 	outputs := make([]bytes.Buffer, 2)
 
-	for i, username := range []string{"bob", "carol"} {
+	childUsers := []string{"bob", "carol"}
+
+	for i, username := range childUsers {
 		cmd := exec.Command(os.Args[0], "-test.run=^TestConcurrentSubprocessAddUser$")
 
 		cmd.Env = append(os.Environ(), "OUTBOXD_ADD_USER_CHILD=1", "OUTBOXD_TEST_CONFIG="+path, "OUTBOXD_TEST_USER="+username, "OUTBOXD_TEST_HASH="+hash)
@@ -992,7 +1109,9 @@ func TestConcurrentSubprocessAddUser(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, username := range []string{"alice", "bob", "carol"} {
+	expectedUsers := []string{"alice", "bob", "carol"}
+
+	for _, username := range expectedUsers {
 		_, ok := cfg.User(username)
 		if !ok {
 			t.Fatalf("concurrent update lost user %q", username)

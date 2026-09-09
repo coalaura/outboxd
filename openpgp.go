@@ -11,7 +11,7 @@ import (
 
 func openPGPCommand(configPath string, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: outboxd openpgp <create|publish> ...")
+		return errors.New("usage: outboxd openpgp <create|publish> [...]")
 	}
 
 	switch args[0] {
@@ -48,5 +48,5 @@ func openPGPCommand(configPath string, args []string) error {
 		return nil
 	}
 
-	return errors.New("usage: outboxd openpgp <create|publish> ...")
+	return errors.New("usage: outboxd openpgp <create|publish> [...]")
 }

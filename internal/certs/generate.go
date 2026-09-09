@@ -71,8 +71,11 @@ func (k *Keeper) generate(hostname string) error {
 		Bytes: body,
 	})
 
-	for _, path := range []string{k.privateKeyStage(), k.certificateStage()} {
-		if _, err = os.Lstat(path); err == nil {
+	stagePaths := []string{k.privateKeyStage(), k.certificateStage()}
+
+	for _, path := range stagePaths {
+		_, err = os.Lstat(path)
+		if err == nil {
 			return fmt.Errorf("self-signed tls staging file %q already exists", path)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -229,7 +232,9 @@ func (k *Keeper) recoverGeneration() (bool, error) {
 }
 
 func (k *Keeper) discardGenerationStages() error {
-	for _, stage := range []string{k.privateKeyStage(), k.certificateStage()} {
+	stagePaths := []string{k.privateKeyStage(), k.certificateStage()}
+
+	for _, stage := range stagePaths {
 		err := removeIfExistsDurable(stage)
 		if err != nil {
 			return err

@@ -73,8 +73,10 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 		}
 
 		sawEligible = true
+
 		if errors.Is(err, errSMTPUTF8Unsupported) {
 			sawUTF8CapErr = true
+
 			if last == nil {
 				last = err
 			}
@@ -84,6 +86,7 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 
 		if errors.Is(err, err8BITMIMEUnsupported) {
 			sawEightBitCapErr = true
+
 			if last == nil {
 				last = err
 			}
@@ -93,6 +96,7 @@ func (d *Deliverer) domain(ctx context.Context, envelope *queue.Envelope, domain
 
 		// Any non-capability outcome means this is not a capability-only failure set.
 		capabilityOnly = false
+
 		if errors.Is(err, errPrivateDestination) {
 			// Do not overwrite a prior retryable diagnostic with a private-destination
 			// error; mixed outcomes must stay temporary (same class as capability mix).

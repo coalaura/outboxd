@@ -115,6 +115,7 @@ func (d *Deliverer) ensureDSN(envelope *queue.Envelope) error {
 func readDSNOriginal(r io.ReadCloser) (original []byte, err error) {
 	defer func() {
 		closeErr := r.Close()
+
 		if err == nil {
 			err = closeErr
 		}

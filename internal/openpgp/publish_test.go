@@ -72,7 +72,9 @@ func TestPublishCreatesPublicKeysAndBothWKDLayouts(t *testing.T) {
 		t.Fatalf("Publish() results = %+v", results)
 	}
 
-	for _, path := range []string{results[0].PublicKey, results[0].AdvancedWKD, results[0].DirectWKD} {
+	artifactPaths := []string{results[0].PublicKey, results[0].AdvancedWKD, results[0].DirectWKD}
+
+	for _, path := range artifactPaths {
 		body, err := os.ReadFile(path)
 		if err != nil || len(body) == 0 {
 			t.Fatalf("read artifact %s: bytes=%d err=%v", path, len(body), err)
@@ -82,7 +84,9 @@ func TestPublishCreatesPublicKeysAndBothWKDLayouts(t *testing.T) {
 	advancedPolicy := filepath.Join(output, "wkd", "advanced", "openpgpkey.example.com", ".well-known", "openpgpkey", "example.com", "policy")
 	directPolicy := filepath.Join(output, "wkd", "direct", "example.com", ".well-known", "openpgpkey", "policy")
 
-	for _, path := range []string{advancedPolicy, directPolicy} {
+	policyPaths := []string{advancedPolicy, directPolicy}
+
+	for _, path := range policyPaths {
 		body, err := os.ReadFile(path)
 		if err != nil || len(body) != 0 {
 			t.Fatalf("WKD policy %s: bytes=%d err=%v", path, len(body), err)

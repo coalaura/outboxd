@@ -1,11 +1,14 @@
 package mailbox_test
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/coalaura/outboxd/internal/mailbox"
 )
+
+const wantALabel = "xn--exmple-cua.com"
 
 func TestRoutingDomainASCII(t *testing.T) {
 	got, err := mailbox.RoutingDomain("Example.COM")
@@ -24,10 +27,8 @@ func TestRoutingDomainExactALabel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const want = "xn--exmple-cua.com"
-
-	if got != want {
-		t.Fatalf("got %q want %q", got, want)
+	if got != wantALabel {
+		t.Fatalf("got %q want %q", got, wantALabel)
 	}
 
 	again, err := mailbox.RoutingDomain(got)
@@ -35,7 +36,7 @@ func TestRoutingDomainExactALabel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if again != want {
+	if again != wantALabel {
 		t.Fatalf("A-label not idempotent: %q", again)
 	}
 }
@@ -122,26 +123,30 @@ func TestDomainOfLocalPartUntouched(t *testing.T) {
 
 func TestInvalidUTF8Rejected(t *testing.T) {
 	_, err := mailbox.RoutingDomain(string([]byte{0xff, 0xfe}) + ".com")
-	if err != mailbox.ErrInvalidUTF8 {
+	if !errors.Is(err, mailbox.ErrInvalidUTF8) {
 		t.Fatalf("got %v want ErrInvalidUTF8", err)
 	}
 }
 
 func TestAddressOctetLimits(t *testing.T) {
-	for _, addr := range []string{
+	validAddresses := []string{
 		strings.Repeat("a", 64) + "@example.com",
 		strings.Repeat("é", 32) + "@example.com",
-	} {
+	}
+
+	for _, addr := range validAddresses {
 		_, err := mailbox.Address(addr)
 		if err != nil {
 			t.Fatalf("boundary address %q: %v", addr, err)
 		}
 	}
 
-	for _, addr := range []string{
+	invalidAddresses := []string{
 		strings.Repeat("a", 65) + "@example.com",
 		strings.Repeat("é", 33) + "@example.com",
-	} {
+	}
+
+	for _, addr := range invalidAddresses {
 		_, err := mailbox.Address(addr)
 		if err == nil {
 			t.Fatalf("overlong local part accepted: %q", addr)

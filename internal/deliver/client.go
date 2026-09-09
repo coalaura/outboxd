@@ -98,6 +98,7 @@ func (c *Client) EHLO(hostname string) error {
 	}
 
 	c.ext = parseExtensions(lines)
+
 	return nil
 }
 
@@ -112,6 +113,7 @@ func (c *Client) HELO(hostname string) error {
 	}
 
 	c.ext = make(map[string]string)
+
 	return nil
 }
 

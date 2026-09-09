@@ -347,7 +347,9 @@ func TestGracefulShutdownTimeoutPath(t *testing.T) {
 	}
 
 	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
-	if _, err := br.ReadByte(); err == nil {
+
+	_, err = br.ReadByte()
+	if err == nil {
 		t.Fatal("active SMTP connection survived graceful shutdown timeout")
 	}
 
@@ -526,10 +528,12 @@ func TestDataWorkerCountMemoryBound(t *testing.T) {
 		t.Fatalf("DATA memory factor=%d want at least 8", config.DataMemoryCopies)
 	}
 
-	for _, tt := range []dataWorkerCountCase{
+	cases := []dataWorkerCountCase{
 		{"default", config.Default().Server.MaxMessageBytes, 2},
 		{"configured upper bound", config.MaxMessageBytes, 1},
-	} {
+	}
+
+	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			got := dataWorkerCount(tt.maxBytes)
 			if got != tt.workers {
@@ -538,7 +542,9 @@ func TestDataWorkerCountMemoryBound(t *testing.T) {
 		})
 	}
 
-	for _, maxBytes := range []int64{1, config.MaxMessageBytes, config.DataMemoryBudget, math.MaxInt64} {
+	maxBytesCases := []int64{1, config.MaxMessageBytes, config.DataMemoryBudget, math.MaxInt64}
+
+	for _, maxBytes := range maxBytesCases {
 		workers := dataWorkerCount(maxBytes)
 		if workers < 1 || workers > config.MaxDataWorkers {
 			t.Fatalf("maxBytes=%d workers=%d", maxBytes, workers)
@@ -559,7 +565,9 @@ func TestDataWorkersIndependentOfAuthWorkers(t *testing.T) {
 
 	want := dataWorkerCount(cfg.Server.MaxMessageBytes)
 
-	for _, authWorkers := range []int{1, 1024} {
+	authWorkersCases := []int{1, 1024}
+
+	for _, authWorkers := range authWorkersCases {
 		cfg.Server.AuthWorkers = authWorkers
 
 		srv := New(cfg, keeper, nil, spool, testLog{})

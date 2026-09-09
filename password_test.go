@@ -8,6 +8,8 @@ import (
 	"testing"
 )
 
+const readPasswordTestMax = 16
+
 type errReader struct{ err error }
 
 func (e errReader) Read([]byte) (int, error) {
@@ -69,11 +71,9 @@ func TestReadPasswordCRLF(t *testing.T) {
 }
 
 func TestReadPasswordExactMax(t *testing.T) {
-	const max = 16
+	pw := strings.Repeat("a", readPasswordTestMax)
 
-	pw := strings.Repeat("a", max)
-
-	got, err := readPassword(strings.NewReader(pw), max)
+	got, err := readPassword(strings.NewReader(pw), readPasswordTestMax)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,11 +84,9 @@ func TestReadPasswordExactMax(t *testing.T) {
 }
 
 func TestReadPasswordExactMaxLF(t *testing.T) {
-	const max = 16
+	pw := strings.Repeat("a", readPasswordTestMax)
 
-	pw := strings.Repeat("a", max)
-
-	got, err := readPassword(strings.NewReader(pw+"\n"), max)
+	got, err := readPassword(strings.NewReader(pw+"\n"), readPasswordTestMax)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,11 +97,9 @@ func TestReadPasswordExactMaxLF(t *testing.T) {
 }
 
 func TestReadPasswordExactMaxCRLF(t *testing.T) {
-	const max = 16
+	pw := strings.Repeat("a", readPasswordTestMax)
 
-	pw := strings.Repeat("a", max)
-
-	got, err := readPassword(strings.NewReader(pw+"\r\n"), max)
+	got, err := readPassword(strings.NewReader(pw+"\r\n"), readPasswordTestMax)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,11 +110,9 @@ func TestReadPasswordExactMaxCRLF(t *testing.T) {
 }
 
 func TestReadPasswordMaxPlusOne(t *testing.T) {
-	const max = 16
+	pw := strings.Repeat("a", readPasswordTestMax+1)
 
-	pw := strings.Repeat("a", max+1)
-
-	_, err := readPassword(strings.NewReader(pw), max)
+	_, err := readPassword(strings.NewReader(pw), readPasswordTestMax)
 	if err == nil || !strings.Contains(err.Error(), "maximum") {
 		t.Fatalf("err=%v", err)
 	}

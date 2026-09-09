@@ -24,10 +24,10 @@ import (
 	"github.com/emersion/go-msgauth/dkim"
 )
 
-func TestEndToEndLocalPath(t *testing.T) {
-	const password = "e2e-password-xyz"
+const endToEndPassword = "e2e-password-xyz"
 
-	srv, cfg, spool, signer, roots := testServerWithUser(t, password)
+func TestEndToEndLocalPath(t *testing.T) {
+	srv, cfg, spool, signer, roots := testServerWithUser(t, endToEndPassword)
 
 	cert, mxPool := mintOutboundCert(t, "mx.ex.com")
 
@@ -74,7 +74,7 @@ func TestEndToEndLocalPath(t *testing.T) {
 
 	cl := dialSTARTTLS(t, srv.starttls.Addr, roots)
 
-	cl.authPlain(t, "alice", password)
+	cl.authPlain(t, "alice", endToEndPassword)
 
 	cl.cmd(t, "MAIL FROM:<Alice.Sender@test.example>", 250)
 	cl.cmd(t, "RCPT TO:<Dest.User@ex.com>", 250)

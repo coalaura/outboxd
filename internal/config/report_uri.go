@@ -47,6 +47,7 @@ func validateReportURIList(value string, dmarc bool) error {
 
 func validateReportURI(uri string, dmarc bool) error {
 	base := strings.TrimSpace(uri)
+
 	if dmarc {
 		suffix := reportSizeRE.FindStringIndex(base)
 		if suffix != nil {

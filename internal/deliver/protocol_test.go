@@ -212,6 +212,7 @@ func (mx *fakeMX) handle(c net.Conn, log *sessionLog) {
 		switch {
 		case strings.HasPrefix(upper, "EHLO"):
 			code := mx.initialEHLOCode
+
 			if secured {
 				code = mx.postTLSEHLOCode
 			}
@@ -328,6 +329,7 @@ func (mx *fakeMX) handle(c net.Conn, log *sessionLog) {
 			})
 		case strings.HasPrefix(upper, "QUIT"):
 			write("221 bye\r\n")
+
 			return
 		default:
 			write("250 OK\r\n")
@@ -805,7 +807,9 @@ func TestTLSAbsentPlainAllowed(t *testing.T) {
 }
 
 func TestInitialEHLOFallbackToHELO(t *testing.T) {
-	for _, code := range []int{500, 502, 504} {
+	codes := []int{500, 502, 504}
+
+	for _, code := range codes {
 		t.Run(fmt.Sprint(code), func(t *testing.T) {
 			mx := &fakeMX{initialEHLOCode: code}
 

@@ -32,6 +32,28 @@ import (
 	"github.com/emersion/go-smtp"
 )
 
+const (
+	messageOfSizeHeaders        = "From: Alice.Sender@test.example\r\nTo: dest@example.com\r\nSubject: size test\r\n\r\n"
+	messageSizePassword         = "message-size-password"
+	uniqueRecipientPassword     = "unique-recipient-password"
+	protocolSizePassword        = "protocol-size-password"
+	smtpUTF8Password            = "test-password-xyz"
+	dataSemaphorePassword       = "data-semaphore-password"
+	bdatDeadlinePassword        = "bdat-deadline-password"
+	malformedRatePassword       = "malformed-rate-password"
+	failureRatePassword         = "failure-rate-password"
+	openPGPFailurePassword      = "openpgp-failure-password"
+	openPGPSizePassword         = "openpgp-size-password"
+	openPGPOrderPassword        = "openpgp-order-password"
+	recipientEncryptionPassword = "recipient-encryption-password"
+	bodyModePassword            = "body-mode-password"
+	originatorPassword          = "originator-password"
+	absoluteAuthPassword        = "absolute-auth-password"
+	clearsDeadlineUsername      = "ali\t\"ce"
+	dataContextPassword         = "data-context-password"
+	dataSignContextPassword     = "data-sign-context-password"
+)
+
 type submissionMessageSizeCase struct {
 	name string
 	size int64
@@ -327,6 +349,7 @@ func (c *smtpClient) cmdLines(t *testing.T, line string, want int) []string {
 		response = strings.TrimRight(response, "\r\n")
 
 		lines = append(lines, response)
+
 		if len(response) < 4 {
 			t.Fatalf("short reply %q", response)
 		}
@@ -334,6 +357,7 @@ func (c *smtpClient) cmdLines(t *testing.T, line string, want int) []string {
 		var code int
 
 		fmt.Sscanf(response[:3], "%d", &code)
+
 		if code != want {
 			t.Fatalf("want %d got %q", want, response)
 		}
@@ -397,6 +421,7 @@ func beginMessage(t *testing.T, cl *smtpClient, bodyOpt string) {
 	t.Helper()
 
 	mail := "MAIL FROM:<Alice.Sender@test.example>"
+
 	if bodyOpt != "" {
 		mail += " BODY=" + bodyOpt
 	}
@@ -411,14 +436,13 @@ func writeMessage(cl *smtpClient, body string) {
 }
 
 func messageOfSize(size int64) string {
-	const headers = "From: Alice.Sender@test.example\r\nTo: dest@example.com\r\nSubject: size test\r\n\r\n"
-
-	remaining := int(size) - len(headers) - 2
+	remaining := int(size) - len(messageOfSizeHeaders) - 2
 
 	var body strings.Builder
+
 	body.Grow(int(size))
 
-	body.WriteString(headers)
+	body.WriteString(messageOfSizeHeaders)
 
 	for remaining > 998 {
 		body.WriteString(strings.Repeat("x", 998))
@@ -434,21 +458,21 @@ func messageOfSize(size int64) string {
 }
 
 func TestSubmissionMessageSizeBoundary(t *testing.T) {
-	const password = "message-size-password"
-
-	srv, cfg, _, _, pool := testServerWithUser(t, password)
+	srv, cfg, _, _, pool := testServerWithUser(t, messageSizePassword)
 
 	runTestSubmission(t, srv)
 
-	for _, tt := range []submissionMessageSizeCase{
+	cases := []submissionMessageSizeCase{
 		{"exact maximum", cfg.Server.MaxMessageBytes, 250},
 		{"one over maximum", cfg.Server.MaxMessageBytes + 1, 552},
-	} {
+	}
+
+	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
 			defer cl.close()
 
-			cl.authPlain(t, "alice", password)
+			cl.authPlain(t, "alice", messageSizePassword)
 
 			beginMessage(t, cl, "")
 
@@ -460,9 +484,7 @@ func TestSubmissionMessageSizeBoundary(t *testing.T) {
 }
 
 func TestSubmissionRecipientLimitCountsUniqueRecipients(t *testing.T) {
-	const password = "unique-recipient-password"
-
-	srv, cfg, spool, _, pool := testServerWithUser(t, password)
+	srv, cfg, spool, _, pool := testServerWithUser(t, uniqueRecipientPassword)
 
 	cfg.Server.MaxRecipients = 2
 
@@ -471,7 +493,7 @@ func TestSubmissionRecipientLimitCountsUniqueRecipients(t *testing.T) {
 	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
 	defer cl.close()
 
-	cl.authPlain(t, "alice", password)
+	cl.authPlain(t, "alice", uniqueRecipientPassword)
 
 	cl.cmd(t, "MAIL FROM:<Alice.Sender@test.example>", 250)
 	cl.cmd(t, "RCPT TO:<a@example.com>", 250)
@@ -494,9 +516,7 @@ func TestSubmissionRecipientLimitCountsUniqueRecipients(t *testing.T) {
 }
 
 func TestSubmissionSizeProtocolBoundaries(t *testing.T) {
-	const password = "protocol-size-password"
-
-	srv, cfg, _, _, pool := testServerWithUser(t, password)
+	srv, cfg, _, _, pool := testServerWithUser(t, protocolSizePassword)
 
 	runTestSubmission(t, srv)
 
@@ -510,16 +530,18 @@ func TestSubmissionSizeProtocolBoundaries(t *testing.T) {
 		t.Fatalf("EHLO capabilities %q do not contain %q", lines, wantCapability)
 	}
 
-	cl.authPlain(t, "alice", password)
+	cl.authPlain(t, "alice", protocolSizePassword)
 
 	cl.cmd(t, fmt.Sprintf("MAIL FROM:<Alice.Sender@test.example> SIZE=%d", cfg.Server.MaxMessageBytes), 250)
 	cl.cmd(t, "RSET", 250)
 	cl.cmd(t, fmt.Sprintf("MAIL FROM:<Alice.Sender@test.example> SIZE=%d", cfg.Server.MaxMessageBytes+1), 552)
 
-	for _, tt := range []submissionMessageSizeCase{
+	cases := []submissionMessageSizeCase{
 		{"exact maximum", cfg.Server.MaxMessageBytes, 250},
 		{"one over maximum", cfg.Server.MaxMessageBytes + 1, 552},
-	} {
+	}
+
+	for _, tt := range cases {
 		t.Run("BDAT "+tt.name, func(t *testing.T) {
 			cl.cmd(t, "MAIL FROM:<Alice.Sender@test.example>", 250)
 			cl.cmd(t, "RCPT TO:<dest@example.com>", 250)
@@ -534,9 +556,7 @@ func TestSubmissionSizeProtocolBoundaries(t *testing.T) {
 }
 
 func TestSubmissionUnnecessarySMTPUTF8OptIn(t *testing.T) {
-	const password = "test-password-xyz"
-
-	srv, _, spool, _, pool := testServerWithUser(t, password)
+	srv, _, spool, _, pool := testServerWithUser(t, smtpUTF8Password)
 
 	entered := waitServeEntered(t, srv)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -561,7 +581,7 @@ func TestSubmissionUnnecessarySMTPUTF8OptIn(t *testing.T) {
 	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
 	defer cl.close()
 
-	cl.authPlain(t, "alice", password)
+	cl.authPlain(t, "alice", smtpUTF8Password)
 
 	// Opt in to SMTPUTF8 with fully ASCII envelope and body.
 	cl.cmd(t, "MAIL FROM:<Alice.Sender@test.example> SMTPUTF8", 250)
@@ -600,9 +620,7 @@ func TestSubmissionUnnecessarySMTPUTF8OptIn(t *testing.T) {
 }
 
 func TestDataProcessingSemaphoreNonblockingAndReleased(t *testing.T) {
-	const password = "data-semaphore-password"
-
-	srv, _, _, _, pool := testServerWithUser(t, password)
+	srv, _, _, _, pool := testServerWithUser(t, dataSemaphorePassword)
 
 	srv.dataWork = make(chan struct{}, 1)
 
@@ -611,7 +629,7 @@ func TestDataProcessingSemaphoreNonblockingAndReleased(t *testing.T) {
 	first := dialSTARTTLS(t, srv.starttls.Addr, pool)
 	defer first.close()
 
-	first.authPlain(t, "alice", password)
+	first.authPlain(t, "alice", dataSemaphorePassword)
 
 	beginMessage(t, first, "")
 
@@ -630,7 +648,7 @@ func TestDataProcessingSemaphoreNonblockingAndReleased(t *testing.T) {
 	second := dialSTARTTLS(t, srv.starttls.Addr, pool)
 	defer second.close()
 
-	second.authPlain(t, "alice", password)
+	second.authPlain(t, "alice", dataSemaphorePassword)
 
 	beginMessage(t, second, "")
 
@@ -647,7 +665,7 @@ func TestDataProcessingSemaphoreNonblockingAndReleased(t *testing.T) {
 	third := dialSTARTTLS(t, srv.starttls.Addr, pool)
 	defer third.close()
 
-	third.authPlain(t, "alice", password)
+	third.authPlain(t, "alice", dataSemaphorePassword)
 
 	beginMessage(t, third, "")
 	writeMessage(third, "accepted after release")
@@ -656,9 +674,7 @@ func TestDataProcessingSemaphoreNonblockingAndReleased(t *testing.T) {
 }
 
 func TestIncompleteBDATAbsoluteDeadlineReleasesWorker(t *testing.T) {
-	const password = "bdat-deadline-password"
-
-	srv, cfg, _, _, pool := testServerWithUser(t, password)
+	srv, cfg, _, _, pool := testServerWithUser(t, bdatDeadlinePassword)
 
 	cfg.Server.ReadTimeout = "1s"
 
@@ -668,7 +684,7 @@ func TestIncompleteBDATAbsoluteDeadlineReleasesWorker(t *testing.T) {
 
 	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
 
-	cl.authPlain(t, "alice", password)
+	cl.authPlain(t, "alice", bdatDeadlinePassword)
 
 	cl.cmd(t, "MAIL FROM:<Alice.Sender@test.example>", 250)
 	cl.cmd(t, "RCPT TO:<dest@example.com>", 250)
@@ -711,7 +727,7 @@ func TestIncompleteBDATAbsoluteDeadlineReleasesWorker(t *testing.T) {
 	next := dialSTARTTLS(t, srv.starttls.Addr, pool)
 	defer next.close()
 
-	next.authPlain(t, "alice", password)
+	next.authPlain(t, "alice", bdatDeadlinePassword)
 
 	beginMessage(t, next, "")
 	writeMessage(next, "ordinary DATA after BDAT cleanup")
@@ -720,9 +736,7 @@ func TestIncompleteBDATAbsoluteDeadlineReleasesWorker(t *testing.T) {
 }
 
 func TestMalformedDataConsumesSubmissionBudget(t *testing.T) {
-	const password = "malformed-rate-password"
-
-	srv, _, _, _, pool := testServerWithUser(t, password)
+	srv, _, _, _, pool := testServerWithUser(t, malformedRatePassword)
 
 	srv.rates = newSubmissionLimiter(2, 2, 2, 2)
 
@@ -731,7 +745,7 @@ func TestMalformedDataConsumesSubmissionBudget(t *testing.T) {
 	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
 	defer cl.close()
 
-	cl.authPlain(t, "alice", password)
+	cl.authPlain(t, "alice", malformedRatePassword)
 
 	cl.cmd(t, "MAIL FROM:<unauthorized@test.example>", 550)
 
@@ -749,16 +763,14 @@ func TestMalformedDataConsumesSubmissionBudget(t *testing.T) {
 }
 
 func TestSigningAndQueueFailuresConsumeSubmissionBudget(t *testing.T) {
-	const password = "failure-rate-password"
-
-	srv, _, _, validSigner, pool := testServerWithUser(t, password)
+	srv, _, _, validSigner, pool := testServerWithUser(t, failureRatePassword)
 
 	runTestSubmission(t, srv)
 
 	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
 	defer cl.close()
 
-	cl.authPlain(t, "alice", password)
+	cl.authPlain(t, "alice", failureRatePassword)
 
 	srv.rates = newSubmissionLimiter(1, 1, 1, 1)
 	srv.signer = new(sign.Signer)
@@ -791,7 +803,7 @@ func TestSigningAndQueueFailuresConsumeSubmissionBudget(t *testing.T) {
 	queueClient := dialSTARTTLS(t, srv.starttls.Addr, pool)
 	defer queueClient.close()
 
-	queueClient.authPlain(t, "alice", password)
+	queueClient.authPlain(t, "alice", failureRatePassword)
 
 	beginMessage(t, queueClient, "")
 	writeMessage(queueClient, "queue failure")
@@ -806,9 +818,7 @@ func TestSigningAndQueueFailuresConsumeSubmissionBudget(t *testing.T) {
 }
 
 func TestOpenPGPFailureSkipsDKIMAndQueue(t *testing.T) {
-	const password = "openpgp-failure-password"
-
-	srv, _, spool, _, pool := testServerWithUser(t, password)
+	srv, _, spool, _, pool := testServerWithUser(t, openPGPFailurePassword)
 
 	var (
 		transformed atomic.Int32
@@ -839,7 +849,7 @@ func TestOpenPGPFailureSkipsDKIMAndQueue(t *testing.T) {
 	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
 	defer cl.close()
 
-	cl.authPlain(t, "alice", password)
+	cl.authPlain(t, "alice", openPGPFailurePassword)
 
 	beginMessage(t, cl, "")
 	writeMessage(cl, "must not be accepted unsigned")
@@ -852,9 +862,7 @@ func TestOpenPGPFailureSkipsDKIMAndQueue(t *testing.T) {
 }
 
 func TestOpenPGPExpansionFailureReturnsMessageTooLarge(t *testing.T) {
-	const password = "openpgp-size-password"
-
-	srv, _, spool, _, pool := testServerWithUser(t, password)
+	srv, _, spool, _, pool := testServerWithUser(t, openPGPSizePassword)
 
 	var (
 		dkim  atomic.Int32
@@ -882,7 +890,7 @@ func TestOpenPGPExpansionFailureReturnsMessageTooLarge(t *testing.T) {
 	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
 	defer cl.close()
 
-	cl.authPlain(t, "alice", password)
+	cl.authPlain(t, "alice", openPGPSizePassword)
 
 	beginMessage(t, cl, "")
 	writeMessage(cl, "must not be accepted oversized")
@@ -895,9 +903,7 @@ func TestOpenPGPExpansionFailureReturnsMessageTooLarge(t *testing.T) {
 }
 
 func TestOpenPGPTransformRunsBeforeDKIM(t *testing.T) {
-	const password = "openpgp-order-password"
-
-	srv, _, spool, _, pool := testServerWithUser(t, password)
+	srv, _, spool, _, pool := testServerWithUser(t, openPGPOrderPassword)
 
 	transformed := []byte("From: alice@example.com\r\n\r\ntransformed\r\n")
 
@@ -918,7 +924,7 @@ func TestOpenPGPTransformRunsBeforeDKIM(t *testing.T) {
 	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
 	defer cl.close()
 
-	cl.authPlain(t, "alice", password)
+	cl.authPlain(t, "alice", openPGPOrderPassword)
 
 	beginMessage(t, cl, "")
 	writeMessage(cl, "original")
@@ -936,9 +942,7 @@ func TestOpenPGPTransformRunsBeforeDKIM(t *testing.T) {
 }
 
 func TestRecipientEncryptionQueuesAtomicVariants(t *testing.T) {
-	const password = "recipient-encryption-password"
-
-	srv, cfg, spool, _, pool := testServerWithUser(t, password)
+	srv, cfg, spool, _, pool := testServerWithUser(t, recipientEncryptionPassword)
 
 	directory := cfg.ResolvePath("openpgp/recipients")
 
@@ -988,7 +992,7 @@ func TestRecipientEncryptionQueuesAtomicVariants(t *testing.T) {
 	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
 	defer cl.close()
 
-	cl.authPlain(t, "alice", password)
+	cl.authPlain(t, "alice", recipientEncryptionPassword)
 
 	cl.cmd(t, "MAIL FROM:<Alice.Sender@test.example> BODY=8BITMIME", 250)
 	cl.cmd(t, "RCPT TO:<bob@example.com>", 250)
@@ -1067,16 +1071,14 @@ func TestRecipientEncryptionQueuesAtomicVariants(t *testing.T) {
 }
 
 func TestBody7BitAndReset(t *testing.T) {
-	const password = "body-mode-password"
-
-	srv, _, _, _, pool := testServerWithUser(t, password)
+	srv, _, _, _, pool := testServerWithUser(t, bodyModePassword)
 
 	runTestSubmission(t, srv)
 
 	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
 	defer cl.close()
 
-	cl.authPlain(t, "alice", password)
+	cl.authPlain(t, "alice", bodyModePassword)
 
 	beginMessage(t, cl, "")
 	writeMessage(cl, "caf\xc3\xa9")
@@ -1107,28 +1109,28 @@ func TestBody7BitAndReset(t *testing.T) {
 }
 
 func TestOriginatorAuthorization(t *testing.T) {
-	const password = "originator-password"
-
-	srv, _, _, _, pool := testServerWithUser(t, password)
+	srv, _, _, _, pool := testServerWithUser(t, originatorPassword)
 
 	runTestSubmission(t, srv)
 
 	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
 	defer cl.close()
 
-	cl.authPlain(t, "alice", password)
+	cl.authPlain(t, "alice", originatorPassword)
 
 	cl.cmd(t, "MAIL FROM:<alice.sender@test.example>", 550)
 	cl.cmd(t, "MAIL FROM:<Alice.Sender@TEST.EXAMPLE>", 250)
 	cl.cmd(t, "RSET", 250)
 
-	for _, tt := range []originatorHeaderCase{
+	cases := []originatorHeaderCase{
 		{"case-mismatched From", "From: alice.sender@test.example\r\n"},
 		{"unauthorized Sender", "Sender: attacker@test.example\r\n"},
 		{"case-mismatched Sender", "Sender: ALICE@test.example\r\n"},
 		{"unsupported Resent-From", "Resent-From: Alice.Sender@test.example\r\n"},
 		{"unsupported Resent-Sender", "Resent-Sender: Alice.Sender@test.example\r\n"},
-	} {
+	}
+
+	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			beginMessage(t, cl, "")
 
@@ -1152,10 +1154,8 @@ func TestOriginatorAuthorization(t *testing.T) {
 }
 
 func TestPreAuthAbsoluteLifetimeAndAuthClearsDeadline(t *testing.T) {
-	const password = "absolute-auth-password"
-
 	t.Run("NOOP cannot extend", func(t *testing.T) {
-		srv, cfg, _, _, _ := testServerWithUser(t, password)
+		srv, cfg, _, _, _ := testServerWithUser(t, absoluteAuthPassword)
 
 		cfg.Server.ReadTimeout = "150ms"
 
@@ -1197,11 +1197,9 @@ func TestPreAuthAbsoluteLifetimeAndAuthClearsDeadline(t *testing.T) {
 	})
 
 	t.Run("successful auth clears", func(t *testing.T) {
-		srv, cfg, _, _, pool := testServerWithUser(t, password)
+		srv, cfg, _, _, pool := testServerWithUser(t, absoluteAuthPassword)
 
 		cfg.Server.ReadTimeout = "1s"
-
-		const username = "ali\t\"ce"
 
 		alice, ok := cfg.User("alice")
 		if !ok {
@@ -1209,7 +1207,7 @@ func TestPreAuthAbsoluteLifetimeAndAuthClearsDeadline(t *testing.T) {
 		}
 
 		err := cfg.AddUser(config.User{
-			Username:       username,
+			Username:       clearsDeadlineUsername,
 			PasswordHash:   alice.PasswordHash,
 			AllowedSenders: []string{"alice@test.example"},
 			Enabled:        true,
@@ -1229,7 +1227,7 @@ func TestPreAuthAbsoluteLifetimeAndAuthClearsDeadline(t *testing.T) {
 		cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
 		defer cl.close()
 
-		cl.authPlain(t, username, password)
+		cl.authPlain(t, clearsDeadlineUsername, absoluteAuthPassword)
 
 		time.Sleep(1100 * time.Millisecond)
 
@@ -1242,14 +1240,14 @@ func TestPreAuthAbsoluteLifetimeAndAuthClearsDeadline(t *testing.T) {
 }
 
 func TestDataDeadlineQueueAddOutcomes(t *testing.T) {
-	for _, tt := range []dataDeadlineQueueAddCase{
+	cases := []dataDeadlineQueueAddCase{
 		{"durably accepted before deadline return", nil, true},
 		{"precommit error after deadline", errors.New("injected queue failure"), false},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			const password = "data-context-password"
+	}
 
-			srv, cfg, spool, _, pool := testServerWithUser(t, password)
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, cfg, spool, _, pool := testServerWithUser(t, dataContextPassword)
 
 			cfg.Server.ReadTimeout = "5s"
 
@@ -1291,7 +1289,7 @@ func TestDataDeadlineQueueAddOutcomes(t *testing.T) {
 
 			cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
 
-			cl.authPlain(t, "alice", password)
+			cl.authPlain(t, "alice", dataContextPassword)
 
 			beginMessage(t, cl, "")
 			writeMessage(cl, "queue operation outlives DATA deadline")
@@ -1318,7 +1316,14 @@ func TestDataDeadlineQueueAddOutcomes(t *testing.T) {
 				t.Fatalf("queue seam calls=%d want 1", called.Load())
 			}
 
-			if got := spool.Len(); got != map[bool]int{true: 1, false: 0}[tt.accepted] {
+			want := 0
+
+			if tt.accepted {
+				want = 1
+			}
+
+			got := spool.Len()
+			if got != want {
 				t.Fatalf("queue length=%d accepted=%v", got, tt.accepted)
 			}
 
@@ -1331,15 +1336,16 @@ func TestDataDeadlineQueueAddOutcomes(t *testing.T) {
 }
 
 func TestDataDeadlineDuringSigningPreventsQueueAdd(t *testing.T) {
-	const password = "data-sign-context-password"
-
-	srv, cfg, spool, _, pool := testServerWithUser(t, password)
+	srv, cfg, spool, _, pool := testServerWithUser(t, dataSignContextPassword)
 
 	cfg.Server.ReadTimeout = "100ms"
 
 	srv.dataWork = make(chan struct{}, 1)
 
-	var signed, added atomic.Int32
+	var (
+		signed atomic.Int32
+		added  atomic.Int32
+	)
 
 	srv.signMessage = func(ctx context.Context, data []byte) (string, error) {
 		signed.Add(1)
@@ -1358,7 +1364,7 @@ func TestDataDeadlineDuringSigningPreventsQueueAdd(t *testing.T) {
 
 	cl := dialSTARTTLS(t, srv.starttls.Addr, pool)
 
-	cl.authPlain(t, "alice", password)
+	cl.authPlain(t, "alice", dataSignContextPassword)
 
 	beginMessage(t, cl, "")
 	writeMessage(cl, "signing waits for cancellation")

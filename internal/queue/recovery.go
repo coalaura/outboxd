@@ -132,6 +132,7 @@ func (q *Queue) recoverDSN() error {
 
 	for _, entry := range entries {
 		path := filepath.Join(q.dsn, entry.Name())
+
 		if !entry.IsDir() {
 			err = q.quarantineFile(path, entry.Name()+"-dsn-stray")
 			if err != nil {
@@ -199,6 +200,7 @@ func (q *Queue) recoverDSN() error {
 
 			continue
 		}
+
 		if source.Incarnation != dsn.DSNSourceIncarnation || source.Revision != dsn.DSNSourceRevision || source.DSNID != dsn.ID || source.DSNGeneration != dsn.DSNGeneration {
 			cause := corruptionf("source reciprocal DSN identity is invalid")
 
@@ -378,6 +380,7 @@ func (q *Queue) loadReady() error {
 			err = q.quarantineFile(filepath.Join(q.ready, e.Name()), e.Name()+"-stray")
 			if err != nil {
 				q.recordQuarantineFailure(e.Name(), filepath.Join(q.ready, e.Name()), corruptionf("stray file in ready"), err)
+
 				continue
 			}
 

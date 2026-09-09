@@ -54,6 +54,7 @@ func allowDataTerminator(r io.Reader, maxBytes int64) error {
 	}
 
 	reader := reflect.ValueOf(r).Elem()
+
 	limited := reader.FieldByName("limited")
 	value := reader.FieldByName("n")
 

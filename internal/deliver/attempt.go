@@ -142,6 +142,7 @@ func (d *Deliverer) attemptAdmitted(ctx context.Context, envelope *queue.Envelop
 		domain := key.domain
 
 		indexes := groups[key]
+
 		if ctx.Err() != nil {
 			break
 		}

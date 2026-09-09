@@ -36,6 +36,7 @@ func checkEnvelopeMX(ctx context.Context, r Resolver, cfg *config.Config) []Resu
 
 			if null > 0 {
 				message := fmt.Sprintf("%s publishes a null MX and does not accept bounces", d)
+
 				if len(mxs) > 1 || null > 1 {
 					message = fmt.Sprintf("%s publishes an invalid null MX mixed with other MX records", d)
 				}
@@ -91,6 +92,7 @@ func checkEnvelopeMX(ctx context.Context, r Resolver, cfg *config.Config) []Resu
 		}
 
 		msg := fmt.Sprintf("%s has no MX and no A/AAAA (bounces cannot be delivered)", d)
+
 		if err != nil {
 			msg = fmt.Sprintf("%s MX lookup failed (%v) and no A/AAAA", d, err)
 		}

@@ -66,6 +66,7 @@ func (q *Queue) QuarantineCheckedOut(envelope *Envelope, cause error) error {
 
 		return err
 	}
+
 	if current.Incarnation != envelope.Incarnation || current.Revision != envelope.Revision || current.Size != envelope.Size || current.BodyDigest != envelope.BodyDigest {
 		err := fmt.Errorf("%w: checked-out queue identity changed", ErrIDConflict)
 
@@ -94,6 +95,7 @@ func (q *Queue) QuarantineCheckedOut(envelope *Envelope, cause error) error {
 	q.noteRemoved(envelope.ID)
 
 	q.mu.Lock()
+
 	if moveErr != nil {
 		q.blocked[envelope.ID] = struct{}{}
 
@@ -101,6 +103,7 @@ func (q *Queue) QuarantineCheckedOut(envelope *Envelope, cause error) error {
 	} else {
 		q.Corrupt = append(q.Corrupt, fmt.Errorf("ready %s: %w", envelope.ID, cause))
 	}
+
 	q.mu.Unlock()
 
 	return moveErr
@@ -110,7 +113,8 @@ func (q *Queue) blockCheckedOut(id string, cause, relocation error) {
 	q.mu.Lock()
 	q.blocked[id] = struct{}{}
 
-	if queued := q.scheduled[id]; queued != nil {
+	queued := q.scheduled[id]
+	if queued != nil {
 		q.pending.Remove(queued)
 
 		delete(q.scheduled, id)

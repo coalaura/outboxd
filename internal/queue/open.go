@@ -37,6 +37,7 @@ func (q *Queue) CloseContext(ctx context.Context) error {
 	}
 
 	q.mu.Lock()
+
 	if !q.closing {
 		q.closing = true
 
@@ -181,16 +182,20 @@ func OpenWithOptions(directory string, limits Limits, options OpenOptions) (*Que
 		return nil, err
 	}
 
-	for _, d := range []string{q.ready, q.dead, q.tmp, q.dsn, q.corr, q.trash} {
+	directories := []string{q.ready, q.dead, q.tmp, q.dsn, q.corr, q.trash}
+
+	for _, d := range directories {
 		err = disk.MkdirDurable(d)
 		if err != nil {
 			_ = q.Close()
+
 			return nil, err
 		}
 
 		err = disk.ValidatePath(d)
 		if err != nil {
 			_ = q.Close()
+
 			return nil, err
 		}
 
@@ -289,7 +294,9 @@ func OpenReadOnly(directory string) (*Queue, error) {
 
 	var handles [2]*os.File
 
-	for i, namespace := range []string{ready, dead} {
+	namespaces := []string{ready, dead}
+
+	for i, namespace := range namespaces {
 		handles[i], err = disk.OpenDirectoryAt(rootDir, filepath.Base(namespace))
 		if err != nil {
 			_, statErr := os.Lstat(namespace)

@@ -58,7 +58,8 @@ type contextWriter struct {
 }
 
 func (b *limitedBuffer) Write(data []byte) (int, error) {
-	if err := b.ctx.Err(); err != nil {
+	err := b.ctx.Err()
+	if err != nil {
 		return 0, err
 	}
 
@@ -118,7 +119,8 @@ func loadIdentity(cfg *config.Config, configured config.OpenPGPIdentity) (*ident
 		}
 	}
 
-	if _, ok := entity.SigningKey(time.Now()); !ok {
+	_, ok = entity.SigningKey(time.Now())
+	if !ok {
 		return nil, errors.New("no currently valid signing key")
 	}
 
@@ -267,7 +269,8 @@ func (s *Signers) Sign(ctx context.Context, sender string, data []byte) ([]byte,
 		return data, false, nil
 	}
 
-	if err := ctx.Err(); err != nil {
+	err := ctx.Err()
+	if err != nil {
 		return nil, false, err
 	}
 
@@ -300,7 +303,9 @@ func (s *Signers) Sign(ctx context.Context, sender string, data []byte) ([]byte,
 
 		return nil, false, fmt.Errorf("create detached signature: %w", err)
 	}
-	if err := ctx.Err(); err != nil {
+
+	err = ctx.Err()
+	if err != nil {
 		return nil, false, err
 	}
 
@@ -319,7 +324,8 @@ func (s *Signers) Sign(ctx context.Context, sender string, data []byte) ([]byte,
 		return nil, false, fmt.Errorf("%w: maximum is %d bytes", ErrMessageTooLarge, s.maximum)
 	}
 
-	if err := ctx.Err(); err != nil {
+	err = ctx.Err()
+	if err != nil {
 		return nil, false, err
 	}
 
@@ -343,6 +349,7 @@ func randomBoundary() (string, error) {
 
 func buildSignedMessage(outer, entity, signature []byte, boundary string) []byte {
 	var result bytes.Buffer
+
 	result.Grow(len(outer) + len(entity) + len(signature) + 512)
 
 	result.Write(outer)
@@ -378,13 +385,16 @@ func splitMessage(data []byte, replaceAutocrypt bool) ([]byte, []byte, error) {
 		return nil, nil, err
 	}
 
-	var outer, entity bytes.Buffer
+	var (
+		outer  bytes.Buffer
+		entity bytes.Buffer
+	)
 
 	for _, field := range fields {
 		name := fieldName(field)
 		if strings.HasPrefix(name, "content-") {
 			entity.Write(field)
-		} else if name != "mime-version" && !(replaceAutocrypt && name == "autocrypt") {
+		} else if name != "mime-version" && (!replaceAutocrypt || name != "autocrypt") {
 			outer.Write(field)
 		}
 	}
@@ -400,7 +410,8 @@ func canonicalizeEntity(data []byte, maximum int64) ([]byte, error) {
 }
 
 func canonicalizeEntityContext(ctx context.Context, data []byte, maximum int64, depth int) ([]byte, error) {
-	if err := ctx.Err(); err != nil {
+	err := ctx.Err()
+	if err != nil {
 		return nil, err
 	}
 
@@ -562,7 +573,8 @@ func canonicalizeMultipart(ctx context.Context, body []byte, boundary string, ma
 	partStart := -1
 
 	for offset := 0; offset < len(body); {
-		if err := ctx.Err(); err != nil {
+		err := ctx.Err()
+		if err != nil {
 			return nil, err
 		}
 
@@ -712,16 +724,17 @@ func headerFields(head []byte) ([][]byte, error) {
 }
 
 func fieldName(field []byte) string {
-	colon := bytes.IndexByte(field, ':')
-	if colon < 0 {
+	name, _, ok := bytes.Cut(field, []byte(":"))
+	if !ok {
 		return ""
 	}
 
-	return strings.ToLower(string(field[:colon]))
+	return strings.ToLower(string(name))
 }
 
 func (r contextReader) Read(data []byte) (int, error) {
-	if err := r.ctx.Err(); err != nil {
+	err := r.ctx.Err()
+	if err != nil {
 		return 0, err
 	}
 
@@ -729,7 +742,8 @@ func (r contextReader) Read(data []byte) (int, error) {
 }
 
 func (w contextWriter) Write(data []byte) (int, error) {
-	if err := w.ctx.Err(); err != nil {
+	err := w.ctx.Err()
+	if err != nil {
 		return 0, err
 	}
 

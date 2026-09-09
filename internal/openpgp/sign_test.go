@@ -182,12 +182,12 @@ func TestSignAddsAutocryptOutsideSignedMIMEEntity(t *testing.T) {
 		t.Fatalf("Sign() = signed %v, err %v", ok, err)
 	}
 
-	headerEnd := bytes.Index(signed, []byte("\r\n\r\n"))
-	if headerEnd < 0 || bytes.Count(signed[:headerEnd], []byte("Autocrypt:")) != 1 {
+	headers, rest, ok := bytes.Cut(signed, []byte("\r\n\r\n"))
+	if !ok || bytes.Count(headers, []byte("Autocrypt:")) != 1 {
 		t.Fatalf("outer headers do not contain exactly one Autocrypt field:\n%s", signed)
 	}
 
-	if bytes.Contains(signed[headerEnd+4:], []byte("Autocrypt:")) {
+	if bytes.Contains(rest, []byte("Autocrypt:")) {
 		t.Fatal("Autocrypt field was included in the signed MIME entity")
 	}
 
@@ -305,7 +305,9 @@ func TestCanonicalizeContentTransferEncodingMatrix(t *testing.T) {
 		}
 
 		canonicalHead := canonical[:bytes.Index(canonical, []byte("\r\n\r\n"))+2]
-		if got := headerValue(canonicalHead, "content-transfer-encoding"); got != expected {
+
+		got := headerValue(canonicalHead, "content-transfer-encoding")
+		if got != expected {
 			t.Errorf("leaf encoding %q canonicalized to %q, want %q", encoding, got, expected)
 		}
 	}
@@ -327,7 +329,9 @@ func TestCanonicalizeContentTransferEncodingMatrix(t *testing.T) {
 		}
 
 		canonicalHead := canonical[:bytes.Index(canonical, []byte("\r\n\r\n"))+2]
-		if got := headerValue(canonicalHead, "content-transfer-encoding"); got != expected {
+
+		got := headerValue(canonicalHead, "content-transfer-encoding")
+		if got != expected {
 			t.Errorf("multipart encoding %q canonicalized to %q, want %q", encoding, got, expected)
 		}
 	}
@@ -369,7 +373,8 @@ func TestSignCancellationWhileWaitingForSigner(t *testing.T) {
 		t.Fatalf("Sign() error = %v", err)
 	}
 
-	if elapsed := time.Since(started); elapsed > time.Second {
+	elapsed := time.Since(started)
+	if elapsed > time.Second {
 		t.Fatalf("Sign() cancellation took %v", elapsed)
 	}
 }

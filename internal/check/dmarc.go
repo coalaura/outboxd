@@ -132,7 +132,8 @@ func parseDMARCTags(record string) (map[string]string, error) {
 		}
 
 		key, value, ok := strings.Cut(part, "=")
-		key, value = strings.ToLower(strings.TrimSpace(key)), strings.TrimSpace(value)
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.TrimSpace(value)
 
 		if !ok || key == "" || value == "" || !asciiLetters(key) {
 			return nil, fmt.Errorf("malformed tag %q", part)

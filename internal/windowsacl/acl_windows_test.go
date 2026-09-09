@@ -51,7 +51,9 @@ func TestApprovedOwnerRejectsForeignPrincipal(t *testing.T) {
 		t.Fatal("foreign owner accepted")
 	}
 
-	for _, owner := range []*windows.SID{user, system, administrators} {
+	owners := []*windows.SID{user, system, administrators}
+
+	for _, owner := range owners {
 		if !approvedOwner(owner, user, system, administrators) {
 			t.Fatalf("approved owner %s rejected", owner.String())
 		}

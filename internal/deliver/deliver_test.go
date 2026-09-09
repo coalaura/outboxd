@@ -184,7 +184,9 @@ func TestStoragePressureIsNonfatalAndBackedOff(t *testing.T) {
 
 	addMsg(t, q, "storage-pressure", "missing.invalid", "user@missing.invalid")
 
-	q.FreeDisk = func(string) (int64, error) { return 0, nil }
+	q.FreeDisk = func(string) (int64, error) {
+		return 0, nil
+	}
 
 	logger := new(recordingLog)
 
@@ -428,6 +430,7 @@ func TestDeliveryOpportunisticTLS(t *testing.T) {
 	defer cancel()
 
 	done := make(chan error, 1)
+
 	go func() {
 		done <- d.Run(ctx)
 	}()
@@ -643,6 +646,7 @@ func TestFairnessBlockedDomain(t *testing.T) {
 			"mx.fast.com":    {fastIP},
 		},
 	})
+
 	d.SetDialer(dialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
 		host, _, _ := net.SplitHostPort(address)
 
@@ -674,6 +678,7 @@ func TestFairnessBlockedDomain(t *testing.T) {
 	defer cancel()
 
 	done := make(chan error, 1)
+
 	go func() {
 		done <- d.Run(ctx)
 	}()
@@ -765,7 +770,9 @@ func TestRunDSNAtFullQueueNotFatal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = q.Close() })
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
 
 	cfg := testConfig()
 
@@ -823,6 +830,7 @@ func TestRunDSNAtFullQueueNotFatal(t *testing.T) {
 
 	deadline := time.After(3 * time.Second)
 
+loop:
 	for {
 		select {
 		case err := <-done:
@@ -841,14 +849,13 @@ func TestRunDSNAtFullQueueNotFatal(t *testing.T) {
 			_, dsnErr := os.Stat(filepath.Join(root, "ready", queue.DSNID("full1", env.Incarnation, 0)))
 
 			if deadErr == nil && dsnErr == nil {
-				goto buried // goto bad :(
+				break loop
 			}
 
 			runtime.Gosched()
 		}
 	}
 
-buried:
 	cancel()
 
 	select {

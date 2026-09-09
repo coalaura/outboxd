@@ -83,7 +83,7 @@ func TestValidatePrefixedArgon2idBounds(t *testing.T) {
 	salt := encoding.EncodeToString(make([]byte, saltLength))
 	key := encoding.EncodeToString(make([]byte, keyLength))
 
-	for _, params := range []string{
+	invalidParams := []string{
 		"m=0,t=1,p=1",
 		"m=8,t=1,p=1",
 		"m=19455,t=2,p=1",
@@ -93,7 +93,9 @@ func TestValidatePrefixedArgon2idBounds(t *testing.T) {
 		"m=19456,t=2,p=2",
 		"m=19456,t=2,p=1,x=1",
 		"t=2,m=19456,p=1",
-	} {
+	}
+
+	for _, params := range invalidParams {
 		hash := fmt.Sprintf("{ARGON2ID}$argon2id$v=%d$%s$%s$%s", argon2.Version, params, salt, key)
 
 		err := ValidatePHC(hash)
@@ -118,14 +120,16 @@ func TestValidatePrefixedArgon2idBounds(t *testing.T) {
 func TestValidatePrefixedArgon2idRequiresStrongSizes(t *testing.T) {
 	params := fmt.Sprintf("m=%d,t=%d,p=%d", hashMemory, hashTime, hashThreads)
 
-	for _, tc := range []phcCanonicalSizeCase{
+	cases := []phcCanonicalSizeCase{
 		{make([]byte, 1), make([]byte, keyLength)},
 		{make([]byte, saltLength), make([]byte, 1)},
 		{make([]byte, saltLength-1), make([]byte, keyLength)},
 		{make([]byte, saltLength), make([]byte, keyLength-1)},
 		{make([]byte, saltLength+1), make([]byte, keyLength)},
 		{make([]byte, saltLength), make([]byte, keyLength+1)},
-	} {
+	}
+
+	for _, tc := range cases {
 		hash := fmt.Sprintf("{ARGON2ID}$argon2id$v=%d$%s$%s$%s", argon2.Version, params, encoding.EncodeToString(tc.salt), encoding.EncodeToString(tc.key))
 
 		err := ValidatePHC(hash)
@@ -146,12 +150,14 @@ func TestValidatePHCBounds(t *testing.T) {
 		t.Fatalf("canonical parameters rejected: %v", err)
 	}
 
-	for _, params := range []string{
+	invalidParams := []string{
 		"m=19457,t=2,p=1",
 		"m=19456,t=3,p=1",
 		"m=19456,t=2,p=2",
 		"t=2,m=19456,p=1",
-	} {
+	}
+
+	for _, params := range invalidParams {
 		h := fmt.Sprintf("$argon2id$v=%d$%s$%s$%s", argon2.Version, params, salt, key)
 
 		err := ValidatePHC(h)
@@ -303,12 +309,14 @@ func TestValidatePHCRequiresCanonicalSizes(t *testing.T) {
 
 	params := fmt.Sprintf("m=%d,t=%d,p=%d", hashMemory, hashTime, hashThreads)
 
-	for _, tc := range []phcCanonicalSizeCase{
+	cases := []phcCanonicalSizeCase{
 		{make([]byte, saltLength-1), make([]byte, keyLength)},
 		{make([]byte, saltLength+1), make([]byte, keyLength)},
 		{make([]byte, saltLength), make([]byte, keyLength-1)},
 		{make([]byte, saltLength), make([]byte, keyLength+1)},
-	} {
+	}
+
+	for _, tc := range cases {
 		h := fmt.Sprintf("$argon2id$v=%d$%s$%s$%s", argon2.Version, params, encoding.EncodeToString(tc.salt), encoding.EncodeToString(tc.key))
 
 		err := ValidatePHC(h)

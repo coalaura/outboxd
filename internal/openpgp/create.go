@@ -123,6 +123,7 @@ func Create(configPath, username, sender string) (*CreatedKey, error) {
 
 	rollback := func(paths ...string) error {
 		result := rollbackGenerated(paths...)
+
 		if senderDirectoryCreated {
 			directoryErr := removeDurable(senderDirectory)
 			if directoryErr != nil {
@@ -136,6 +137,7 @@ func Create(configPath, username, sender string) (*CreatedKey, error) {
 	err = disk.WriteExclusive(keyPath, generated.armoredKey, 0600)
 	if err != nil {
 		writeErr := fmt.Errorf("write OpenPGP private key: %w", err)
+
 		if errors.Is(err, os.ErrExist) {
 			return nil, writeErr
 		}
@@ -154,6 +156,7 @@ func Create(configPath, username, sender string) (*CreatedKey, error) {
 
 	if err != nil {
 		writeErr := fmt.Errorf("write OpenPGP passphrase file: %w", err)
+
 		if errors.Is(err, os.ErrExist) {
 			return nil, errors.Join(writeErr, rollback(keyPath))
 		}

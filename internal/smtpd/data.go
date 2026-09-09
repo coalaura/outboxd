@@ -75,6 +75,7 @@ func (s *session) Data(r io.Reader) error {
 	}
 
 	body := io.Reader(r)
+
 	if maxBytes > 0 {
 		body = io.LimitReader(r, incrementLimit(maxBytes))
 	}
@@ -145,7 +146,8 @@ func (s *session) Data(r io.Reader) error {
 		}
 	}
 
-	if err := ctx.Err(); err != nil {
+	err = ctx.Err()
+	if err != nil {
 		s.waitDataDeadlineClose()
 
 		return errTemporaryFailure
@@ -231,7 +233,8 @@ func (s *session) Data(r io.Reader) error {
 		envelope.Bodies = bodies
 	}
 
-	if err := ctx.Err(); err != nil {
+	err = ctx.Err()
+	if err != nil {
 		s.waitDataDeadlineClose()
 
 		return errTemporaryFailure
@@ -274,6 +277,7 @@ func (s *Server) prepareVariants(ctx context.Context, message []byte, recipients
 		}
 
 		variantKey := "plaintext"
+
 		if encrypted {
 			variantKey = "key:" + keyID
 		}
@@ -292,6 +296,7 @@ func (s *Server) prepareVariants(ctx context.Context, message []byte, recipients
 			if err != nil {
 				return nil, nil, nil, err
 			}
+
 			if !encrypted {
 				return nil, nil, nil, errors.New("recipient encryption key disappeared")
 			}
@@ -352,6 +357,7 @@ func (s *session) clearDataDeadline() {
 	}
 
 	expired := ctx.Err() != nil
+
 	if !stop() {
 		<-done
 	} else if expired || ctx.Err() != nil {

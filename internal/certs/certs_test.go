@@ -97,8 +97,9 @@ func TestSelfSignedLeafNotCA(t *testing.T) {
 }
 
 func TestPartialPairSelfSignedPreservesConfiguredFile(t *testing.T) {
-	for _, name := range []string{"server.crt", "server.key"} {
+	pairFiles := []string{"server.crt", "server.key"}
 
+	for _, name := range pairFiles {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 
@@ -193,8 +194,11 @@ func TestSelfSignedGenerationRecoversMarkedPartialPair(t *testing.T) {
 		t.Fatal("marked partial generation was not recovered")
 	}
 
-	for _, path := range []string{k.generationMarker(), k.certificateStage(), k.privateKeyStage()} {
-		if _, err = os.Stat(path); !os.IsNotExist(err) {
+	generationArtifacts := []string{k.generationMarker(), k.certificateStage(), k.privateKeyStage()}
+
+	for _, path := range generationArtifacts {
+		_, err = os.Stat(path)
+		if !os.IsNotExist(err) {
 			t.Fatalf("generation artifact remains at %s: %v", path, err)
 		}
 	}
@@ -229,8 +233,11 @@ func TestSelfSignedGenerationRecoversMarkerWithSingleStage(t *testing.T) {
 		t.Fatal("incomplete marked generation was not replaced")
 	}
 
-	for _, path := range []string{k.generationMarker(), k.certificateStage(), k.privateKeyStage()} {
-		if _, err = os.Stat(path); !os.IsNotExist(err) {
+	generationArtifacts := []string{k.generationMarker(), k.certificateStage(), k.privateKeyStage()}
+
+	for _, path := range generationArtifacts {
+		_, err = os.Stat(path)
+		if !os.IsNotExist(err) {
 			t.Fatalf("generation artifact remains at %s: %v", path, err)
 		}
 	}
@@ -318,8 +325,11 @@ func TestSelfSignedPathsConfinedToDataDirectory(t *testing.T) {
 		t.Fatalf("escaping generated paths accepted: %v", err)
 	}
 
-	for _, path := range []string{cfg.TLS.CertificateFile, cfg.TLS.PrivateKeyFile} {
-		if _, err = os.Stat(path); !os.IsNotExist(err) {
+	escapingPaths := []string{cfg.TLS.CertificateFile, cfg.TLS.PrivateKeyFile}
+
+	for _, path := range escapingPaths {
+		_, err = os.Stat(path)
+		if !os.IsNotExist(err) {
 			t.Fatalf("escaping path created: %s (%v)", path, err)
 		}
 	}
@@ -338,8 +348,11 @@ func TestLoadDoesNotGenerateMissingSelfSignedPair(t *testing.T) {
 		t.Fatal("Load accepted missing certificate pair")
 	}
 
-	for _, name := range []string{"tls/server.crt", "tls/server.key"} {
-		if _, err = os.Stat(filepath.Join(dir, filepath.FromSlash(name))); !os.IsNotExist(err) {
+	tlsFiles := []string{"tls/server.crt", "tls/server.key"}
+
+	for _, name := range tlsFiles {
+		_, err = os.Stat(filepath.Join(dir, filepath.FromSlash(name)))
+		if !os.IsNotExist(err) {
 			t.Fatalf("Load generated %s: %v", name, err)
 		}
 	}
@@ -618,7 +631,9 @@ func writeTestChain(t *testing.T, dir string) *x509.CertPool {
 }
 
 func TestCertificateReadLimit(t *testing.T) {
-	for _, name := range []string{"server.crt", "server.key"} {
+	pairFiles := []string{"server.crt", "server.key"}
+
+	for _, name := range pairFiles {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 
@@ -765,7 +780,9 @@ func TestHotReloadDetectsEqualMtimeReplacement(t *testing.T) {
 
 	stamp := time.Now().Add(-24 * time.Hour)
 
-	for _, name := range []string{"server.crt", "server.key"} {
+	pairFiles := []string{"server.crt", "server.key"}
+
+	for _, name := range pairFiles {
 		body, err := os.ReadFile(filepath.Join(replacement, name))
 		if err != nil {
 			t.Fatal(err)

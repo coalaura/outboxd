@@ -42,7 +42,8 @@ func TestDNSDoesNotGenerateMissingDKIMKeyOrReplaceOutput(t *testing.T) {
 		t.Fatalf("dns with missing DKIM key error=%v", err)
 	}
 
-	if _, err = os.Stat(keyPath); !os.IsNotExist(err) {
+	_, err = os.Stat(keyPath)
+	if !os.IsNotExist(err) {
 		t.Fatalf("dns generated missing DKIM key: %v", err)
 	}
 
@@ -65,11 +66,13 @@ func TestDNSMissingConfigDoesNotCreateIt(t *testing.T) {
 		t.Fatal("dns with missing config succeeded")
 	}
 
-	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+	_, statErr := os.Stat(path)
+	if !os.IsNotExist(statErr) {
 		t.Fatalf("dns created missing config: %v", statErr)
 	}
 
-	if _, statErr := os.Stat(path + ".outboxd.lock"); !os.IsNotExist(statErr) {
+	_, statErr = os.Stat(path + ".outboxd.lock")
+	if !os.IsNotExist(statErr) {
 		t.Fatalf("dns created ownership lock for missing config: %v", statErr)
 	}
 }
@@ -125,7 +128,9 @@ func TestDNSRejectsChangedPathsWhileStartupSnapshotOwned(t *testing.T) {
 	defer startup.Close()
 
 	cfg.Server.DataDirectory = filepath.Join(dir, "changed-data")
-	if err = cfg.Save(); err != nil {
+
+	err = cfg.Save()
+	if err != nil {
 		t.Fatal(err)
 	}
 

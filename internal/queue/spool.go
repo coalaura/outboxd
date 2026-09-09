@@ -67,6 +67,7 @@ func (q *Queue) holdPhysical(bytes int64, terminal bool) (func(bool), error) {
 
 	return func(commit bool) {
 		q.mu.Lock()
+
 		if commit {
 			q.commitPhysicalLocked(bytes)
 		} else if bytes > q.spoolReserved {
@@ -74,6 +75,7 @@ func (q *Queue) holdPhysical(bytes int64, terminal bool) (func(bool), error) {
 		} else {
 			q.spoolReserved -= bytes
 		}
+
 		q.mu.Unlock()
 	}, nil
 }
@@ -154,6 +156,7 @@ func (q *Queue) reservePhysicalLocked(physical int64, emergency, terminal bool) 
 
 	if q.limits.MaxSpoolBytes > 0 {
 		limit := q.limits.MaxSpoolBytes
+
 		if !emergency {
 			limit -= q.limits.SpoolEmergencyBytes
 		} else if !terminal {
@@ -174,6 +177,7 @@ func (q *Queue) reservePhysicalLocked(physical int64, emergency, terminal bool) 
 		}
 
 		floor := q.limits.MinFreeDisk
+
 		if !emergency {
 			floor, ok = checkedAddInt64(floor, q.limits.SpoolEmergencyBytes)
 			if !ok {

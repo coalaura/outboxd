@@ -123,7 +123,8 @@ func PrepareContext(ctx context.Context, r io.Reader, opts Options) (*Message, e
 		return nil, errEmpty
 	}
 
-	if err := ctx.Err(); err != nil {
+	err = ctx.Err()
+	if err != nil {
 		return nil, err
 	}
 
@@ -142,14 +143,16 @@ func PrepareContext(ctx context.Context, r io.Reader, opts Options) (*Message, e
 		return nil, err
 	}
 
-	if err := ctx.Err(); err != nil {
+	err = ctx.Err()
+	if err != nil {
 		return nil, err
 	}
 
 	present := make(map[string]int, len(fields))
 
 	for _, field := range fields {
-		if err := ctx.Err(); err != nil {
+		err = ctx.Err()
+		if err != nil {
 			return nil, err
 		}
 
@@ -194,7 +197,9 @@ func PrepareContext(ctx context.Context, r io.Reader, opts Options) (*Message, e
 
 		// Preserve local-part case; only the domain is case-insensitive.
 		originator := preserveLocalPartCase(field.text(), address.Address)
-		if err := mailbox.ValidateAddress(originator); err != nil {
+
+		err = mailbox.ValidateAddress(originator)
+		if err != nil {
 			return nil, fmt.Errorf("invalid %s header: %w", canonicalHeader(field.name), err)
 		}
 
@@ -223,6 +228,7 @@ func PrepareContext(ctx context.Context, r io.Reader, opts Options) (*Message, e
 	identifier := messageID(identifierDomain)
 
 	var out bytes.Buffer
+
 	out.Grow(len(data) + 512)
 
 	fmt.Fprintf(&out, "Received: from %s", traceValue(opts.Helo))
@@ -329,7 +335,8 @@ func PrepareContext(ctx context.Context, r io.Reader, opts Options) (*Message, e
 }
 
 func (r contextReader) Read(p []byte) (int, error) {
-	if err := r.ctx.Err(); err != nil {
+	err := r.ctx.Err()
+	if err != nil {
 		return 0, err
 	}
 
@@ -445,7 +452,8 @@ func normalize(ctx context.Context, raw []byte) ([]byte, error) {
 
 	for i := 0; i < len(raw); i++ {
 		if i&4095 == 0 {
-			if err := ctx.Err(); err != nil {
+			err := ctx.Err()
+			if err != nil {
 				return nil, err
 			}
 		}
@@ -467,6 +475,7 @@ func normalize(ctx context.Context, raw []byte) ([]byte, error) {
 			out = append(out, raw[i])
 
 			length++
+
 			if length > maxLineLength {
 				return nil, errLongLine
 			}
@@ -496,7 +505,8 @@ func scan(ctx context.Context, header []byte) ([]field, error) {
 	)
 
 	for offset := 0; offset < len(header); {
-		if err := ctx.Err(); err != nil {
+		err := ctx.Err()
+		if err != nil {
 			return nil, err
 		}
 
@@ -549,6 +559,7 @@ func scan(ctx context.Context, header []byte) ([]field, error) {
 		}
 
 		start = offset
+
 		if len(fields) >= maxHeaderFields {
 			return nil, errFieldCount
 		}
@@ -600,6 +611,7 @@ func containsHeaderControls(b []byte) bool {
 
 func traceValue(value string) string {
 	var builder strings.Builder
+
 	builder.Grow(min(len(value), maxTraceLength))
 
 	for _, char := range value {

@@ -34,6 +34,11 @@ type attemptState struct {
 	inFlight int
 }
 
+type authAggregateSum struct {
+	fail     int
+	inflight int
+}
+
 // authLimiter tracks per-IP and per-IP+canonicalUsername failures, plus a
 // username-global in-flight aggregate. The username aggregate is deliberately
 // not failure-based, so distributed attackers cannot persistently lock an account.
@@ -504,7 +509,8 @@ func (l *authLimiter) evictOldestKey(now time.Time) bool {
 		}
 
 		if oldestKey == "" || st.seen.Before(oldest) {
-			oldestKey, oldest = key, st.seen
+			oldestKey = key
+			oldest = st.seen
 		}
 	}
 
@@ -537,7 +543,8 @@ func (l *authLimiter) evictOldestIP(now time.Time) bool {
 		}
 
 		if oldestIP == "" || st.seen.Before(oldest) {
-			oldestIP, oldest = ip, st.seen
+			oldestIP = ip
+			oldest = st.seen
 		}
 	}
 
@@ -595,12 +602,7 @@ func (l *authLimiter) dropIdentityLocked(key string, st *attemptState, now time.
 // assertAggregatesLocked verifies IP totals equal the sum of identity contributions.
 // Used only by tests; panics on violation so race tests surface corruption quickly.
 func (l *authLimiter) assertAggregatesLocked() error {
-	type sum struct {
-		fail     int
-		inflight int
-	}
-
-	want := make(map[string]sum)
+	want := make(map[string]authAggregateSum)
 
 	for k, st := range l.byKey {
 		ip := ipFromKey(k)

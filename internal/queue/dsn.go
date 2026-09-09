@@ -216,15 +216,19 @@ func (q *Queue) AddDSN(source, dsn *Envelope, data []byte) error {
 		return ErrSpoolFull
 	}
 
-	for _, dir := range []string{q.ready, q.dead} {
-		if _, err := os.Stat(filepath.Join(dir, dsn.ID)); err == nil {
+	dirs := []string{q.ready, q.dead}
+
+	for _, dir := range dirs {
+		_, statErr := os.Stat(filepath.Join(dir, dsn.ID))
+		if statErr == nil {
 			return fmt.Errorf("%w: %s already exists", ErrIDConflict, dsn.ID)
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return statErr
 		}
 	}
 
 	stageDir := filepath.Join(q.dsn, dsn.ID)
+
 	_, err = os.Stat(stageDir)
 	if err == nil {
 		// The durable source is unlinked, so an existing stage never crossed the

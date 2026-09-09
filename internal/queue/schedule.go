@@ -73,7 +73,8 @@ func (h userHeap) Len() int {
 }
 
 func (h userHeap) Less(i, j int) bool {
-	a, b := h[i].messages[0], h[j].messages[0]
+	a := h[i].messages[0]
+	b := h[j].messages[0]
 
 	if a.NextAttempt.Equal(b.NextAttempt) {
 		return h[i].name < h[j].name

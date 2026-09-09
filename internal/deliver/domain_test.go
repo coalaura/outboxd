@@ -185,6 +185,7 @@ func serveCapOnly(ln net.Listener, utf8, eight bool) {
 				switch {
 				case strings.HasPrefix(upper, "EHLO"):
 					resp := "250-mx\r\n"
+
 					if eight {
 						resp += "250-8BITMIME\r\n"
 					}
@@ -259,6 +260,7 @@ func startMiniMX(t *testing.T, startTLS bool, cert tls.Certificate, utf8, eight 
 					switch {
 					case strings.HasPrefix(upper, "EHLO"):
 						resp := "250-mx\r\n"
+
 						if startTLS && !secured {
 							resp += "250-STARTTLS\r\n"
 						}
@@ -926,7 +928,10 @@ func TestRunQueueErrorCancelsAttemptsBeforeWait(t *testing.T) {
 	dialStarted := make(chan struct{})
 	dialCanceled := make(chan struct{})
 
-	var startOnce, cancelOnce sync.Once
+	var (
+		startOnce  sync.Once
+		cancelOnce sync.Once
+	)
 
 	d.SetResolver(&fixedResolver{
 		mx:  map[string][]*net.MX{"ex.com": {{Host: "mx.ex.com.", Pref: 10}}},

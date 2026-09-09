@@ -25,11 +25,12 @@ func (q *Queue) AddContext(ctx context.Context, envelope *Envelope, data []byte)
 		return errors.New("nil Add context")
 	}
 
-	if err := ctx.Err(); err != nil {
+	err := ctx.Err()
+	if err != nil {
 		return err
 	}
 
-	err := q.beginOperation()
+	err = q.beginOperation()
 	if err != nil {
 		return err
 	}
@@ -88,7 +89,8 @@ func (q *Queue) AddContext(ctx context.Context, envelope *Envelope, data []byte)
 		}
 	}()
 
-	if err = ctx.Err(); err != nil {
+	err = ctx.Err()
+	if err != nil {
 		return err
 	}
 
@@ -126,11 +128,14 @@ func (q *Queue) AddContext(ctx context.Context, envelope *Envelope, data []byte)
 		return err
 	}
 
-	for _, dir := range []string{q.dead, q.dsn} {
-		if _, err := os.Stat(filepath.Join(dir, envelope.ID)); err == nil {
+	dirs := []string{q.dead, q.dsn}
+
+	for _, dir := range dirs {
+		_, statErr := os.Stat(filepath.Join(dir, envelope.ID))
+		if statErr == nil {
 			return fmt.Errorf("%w: queue id %s already exists", ErrIDConflict, envelope.ID)
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return statErr
 		}
 	}
 
@@ -152,7 +157,8 @@ func (q *Queue) AddContext(ctx context.Context, envelope *Envelope, data []byte)
 		return err
 	}
 
-	if err = ctx.Err(); err != nil {
+	err = ctx.Err()
+	if err != nil {
 		return err
 	}
 
@@ -192,7 +198,8 @@ func (q *Queue) AddContext(ctx context.Context, envelope *Envelope, data []byte)
 		}
 	}()
 
-	if err = ctx.Err(); err != nil {
+	err = ctx.Err()
+	if err != nil {
 		return err
 	}
 
@@ -226,7 +233,9 @@ func (q *Queue) AddContext(ctx context.Context, envelope *Envelope, data []byte)
 	}()
 
 	statePath := filepath.Join(tmpDir, addStateName)
-	if err = ctx.Err(); err != nil {
+
+	err = ctx.Err()
+	if err != nil {
 		return err
 	}
 
@@ -236,7 +245,9 @@ func (q *Queue) AddContext(ctx context.Context, envelope *Envelope, data []byte)
 	}
 
 	bodyPath := filepath.Join(tmpDir, bodyName)
-	if err = ctx.Err(); err != nil {
+
+	err = ctx.Err()
+	if err != nil {
 		return err
 	}
 
@@ -246,7 +257,9 @@ func (q *Queue) AddContext(ctx context.Context, envelope *Envelope, data []byte)
 	}
 
 	metaPath := filepath.Join(tmpDir, metaName)
-	if err = ctx.Err(); err != nil {
+
+	err = ctx.Err()
+	if err != nil {
 		return err
 	}
 
@@ -255,7 +268,8 @@ func (q *Queue) AddContext(ctx context.Context, envelope *Envelope, data []byte)
 		return err
 	}
 
-	if err = ctx.Err(); err != nil {
+	err = ctx.Err()
+	if err != nil {
 		return err
 	}
 
@@ -264,7 +278,8 @@ func (q *Queue) AddContext(ctx context.Context, envelope *Envelope, data []byte)
 		return err
 	}
 
-	if err = ctx.Err(); err != nil {
+	err = ctx.Err()
+	if err != nil {
 		return err
 	}
 
@@ -275,7 +290,9 @@ func (q *Queue) AddContext(ctx context.Context, envelope *Envelope, data []byte)
 
 	abortReady := func(cause error) error {
 		persistent := estimatePersistentEntryAllocation(envelope.Size, len(meta))
-		if measured, measureErr := disk.AllocatedBytes(readyDir); measureErr == nil {
+
+		measured, measureErr := disk.AllocatedBytes(readyDir)
+		if measureErr == nil {
 			persistent = measured
 		}
 
@@ -301,11 +318,13 @@ func (q *Queue) AddContext(ctx context.Context, envelope *Envelope, data []byte)
 		// ready-directory sync proving the source absent resolves that ambiguity.
 		syncErr := disk.Sync(q.ready)
 		_, statErr := os.Stat(readyDir)
+
 		if syncErr == nil && errors.Is(statErr, os.ErrNotExist) {
 			return errors.Join(definiteAcceptanceCause(cause), fmt.Errorf("quarantine reported an error after removing ready entry: %w", abortErr))
 		}
 
 		cleanupErr := errors.Join(abortErr, syncErr)
+
 		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 			cleanupErr = errors.Join(cleanupErr, statErr)
 		}
@@ -321,7 +340,8 @@ func (q *Queue) AddContext(ctx context.Context, envelope *Envelope, data []byte)
 		return errors.Join(cause, fmt.Errorf("quarantine failed add: %w", cleanupErr))
 	}
 
-	if err = ctx.Err(); err != nil {
+	err = ctx.Err()
+	if err != nil {
 		return abortReady(err)
 	}
 

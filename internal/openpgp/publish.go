@@ -237,6 +237,7 @@ func writePublicArtifact(root, relative string, body []byte, written map[string]
 	}
 
 	closeErr := file.Close()
+
 	if writeErr != nil {
 		return writeErr
 	}
@@ -296,6 +297,7 @@ func armorPublicKey(key []byte) ([]byte, error) {
 	} else {
 		_ = armored.Close()
 	}
+
 	if err != nil {
 		return nil, err
 	}

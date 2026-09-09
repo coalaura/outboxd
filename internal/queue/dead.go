@@ -170,6 +170,7 @@ func (q *Queue) Bury(envelope *Envelope) error {
 
 		return err
 	}
+
 	moved, err := moveState(src, dst)
 	if err != nil {
 		if moved {
@@ -301,6 +302,7 @@ func (q *Queue) ReviveDead(id string) (*Envelope, error) {
 	err = q.reserveLocked(env.Size, physical, exempt, true, owner)
 	if err != nil {
 		q.mu.Unlock()
+
 		return nil, err
 	}
 
@@ -362,6 +364,7 @@ func (q *Queue) ReviveDead(id string) (*Envelope, error) {
 	_, retainedStageTemp, err := q.writeMetaReconciled(stagedMeta, env)
 	if err != nil {
 		cleanupErr := removeAndSync(stagedMeta)
+
 		if retainedStageTemp {
 			commitPhysical(disk.AllocationSize(int64(len(meta))))
 		}
@@ -471,7 +474,9 @@ func (q *Queue) claimLinkedDeadDSN(env *Envelope) (string, error) {
 		return "", fmt.Errorf("inspect linked DSN %s: %w", dsnID, err)
 	}
 
-	for _, namespace := range []string{q.dsn, q.ready, q.dead} {
+	namespaces := []string{q.dsn, q.ready, q.dead}
+
+	for _, namespace := range namespaces {
 		path := filepath.Join(namespace, dsnID)
 
 		err = disk.CheckRead(path)

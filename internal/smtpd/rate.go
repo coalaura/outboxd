@@ -99,6 +99,7 @@ func (l *submissionLimiter) refill(a *submissionAllowance, now time.Time) {
 	elapsed := now.Sub(a.updated)
 
 	a.updated = now
+
 	if elapsed <= 0 {
 		return
 	}

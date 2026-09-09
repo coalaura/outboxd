@@ -59,7 +59,9 @@ func TestSPFForSenderDomainsAndIncludes(t *testing.T) {
 		}
 	}
 
-	for _, want := range []string{"example.com.", "news.example.com.", "mail.example.com."} {
+	expectedOwners := []string{"example.com.", "news.example.com.", "mail.example.com."}
+
+	for _, want := range expectedOwners {
 		if !owners[want] {
 			t.Fatalf("missing SPF owner %s in %v", want, owners)
 		}

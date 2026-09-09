@@ -67,7 +67,7 @@ func LoadFile(path string) (*Config, error) {
 	err = dec.Decode(&extra)
 	if err == nil {
 		return nil, errors.New("config contains trailing YAML content")
-	} else if err != io.EOF && !isYAMLEOF(err) {
+	} else if !errors.Is(err, io.EOF) && !isYAMLEOF(err) {
 		return nil, fmt.Errorf("trailing YAML content: %w", err)
 	}
 

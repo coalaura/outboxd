@@ -16,6 +16,7 @@ func checkFCrDNS(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 
 	checkIP := func(ip string, label string) {
 		name := "fcrdns_" + label
+
 		if ip == "" {
 			return
 		}
@@ -23,6 +24,7 @@ func checkFCrDNS(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 		names, err := r.LookupAddr(ctx, ip)
 		if err != nil {
 			rs = append(rs, Result{Name: name, Level: Fail, Message: fmt.Sprintf("PTR for %s: %v", ip, err)})
+
 			return
 		}
 

@@ -8,6 +8,13 @@ import (
 	"time"
 )
 
+const trackerCloseAllAttempts = 500
+
+type acceptResult struct {
+	conn net.Conn
+	err  error
+}
+
 type oneConnListener struct {
 	conn net.Conn
 }
@@ -59,11 +66,6 @@ func TestTrackListenerRejectsAcceptBetweenAcceptAndTrack(t *testing.T) {
 		},
 	}
 
-	type acceptResult struct {
-		conn net.Conn
-		err  error
-	}
-
 	result := make(chan acceptResult, 1)
 
 	go func() {
@@ -88,9 +90,7 @@ func TestTrackListenerRejectsAcceptBetweenAcceptAndTrack(t *testing.T) {
 }
 
 func TestConnectionTrackerCloseAllRace(t *testing.T) {
-	const attempts = 500
-
-	for i := range attempts {
+	for i := range trackerCloseAllAttempts {
 		accepted, peer := net.Pipe()
 
 		tracker := newConnectionTracker()

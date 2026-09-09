@@ -49,7 +49,8 @@ func TestUserValidateAllowsCaseDistinctExactSenders(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := u.AllowedSenders; got[0] != "User@example.com" || got[1] != "user@example.com" {
+	got := u.AllowedSenders
+	if got[0] != "User@example.com" || got[1] != "user@example.com" {
 		t.Fatalf("normalized senders=%q", got)
 	}
 }

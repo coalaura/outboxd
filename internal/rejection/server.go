@@ -186,6 +186,7 @@ func (s *Server) Run(ctx context.Context) error {
 	started := make(chan struct{})
 
 	lifetime := max(config.Duration(s.cfg.ReadTimeout), config.Duration(s.cfg.WriteTimeout))
+
 	listener := &startListener{
 		Listener: &trackListener{
 			Listener: &protocolListener{
@@ -274,7 +275,9 @@ func (c *protocolConn) Read(p []byte) (int, error) {
 		c.commands++
 
 		command := line
-		if space := bytes.IndexAny(command, " \r\n"); space >= 0 {
+
+		space := bytes.IndexAny(command, " \r\n")
+		if space >= 0 {
 			command = command[:space]
 		}
 

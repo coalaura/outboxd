@@ -54,6 +54,7 @@ func main() {
 
 	if len(args) == 0 {
 		log.MustExit(serve(configPath))
+
 		return
 	}
 

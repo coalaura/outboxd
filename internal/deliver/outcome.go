@@ -43,7 +43,10 @@ func (d *Deliverer) expirePending(envelope *queue.Envelope) error {
 }
 
 func (d *Deliverer) complete(envelope *queue.Envelope) error {
-	var delivered, failed int
+	var (
+		delivered int
+		failed    int
+	)
 
 	for i := range envelope.Recipients {
 		switch envelope.Recipients[i].Status {
@@ -131,6 +134,7 @@ func (d *Deliverer) backoff(attempts int) time.Duration {
 	for range attempts - 1 {
 		if delay >= d.maximum || delay > d.maximum/2 {
 			delay = d.maximum
+
 			break
 		}
 

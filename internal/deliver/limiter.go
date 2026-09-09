@@ -52,6 +52,7 @@ func (l *domainLimiter) release(domain string) {
 	}
 
 	entry.holders--
+
 	if entry.holders <= 0 {
 		delete(l.slots, domain)
 	}

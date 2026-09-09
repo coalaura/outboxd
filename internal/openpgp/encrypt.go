@@ -117,6 +117,7 @@ func LoadRecipients(cfg *config.Config) (*Recipients, error) {
 		}
 
 		keyFiles++
+
 		if keyFiles > config.MaxOpenPGPRecipientKeys {
 			return nil, fmt.Errorf("recipient key directory contains more than %d key files", config.MaxOpenPGPRecipientKeys)
 		}
@@ -282,11 +283,13 @@ func (r *Recipients) Encrypt(ctx context.Context, recipient, keyID string, data 
 		return nil, false, fmt.Errorf("recipient %q no longer has a usable encryption key", recipient)
 	}
 
-	if actual := fmt.Sprintf("%X", encryptionKey.PublicKey.Fingerprint); actual != keyID {
+	actual := fmt.Sprintf("%X", encryptionKey.PublicKey.Fingerprint)
+	if actual != keyID {
 		return nil, false, fmt.Errorf("recipient %q encryption key changed during preparation", recipient)
 	}
 
-	if err := ctx.Err(); err != nil {
+	err = ctx.Err()
+	if err != nil {
 		return nil, false, err
 	}
 
@@ -370,6 +373,7 @@ func supportedEncryptionAlgorithm(algorithm packet.PublicKeyAlgorithm) bool {
 
 func buildEncryptedMessage(outer, encrypted []byte, boundary string) []byte {
 	var result bytes.Buffer
+
 	result.Grow(len(outer) + len(encrypted) + 512)
 
 	result.Write(outer)

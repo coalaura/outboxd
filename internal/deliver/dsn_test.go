@@ -391,7 +391,9 @@ func TestBuildDSNUsesEnhancedStatusAndFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, status := range []string{"Status: 5.1.1\r\n", "Status: 5.0.0\r\n"} {
+	statuses := []string{"Status: 5.1.1\r\n", "Status: 5.0.0\r\n"}
+
+	for _, status := range statuses {
 		if !bytes.Contains(msg, []byte(status)) {
 			t.Fatalf("missing %q in DSN", status)
 		}
@@ -401,9 +403,11 @@ func TestBuildDSNUsesEnhancedStatusAndFallback(t *testing.T) {
 		t.Fatal("DSN Arrival-Date does not use envelope creation time")
 	}
 
-	for _, form := range []string{
+	forms := []string{
 		"report-type=delivery-status", "Content-Type: message/delivery-status", "Final-Recipient: rfc822;", "Content-Type: message/rfc822",
-	} {
+	}
+
+	for _, form := range forms {
 		if !bytes.Contains(msg, []byte(form)) {
 			t.Fatalf("ASCII DSN missing RFC 3464 form %q", form)
 		}
@@ -428,15 +432,19 @@ func TestBuildDSNUsesRFC6533GlobalForms(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, form := range []string{
+	globalForms := []string{
 		"report-type=global-delivery-status", "Content-Type: message/global-delivery-status", "Final-Recipient: utf-8; bob@example.com", "Content-Type: message/global",
-	} {
+	}
+
+	for _, form := range globalForms {
 		if !bytes.Contains(msg, []byte(form)) {
 			t.Fatalf("SMTPUTF8 DSN missing RFC 6533 form %q", form)
 		}
 	}
 
-	for _, asciiForm := range []string{"message/delivery-status", "Final-Recipient: rfc822;", "Content-Type: message/rfc822"} {
+	asciiForms := []string{"message/delivery-status", "Final-Recipient: rfc822;", "Content-Type: message/rfc822"}
+
+	for _, asciiForm := range asciiForms {
 		if bytes.Contains(msg, []byte(asciiForm)) {
 			t.Fatalf("SMTPUTF8 DSN retained RFC 3464 form %q", asciiForm)
 		}
@@ -543,7 +551,7 @@ func TestCompletedDSNDoesNotRegenerateBeforeSourceTransition(t *testing.T) {
 }
 
 func TestTerminalSourceRecoveryAfterDSNPublication(t *testing.T) {
-	for _, tc := range []terminalSourceRecoveryCase{
+	cases := []terminalSourceRecoveryCase{
 		{
 			name: "partial_success_finishes",
 			recipients: []queue.Recipient{
@@ -559,7 +567,9 @@ func TestTerminalSourceRecoveryAfterDSNPublication(t *testing.T) {
 			},
 			wantDead: true,
 		},
-	} {
+	}
+
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
 

@@ -78,7 +78,9 @@ func TestCreateGeneratesEncryptedConfiguredKey(t *testing.T) {
 		}
 	}
 
-	for _, privatePath := range []string{keyPath, passPath} {
+	paths := []string{keyPath, passPath}
+
+	for _, privatePath := range paths {
 		info, statErr := os.Stat(privatePath)
 		if statErr != nil {
 			t.Fatal(statErr)
@@ -271,8 +273,11 @@ func TestCreateConfigCommitFailureAfterRenamePreservesFiles(t *testing.T) {
 
 	identity := loaded.OpenPGP.Identities[0]
 
-	for _, relative := range []string{identity.SigningKey, identity.PassphraseFile} {
-		if _, statErr := os.Stat(cfg.ResolvePath(relative)); statErr != nil {
+	files := []string{identity.SigningKey, identity.PassphraseFile}
+
+	for _, relative := range files {
+		_, statErr := os.Stat(cfg.ResolvePath(relative))
+		if statErr != nil {
 			t.Fatalf("committed identity file %s was not preserved: %v", relative, statErr)
 		}
 	}

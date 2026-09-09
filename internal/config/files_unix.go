@@ -46,6 +46,7 @@ func ReadCheckedFile(path string, private, allowSymlink bool, maximum int64) ([]
 
 func openChecked(path string, private, allowSymlink bool) (*os.File, error) {
 	flags := unix.O_RDONLY | unix.O_CLOEXEC
+
 	if !allowSymlink {
 		flags |= unix.O_NOFOLLOW
 	}
@@ -60,6 +61,7 @@ func openChecked(path string, private, allowSymlink bool) (*os.File, error) {
 	info, err := file.Stat()
 	if err != nil {
 		file.Close()
+
 		return nil, err
 	}
 

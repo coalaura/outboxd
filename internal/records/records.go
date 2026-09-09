@@ -77,6 +77,7 @@ func Build(cfg *config.Config, dkim string) []Record {
 
 	for _, owner := range spfOwners {
 		purpose := "SPF; authorizes this server to send for this domain and rejects everything else"
+
 		if owner == hostname && owner != domain {
 			purpose = "SPF for the EHLO/HELO name; receivers may check HELO separately from the envelope sender"
 		} else if owner != domain && owner != hostname {
@@ -144,6 +145,7 @@ func Write(cfg *config.Config, dkim string, publicIdentities ...pgpsign.PublicId
 	}
 
 	var buffer bytes.Buffer
+
 	buffer.Grow(4096)
 
 	fmt.Fprintf(&buffer, "DNS setup for %s (%s)\n", cfg.Server.Domain, time.Now().Format(time.RFC3339))
@@ -309,7 +311,8 @@ func uncoveredEnvelopeDomains(cfg *config.Config) []string {
 				continue
 			}
 
-			if at := strings.LastIndexByte(sender, '@'); at >= 0 {
+			at := strings.LastIndexByte(sender, '@')
+			if at >= 0 {
 				add(sender[at+1:])
 			}
 		}
@@ -386,6 +389,7 @@ func spfOwnerNames(cfg *config.Config) []string {
 
 			if strings.HasPrefix(sender, "*@") {
 				add(sender[2:])
+
 				continue
 			}
 

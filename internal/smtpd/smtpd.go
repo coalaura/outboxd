@@ -215,9 +215,11 @@ func NewWithOpenPGP(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signe
 	srv.openPGPRecipients = pgpRecipients
 
 	srv.signMessage = func(ctx context.Context, data []byte) (string, error) {
-		if err := ctx.Err(); err != nil {
+		err := ctx.Err()
+		if err != nil {
 			return "", err
 		}
+
 		return srv.signer.Signature(data)
 	}
 

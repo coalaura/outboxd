@@ -120,7 +120,7 @@ func TestAutocryptFieldIsFoldedAndRequiresEncryptionKey(t *testing.T) {
 		t.Fatalf("Autocrypt field length = %d", len(field))
 	}
 
-	for _, line := range bytes.Split(bytes.TrimSuffix(field, []byte("\r\n")), []byte("\r\n")) {
+	for line := range bytes.SplitSeq(bytes.TrimSuffix(field, []byte("\r\n")), []byte("\r\n")) {
 		if len(line) > 998 {
 			t.Fatalf("Autocrypt physical line length = %d", len(line))
 		}
@@ -128,11 +128,13 @@ func TestAutocryptFieldIsFoldedAndRequiresEncryptionKey(t *testing.T) {
 }
 
 func TestWKDHashKnownVector(t *testing.T) {
-	if got := wkdHash("test"); got != "iffe93qcsgp4c8ncbb378rxjo6cn9q6u" {
+	got := wkdHash("test")
+	if got != "iffe93qcsgp4c8ncbb378rxjo6cn9q6u" {
 		t.Fatalf("wkdHash(test) = %q", got)
 	}
 
-	if got := wkdLocalPart("Alice-Ä"); got != "alice-Ä" {
+	got = wkdLocalPart("Alice-Ä")
+	if got != "alice-Ä" {
 		t.Fatalf("wkdLocalPart() = %q", got)
 	}
 }

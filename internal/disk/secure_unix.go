@@ -134,6 +134,7 @@ func validateDirectoryTree(dir *os.File, mount mountIdentity) error {
 			return closeErr
 		}
 	}
+
 	return nil
 }
 

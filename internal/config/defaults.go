@@ -10,9 +10,11 @@ func (cfg *Config) applyDefaults() {
 		cfg.LogLevel = "print"
 	}
 
-	if !slices.ContainsFunc(cfg.DKIM.Headers, func(header string) bool {
+	isSender := func(header string) bool {
 		return strings.EqualFold(strings.TrimSpace(header), "Sender")
-	}) {
+	}
+
+	if !slices.ContainsFunc(cfg.DKIM.Headers, isSender) {
 		cfg.DKIM.Headers = append(cfg.DKIM.Headers, "Sender")
 	}
 

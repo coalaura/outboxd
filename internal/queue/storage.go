@@ -508,6 +508,7 @@ func openRegularFromInfo(path string, before os.FileInfo) (*os.File, os.FileInfo
 	after, err := file.Stat()
 	if err != nil {
 		file.Close()
+
 		return nil, nil, err
 	}
 

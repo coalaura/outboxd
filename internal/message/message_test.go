@@ -2,6 +2,7 @@ package message
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -23,7 +24,9 @@ func TestPrepareStripsBccAndReturnPath(t *testing.T) {
 
 	s := string(msg.Data)
 
-	for _, bad := range []string{"Bcc:", "Return-Path:"} {
+	badHeaders := []string{"Bcc:", "Return-Path:"}
+
+	for _, bad := range badHeaders {
 		if strings.Contains(s, bad) {
 			t.Fatalf("outgoing still contains %s", bad)
 		}
@@ -98,11 +101,13 @@ func TestSenderAndResentOriginators(t *testing.T) {
 		t.Fatalf("Sender=%q data=%q", msg.Sender, msg.Data)
 	}
 
-	for _, name := range []string{"Resent-Date", "Resent-From", "Resent-Sender", "Resent-To", "Resent-Bcc"} {
+	resentHeaders := []string{"Resent-Date", "Resent-From", "Resent-Sender", "Resent-To", "Resent-Bcc"}
+
+	for _, name := range resentHeaders {
 		raw := "From: a@b.co\r\n" + name + ": a@b.co\r\n\r\nbody\r\n"
 
 		_, err := Prepare(strings.NewReader(raw), Options{Hostname: "h"})
-		if err != errResent {
+		if !errors.Is(err, errResent) {
 			t.Fatalf("%s err=%v want %v", name, err, errResent)
 		}
 	}
@@ -117,7 +122,7 @@ func TestHeaderLimitsExactBoundaries(t *testing.T) {
 	}
 
 	_, err = Prepare(strings.NewReader("X:x\r\n"+fields+"\r\nbody\r\n"), Options{Hostname: "h"})
-	if err != errFieldCount {
+	if !errors.Is(err, errFieldCount) {
 		t.Fatalf("field limit + 1 err=%v", err)
 	}
 
@@ -131,7 +136,7 @@ func TestHeaderLimitsExactBoundaries(t *testing.T) {
 	header = append(header, 'x')
 
 	_, err = Prepare(bytes.NewReader(append(append([]byte{}, header...), []byte("\r\nbody\r\n")...)), Options{Hostname: "h"})
-	if err != errHeaderSize {
+	if !errors.Is(err, errHeaderSize) {
 		t.Fatalf("header byte limit + 1 err=%v", err)
 	}
 }
@@ -216,7 +221,7 @@ func TestMaxBytes(t *testing.T) {
 	raw := "From: a@b.co\r\nTo: c@d.co\r\nSubject: x\r\n\r\n" + strings.Repeat("x", 100)
 
 	_, err := Prepare(strings.NewReader(raw), Options{Hostname: "h", MaxBytes: 40})
-	if err != ErrOversized {
+	if !errors.Is(err, ErrOversized) {
 		t.Fatalf("err=%v", err)
 	}
 }

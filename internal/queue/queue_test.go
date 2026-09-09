@@ -22,6 +22,15 @@ import (
 	"github.com/coalaura/outboxd/internal/disk"
 )
 
+const (
+	concurrentAddNextN           = 50
+	closeBroadcastsConsumers     = 4
+	closeConcurrentIterations    = 100
+	closeConcurrentConsumers     = 8
+	closeConcurrentClosers       = 8
+	closeWaitsForInFlightClosers = 16
+)
+
 type addFaultCase struct {
 	name  string
 	hooks func(id string) disk.Hooks
@@ -325,6 +334,7 @@ func TestAddFaultInjectionRecoverable(t *testing.T) {
 			name: "after_meta_write",
 			hooks: func(id string) disk.Hooks {
 				var bodyDone atomic.Bool
+
 				return disk.Hooks{
 					AfterSyncFile: func(path string) error {
 						if strings.Contains(path, "message.eml") {
@@ -581,7 +591,8 @@ func TestAddAcceptanceSyncErrorWithDurableRollbackIsDefinite(t *testing.T) {
 		t.Fatalf("definite failed Add was scheduled: Len=%d", q.Len())
 	}
 
-	if _, err := os.Stat(filepath.Join(root, dirReady, env.ID)); !errors.Is(err, os.ErrNotExist) {
+	_, err = os.Stat(filepath.Join(root, dirReady, env.ID))
+	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("definite failed Add remains ready: %v", err)
 	}
 }
@@ -589,11 +600,13 @@ func TestAddAcceptanceSyncErrorWithDurableRollbackIsDefinite(t *testing.T) {
 func TestRecoverTmpNeverPromotesCompleteUncommittedAdd(t *testing.T) {
 	clearHooks(t)
 
-	for _, state := range []uncommittedTmpAddStateCase{
+	states := []uncommittedTmpAddStateCase{
 		{name: "markerless"},
 		{name: "pending", body: []byte(addPending)},
 		{name: "accepted", body: []byte(addAccepted)},
-	} {
+	}
+
+	for _, state := range states {
 		t.Run(state.name, func(t *testing.T) {
 			root := t.TempDir()
 
@@ -656,11 +669,13 @@ func TestRecoverTmpNeverPromotesCompleteUncommittedAdd(t *testing.T) {
 func TestOpenRejectsUncommittedReadyAdd(t *testing.T) {
 	clearHooks(t)
 
-	for _, state := range []uncommittedReadyAddStateCase{
+	states := []uncommittedReadyAddStateCase{
 		{name: "missing"},
 		{name: "pending", body: []byte(addPending)},
 		{name: "malformed", body: []byte("outboxd-add-v1:accept")},
-	} {
+	}
+
+	for _, state := range states {
 		t.Run(state.name, func(t *testing.T) {
 			root := t.TempDir()
 
@@ -686,7 +701,9 @@ func TestOpenRejectsUncommittedReadyAdd(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			for name, body := range map[string][]byte{bodyName: message, metaName: meta} {
+			files := map[string][]byte{bodyName: message, metaName: meta}
+
+			for name, body := range files {
 				err = os.WriteFile(filepath.Join(dir, name), body, 0600)
 				if err != nil {
 					t.Fatal(err)
@@ -988,7 +1005,9 @@ func TestRecipientDetailRejectsDisplayControls(t *testing.T) {
 
 	q := mustOpen(t, t.TempDir(), Limits{})
 
-	for i, detail := range []string{"line\nfeed", "bidi\u202eoverride", "zero\u200bwidth", "separator\u2028line"} {
+	details := []string{"line\nfeed", "bidi\u202eoverride", "zero\u200bwidth", "separator\u2028line"}
+
+	for i, detail := range details {
 		env := testEnv(fmt.Sprintf("detail-control-%d", i))
 
 		env.Recipients[0].Status = StatusFailed
@@ -1646,8 +1665,11 @@ func TestFinishIsIdempotentByID(t *testing.T) {
 }
 
 func TestTerminalMovesReconcilePostRenameErrors(t *testing.T) {
-	for _, operation := range []string{"finish", "bury"} {
-		for _, failure := range []string{"after_rename", "before_source_sync"} {
+	operations := []string{"finish", "bury"}
+	failures := []string{"after_rename", "before_source_sync"}
+
+	for _, operation := range operations {
+		for _, failure := range failures {
 			t.Run(operation+"/"+failure, func(t *testing.T) {
 				clearHooks(t)
 
@@ -1670,6 +1692,7 @@ func TestTerminalMovesReconcilePostRenameErrors(t *testing.T) {
 				got.Recipients[0].Status = StatusFailed
 
 				destination := dirTrash
+
 				if operation == "bury" {
 					destination = dirDead
 				}
@@ -1908,7 +1931,8 @@ func TestReviveDeadCyclesDoNotGrowCachedSpoolUsage(t *testing.T) {
 			t.Fatalf("bury %d: %v", i, err)
 		}
 
-		if used := q.SpoolStats().Used; used != want {
+		used := q.SpoolStats().Used
+		if used != want {
 			t.Fatalf("bury %d cached usage=%d want %d", i, used, want)
 		}
 	}
@@ -2265,13 +2289,11 @@ func TestConcurrentAddNext(t *testing.T) {
 
 	q := mustOpen(t, root, Limits{})
 
-	const n = 50
-
 	var wg sync.WaitGroup
 
-	errCh := make(chan error, n*2)
+	errCh := make(chan error, concurrentAddNextN*2)
 
-	for i := range n {
+	for i := range concurrentAddNextN {
 		wg.Go(func() {
 			id := fmt.Sprintf("c%04d", i)
 
@@ -2290,7 +2312,7 @@ func TestConcurrentAddNext(t *testing.T) {
 	for range 4 {
 		wg.Go(func() {
 			for {
-				if int(got.Load()) >= n {
+				if int(got.Load()) >= concurrentAddNextN {
 					return
 				}
 
@@ -2323,8 +2345,8 @@ func TestConcurrentAddNext(t *testing.T) {
 		_ = q.Finish(e)
 	}
 
-	if int(got.Load()) != n {
-		t.Fatalf("got %d want %d", got.Load(), n)
+	if int(got.Load()) != concurrentAddNextN {
+		t.Fatalf("got %d want %d", got.Load(), concurrentAddNextN)
 	}
 }
 
@@ -2728,17 +2750,23 @@ func TestAddDSNRejectsSourceWithoutFailedRecipients(t *testing.T) {
 	clearHooks(t)
 
 	q := mustOpen(t, t.TempDir(), Limits{})
-	t.Cleanup(func() { _ = q.Close() })
+
+	t.Cleanup(func() {
+		_ = q.Close()
+	})
 
 	source := testEnv("dsn-without-failures")
-	if err := q.Add(source, []byte("body")); err != nil {
+
+	err := q.Add(source, []byte("body"))
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	source.Recipients[0].Status = StatusSent
 	dsn := testDSN(source)
 
-	if err := q.AddDSN(source, dsn, []byte("dsn")); err == nil || !strings.Contains(err.Error(), "without failed recipients") {
+	err = q.AddDSN(source, dsn, []byte("dsn"))
+	if err == nil || !strings.Contains(err.Error(), "without failed recipients") {
 		t.Fatalf("AddDSN error=%v", err)
 	}
 }
@@ -2774,7 +2802,8 @@ func TestAddDSNStageMkdirDurabilityFailureCleansUp(t *testing.T) {
 		t.Fatalf("AddDSN error=%v want %v", err, wantErr)
 	}
 
-	if _, err := os.Stat(filepath.Join(root, dirDSN, dsn.ID)); !errors.Is(err, os.ErrNotExist) {
+	_, err = os.Stat(filepath.Join(root, dirDSN, dsn.ID))
+	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("failed durable mkdir retained stage: %v", err)
 	}
 
@@ -2987,7 +3016,9 @@ func TestAddReleasesOwnershipBeforeScheduling(t *testing.T) {
 }
 
 func TestAddRejectsOccupiedReadyID(t *testing.T) {
-	for _, checkedOut := range []bool{false, true} {
+	checkedOutStates := []bool{false, true}
+
+	for _, checkedOut := range checkedOutStates {
 		t.Run(fmt.Sprintf("checked_out_%t", checkedOut), func(t *testing.T) {
 			clearHooks(t)
 
@@ -3420,7 +3451,9 @@ func TestAddDSNRejectsExistingDifferentIdentity(t *testing.T) {
 }
 
 func TestStaleHandleCannotMutateReplacement(t *testing.T) {
-	for _, operation := range []string{"retry", "finish", "bury", "dsn"} {
+	operations := []string{"retry", "finish", "bury", "dsn"}
+
+	for _, operation := range operations {
 		t.Run(operation, func(t *testing.T) {
 			clearHooks(t)
 
@@ -3488,11 +3521,13 @@ func TestStaleHandleCannotMutateReplacement(t *testing.T) {
 func TestTransitionsRejectNilEnvelope(t *testing.T) {
 	q := mustOpen(t, t.TempDir(), Limits{})
 
-	for name, operation := range map[string]func(*Envelope) error{
+	operations := map[string]func(*Envelope) error{
 		"retry":  q.Retry,
 		"finish": q.Finish,
 		"bury":   q.Bury,
-	} {
+	}
+
+	for name, operation := range operations {
 		t.Run(name, func(t *testing.T) {
 			err := operation(nil)
 			if !errors.Is(err, errNilEnvelope) {
@@ -3611,7 +3646,9 @@ func TestOpenExclusiveLock(t *testing.T) {
 		t.Fatalf("Open after Close: %v", err)
 	}
 
-	t.Cleanup(func() { _ = q2.Close() })
+	t.Cleanup(func() {
+		_ = q2.Close()
+	})
 }
 
 func TestOpenReadOnlyAlongsideLocked(t *testing.T) {
@@ -3717,29 +3754,45 @@ func TestOpenReadOnlyRejectsLinkedDeadNamespace(t *testing.T) {
 
 func TestOpenReadOnlyRetainsNamespaceHandle(t *testing.T) {
 	clearHooks(t)
+
 	root := t.TempDir()
+
 	q := mustOpen(t, root, Limits{})
+
 	env := testEnv("retained-entry")
-	if err := q.Add(env, []byte("retained")); err != nil {
+
+	err := q.Add(env, []byte("retained"))
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	readOnly, err := OpenReadOnly(root)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer readOnly.Close()
-	if err = q.Close(); err != nil {
+
+	err = q.Close()
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	ready := filepath.Join(root, dirReady)
 	oldReady := filepath.Join(root, "old-ready")
-	if err = os.Rename(ready, oldReady); err != nil {
+
+	err = os.Rename(ready, oldReady)
+	if err != nil {
 		t.Skipf("rename open namespace unavailable: %v", err)
 	}
-	if err = os.Mkdir(ready, 0700); err != nil {
+
+	err = os.Mkdir(ready, 0700)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = readOnly.LoadReady(env.ID); err != nil {
+
+	_, err = readOnly.LoadReady(env.ID)
+	if err != nil {
 		t.Fatalf("retained namespace entry unavailable: %v", err)
 	}
 }
@@ -3752,7 +3805,9 @@ func TestCorruptNeverDeletedSilently(t *testing.T) {
 	_ = mustOpen(t, root, Limits{}).Close()
 
 	// Seed several corrupt ready dirs.
-	for i, name := range []string{"c1", "c2", "c3"} {
+	names := []string{"c1", "c2", "c3"}
+
+	for i, name := range names {
 		dir := filepath.Join(root, dirReady, name)
 
 		err := os.MkdirAll(dir, 0700)
@@ -3791,7 +3846,9 @@ func TestCorruptNeverDeletedSilently(t *testing.T) {
 	}
 
 	// Nothing left unread under ready with those names.
-	for _, name := range []string{"c1", "c2", "c3"} {
+	names = []string{"c1", "c2", "c3"}
+
+	for _, name := range names {
 		_, err := os.Stat(filepath.Join(root, dirReady, name))
 		if !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("%s still in ready (not quarantined)", name)
@@ -3998,12 +4055,14 @@ func TestSMTPUTF8InvariantOpenQuarantine(t *testing.T) {
 }
 
 func TestOpenQuarantinesBodySizeMismatch(t *testing.T) {
-	for _, tc := range []bodySizeMismatchCase{
+	cases := []bodySizeMismatchCase{
 		{name: "smaller", metadata: 1, body: []byte("body")},
 		{name: "larger", metadata: 10, body: []byte("body")},
 		{name: "zero", metadata: 0, body: []byte("body")},
 		{name: "nonzero_empty", metadata: 1, body: nil},
-	} {
+	}
+
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			clearHooks(t)
 
@@ -4506,7 +4565,9 @@ func TestOpenDurablyCreatesFreshTopology(t *testing.T) {
 		_ = q.Close()
 	})
 
-	for _, expected := range []string{base, filepath.Join(base, "one"), filepath.Join(base, "one", "two"), root} {
+	expectedDirs := []string{base, filepath.Join(base, "one"), filepath.Join(base, "one", "two"), root}
+
+	for _, expected := range expectedDirs {
 		var count int
 
 		for _, path := range synced {
@@ -4532,7 +4593,9 @@ func TestOpenDurablyCreatesFreshTopology(t *testing.T) {
 		t.Fatalf("root sync count=%d want at least 6; calls=%v", rootSyncs, synced)
 	}
 
-	for _, name := range []string{dirReady, dirDead, dirTmp, dirDSN, dirCorrupt, dirTrash} {
+	stateDirs := []string{dirReady, dirDead, dirTmp, dirDSN, dirCorrupt, dirTrash}
+
+	for _, name := range stateDirs {
 		info, err := os.Stat(filepath.Join(root, name))
 		if err != nil || !info.IsDir() {
 			t.Fatalf("topology %s: info=%v err=%v", name, info, err)
@@ -4593,18 +4656,16 @@ func TestCloseBroadcastsToBlockedNextCalls(t *testing.T) {
 
 	q := mustOpen(t, t.TempDir(), Limits{})
 
-	const consumers = 4
+	nextResults := make(chan error, closeBroadcastsConsumers)
 
-	nextResults := make(chan error, consumers)
-
-	for range consumers {
+	for range closeBroadcastsConsumers {
 		go func() {
 			_, err := q.Next(context.Background())
 			nextResults <- err
 		}()
 	}
 
-	waitForActiveOperations(t, q, consumers)
+	waitForActiveOperations(t, q, closeBroadcastsConsumers)
 
 	closeResult := make(chan error, 1)
 
@@ -4621,7 +4682,7 @@ func TestCloseBroadcastsToBlockedNextCalls(t *testing.T) {
 		t.Fatal("Close blocked with multiple Next calls")
 	}
 
-	for i := range consumers {
+	for i := range closeBroadcastsConsumers {
 		err := <-nextResults
 		if !errors.Is(err, ErrQueueClosed) {
 			t.Fatalf("Next[%d] error=%v want ErrQueueClosed", i, err)
@@ -4630,45 +4691,39 @@ func TestCloseBroadcastsToBlockedNextCalls(t *testing.T) {
 }
 
 func TestConcurrentCloseAndBlockedNextStress(t *testing.T) {
-	const (
-		iterations = 100
-		consumers  = 8
-		closers    = 8
-	)
-
-	for iteration := range iterations {
+	for iteration := range closeConcurrentIterations {
 		q, err := OpenReadOnly(t.TempDir())
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		nextResults := make(chan error, consumers)
+		nextResults := make(chan error, closeConcurrentConsumers)
 
-		for range consumers {
+		for range closeConcurrentConsumers {
 			go func() {
 				_, err := q.Next(context.Background())
 				nextResults <- err
 			}()
 		}
 
-		waitForActiveOperations(t, q, consumers)
+		waitForActiveOperations(t, q, closeConcurrentConsumers)
 
-		closeResults := make(chan error, closers)
+		closeResults := make(chan error, closeConcurrentClosers)
 
-		for range closers {
+		for range closeConcurrentClosers {
 			go func() {
 				closeResults <- q.Close()
 			}()
 		}
 
-		for i := range closers {
+		for i := range closeConcurrentClosers {
 			err = <-closeResults
 			if err != nil {
 				t.Fatalf("iteration %d Close[%d]: %v", iteration, i, err)
 			}
 		}
 
-		for i := range consumers {
+		for i := range closeConcurrentConsumers {
 			err = <-nextResults
 			if !errors.Is(err, ErrQueueClosed) {
 				t.Fatalf("iteration %d Next[%d] error=%v want ErrQueueClosed", iteration, i, err)
@@ -4740,11 +4795,9 @@ func TestCloseWaitsForActiveDiskOperationAndIsConcurrentSafe(t *testing.T) {
 
 	<-entered
 
-	const closers = 16
+	closeResults := make(chan error, closeWaitsForInFlightClosers)
 
-	closeResults := make(chan error, closers)
-
-	for range closers {
+	for range closeWaitsForInFlightClosers {
 		go func() {
 			closeResults <- q.Close()
 		}()
@@ -4764,7 +4817,7 @@ func TestCloseWaitsForActiveDiskOperationAndIsConcurrentSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := range closers {
+	for i := range closeWaitsForInFlightClosers {
 		err = <-closeResults
 		if err != nil {
 			t.Fatalf("Close[%d]: %v", i, err)
@@ -4830,7 +4883,9 @@ func TestCloseContextKeepsLockUntilBlockedMutationFinishes(t *testing.T) {
 	}
 
 	close(release)
-	if err = <-retryResult; err != nil {
+
+	err = <-retryResult
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -4899,7 +4954,9 @@ func TestReaderErrorsReleaseOperation(t *testing.T) {
 
 	q := mustOpen(t, t.TempDir(), Limits{})
 
-	for _, id := range []string{"../bad", "missing"} {
+	badIDs := []string{"../bad", "missing"}
+
+	for _, id := range badIDs {
 		_, err := q.Reader(id)
 		if err == nil {
 			t.Fatalf("Reader(%q) succeeded", id)
@@ -5125,6 +5182,7 @@ func TestOpenQuarantinesDigestMismatchInDSNStage(t *testing.T) {
 		if filepath.Clean(newpath) == sourceMeta {
 			return errors.New("leave DSN stage")
 		}
+
 		return nil
 	}})
 
@@ -5371,7 +5429,7 @@ func TestEnvelopeAndMetadataBounds(t *testing.T) {
 
 	q := mustOpen(t, t.TempDir(), Limits{})
 
-	for _, tc := range []envelopeBoundsCase{
+	cases := []envelopeBoundsCase{
 		{name: "recipients", env: func() *Envelope {
 			e := testEnv("too-many-recipients")
 
@@ -5424,7 +5482,9 @@ func TestEnvelopeAndMetadataBounds(t *testing.T) {
 
 			return e
 		}()},
-	} {
+	}
+
+	for _, tc := range cases {
 
 		t.Run(tc.name, func(t *testing.T) {
 			err := q.Add(tc.env, []byte("body"))
@@ -5447,10 +5507,12 @@ func TestEnvelopeAndMetadataBounds(t *testing.T) {
 
 	_ = mustOpen(t, root, Limits{}).Close()
 
-	for _, tc := range []queueEntrySizeCase{
+	entryCases := []queueEntrySizeCase{
 		{id: "oversized-meta", name: metaName, size: maxEnvelopeMetadata + 1},
 		{id: "oversized-state", name: addStateName, size: maxAddStateBytes + 1},
-	} {
+	}
+
+	for _, tc := range entryCases {
 		dir := filepath.Join(root, dirReady, tc.id)
 
 		err := os.Mkdir(dir, 0700)
@@ -5573,7 +5635,9 @@ func TestReviveDeadRejectsRevisionBoundaryBeforeWrite(t *testing.T) {
 }
 
 func TestAttemptsHardBoundRejectsNearMachineMaximum(t *testing.T) {
-	for _, attempts := range []int{math.MaxInt - 1, math.MaxInt - 2} {
+	attemptsList := []int{math.MaxInt - 1, math.MaxInt - 2}
+
+	for _, attempts := range attemptsList {
 		env := testEnv(fmt.Sprintf("attempts-%d", attempts))
 
 		env.Attempts = attempts
@@ -5638,7 +5702,9 @@ func TestPhysicalSpoolCountsEveryNamespace(t *testing.T) {
 
 	before := q.SpoolStats().Used
 
-	for _, dir := range []string{q.ready, q.tmp, q.dsn, q.dead, q.corr, q.trash} {
+	dirs := []string{q.ready, q.tmp, q.dsn, q.dead, q.corr, q.trash}
+
+	for _, dir := range dirs {
 		err := os.WriteFile(filepath.Join(dir, "usage"), []byte("x"), 0600)
 		if err != nil {
 			t.Fatal(err)
@@ -5741,7 +5807,9 @@ func TestRetryAndBuryMetadataFaultsDoNotGrowCachedUsage(t *testing.T) {
 		},
 	}
 
-	for _, operation := range []string{"retry", "bury"} {
+	operations := []string{"retry", "bury"}
+
+	for _, operation := range operations {
 		for _, fault := range faults {
 			t.Run(operation+"/"+fault.name, func(t *testing.T) {
 				clearHooks(t)
@@ -6135,7 +6203,9 @@ func TestPruneValidatesOnlyExpiredDeadCandidates(t *testing.T) {
 	expired := testEnv("expired-dead")
 	retained := testEnv("retained-dead-unread")
 
-	for _, envelope := range []*Envelope{expired, retained} {
+	envelopes := []*Envelope{expired, retained}
+
+	for _, envelope := range envelopes {
 		err := q.Add(envelope, []byte("body"))
 		if err != nil {
 			t.Fatal(err)
@@ -6169,7 +6239,8 @@ func TestPruneValidatesOnlyExpiredDeadCandidates(t *testing.T) {
 		t.Fatalf("Prune dead=%d err=%v", dead, err)
 	}
 
-	if _, err := os.Stat(filepath.Join(q.dead, retained.ID)); err != nil {
+	_, err = os.Stat(filepath.Join(q.dead, retained.ID))
+	if err != nil {
 		t.Fatalf("retained dead entry changed: %v", err)
 	}
 }
@@ -6211,7 +6282,8 @@ func TestPruneQuarantinesExpiredCorruptDeadCandidate(t *testing.T) {
 		t.Fatalf("Prune dead=%d err=%v", dead, err)
 	}
 
-	if _, err := os.Stat(filepath.Join(q.dead, envelope.ID)); !errors.Is(err, os.ErrNotExist) {
+	_, err = os.Stat(filepath.Join(q.dead, envelope.ID))
+	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("corrupt dead entry remains: %v", err)
 	}
 
@@ -6278,11 +6350,13 @@ func TestPrunePreservesBlockedReadyDeadConflict(t *testing.T) {
 		t.Fatalf("Prune dead=%d err=%v", deadCount, err)
 	}
 
-	if _, err := os.Stat(readyDir); err != nil {
+	_, err = os.Stat(readyDir)
+	if err != nil {
 		t.Fatalf("blocked ready entry changed: %v", err)
 	}
 
-	if _, err := os.Stat(deadDir); err != nil {
+	_, err = os.Stat(deadDir)
+	if err != nil {
 		t.Fatalf("blocked dead entry changed: %v", err)
 	}
 }
@@ -6378,7 +6452,8 @@ func TestLinkedDeadSourceOperationsRequireCompletedDSN(t *testing.T) {
 				}
 
 				if !state.wantError && operation.name == "revive" {
-					if _, err := os.Stat(filepath.Join(root, dirReady, source.ID)); err != nil {
+					_, err = os.Stat(filepath.Join(root, dirReady, source.ID))
+					if err != nil {
 						t.Fatalf("completed source was not revived: %v", err)
 					}
 				}
@@ -6395,7 +6470,9 @@ func TestLinkedDeadSourceOperationsRequireCompletedDSN(t *testing.T) {
 }
 
 func TestDeadGeneratedDSNDeletion(t *testing.T) {
-	for _, operation := range []string{"delete", "prune"} {
+	operations := []string{"delete", "prune"}
+
+	for _, operation := range operations {
 		t.Run(operation, func(t *testing.T) {
 			clearHooks(t)
 
@@ -6431,7 +6508,8 @@ func TestDeadGeneratedDSNDeletion(t *testing.T) {
 				}
 			}
 
-			if _, err := os.Stat(filepath.Join(root, dirDead, dsn.ID)); !errors.Is(err, os.ErrNotExist) {
+			_, err := os.Stat(filepath.Join(root, dirDead, dsn.ID))
+			if !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("generated DSN remains: %v", err)
 			}
 		})
@@ -6443,7 +6521,9 @@ func TestFailedQuarantineBlocksBadEntryAndLoadsValidEntry(t *testing.T) {
 
 	root := t.TempDir()
 
-	for _, dir := range []string{dirReady, dirDead, dirTmp, dirDSN, dirCorrupt, dirTrash} {
+	dirs := []string{dirReady, dirDead, dirTmp, dirDSN, dirCorrupt, dirTrash}
+
+	for _, dir := range dirs {
 		err := os.MkdirAll(filepath.Join(root, dir), 0700)
 		if err != nil {
 			t.Fatal(err)
@@ -6553,7 +6633,9 @@ func TestFailedInvalidDeadQuarantineDoesNotAbortRecovery(t *testing.T) {
 
 	root := t.TempDir()
 
-	for _, dir := range []string{dirReady, dirDead, dirTmp, dirDSN, dirCorrupt, dirTrash} {
+	dirs := []string{dirReady, dirDead, dirTmp, dirDSN, dirCorrupt, dirTrash}
+
+	for _, dir := range dirs {
 		err := os.MkdirAll(filepath.Join(root, dir), 0700)
 		if err != nil {
 			t.Fatal(err)
@@ -6640,6 +6722,7 @@ func TestQueueCrashHelper(t *testing.T) {
 
 			return nil
 		}})
+
 		_ = q.Add(testEnv("crash-add"), []byte("body"))
 	case "add-after-accept-sync":
 		state := filepath.Join(root, dirReady, "crash-accepted", addStateName)
@@ -6670,6 +6753,7 @@ func TestQueueCrashHelper(t *testing.T) {
 
 			return nil
 		}})
+
 		_ = q.Retry(env)
 	case "finish-before-source-sync", "finish-after-source-sync":
 		env, nextErr := q.Next(context.Background())
@@ -6718,6 +6802,7 @@ func runQueueCrash(t *testing.T, root, scenario string) {
 	cmd.Env = append(os.Environ(), "OUTBOXD_QUEUE_CRASH_ROOT="+root, "OUTBOXD_QUEUE_CRASH_SCENARIO="+scenario)
 
 	err = cmd.Run()
+
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		t.Fatalf("crash helper %s timed out", scenario)
 	}
@@ -6730,13 +6815,16 @@ func runQueueCrash(t *testing.T, root, scenario string) {
 }
 
 func TestQueueSubprocessCrashRecovery(t *testing.T) {
-	for _, scenario := range []string{"add-after-rename", "add-after-accept-sync", "retry-after-meta-rename", "finish-before-source-sync", "finish-after-source-sync"} {
+	scenarios := []string{"add-after-rename", "add-after-accept-sync", "retry-after-meta-rename", "finish-before-source-sync", "finish-after-source-sync"}
+
+	for _, scenario := range scenarios {
 		t.Run(scenario, func(t *testing.T) {
 			clearHooks(t)
 
 			root := t.TempDir()
 
 			q := mustOpen(t, root, Limits{})
+
 			if strings.HasPrefix(scenario, "retry-") {
 				err := q.Add(testEnv("crash-retry"), []byte("body"))
 				if err != nil {
@@ -6800,7 +6888,9 @@ func TestAddDSNRequiresFreshSourceDurabilityBarrier(t *testing.T) {
 	q := mustOpen(t, root, Limits{})
 
 	source := testEnv("dsn-fresh-barrier")
-	if err := q.Add(source, []byte("source")); err != nil {
+
+	err := q.Add(source, []byte("source"))
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -6820,12 +6910,13 @@ func TestAddDSNRequiresFreshSourceDurabilityBarrier(t *testing.T) {
 		return nil
 	}})
 
-	err := q.AddDSN(source, dsn, []byte("dsn"))
+	err = q.AddDSN(source, dsn, []byte("dsn"))
 	if err == nil {
 		t.Fatal("AddDSN succeeded across failed source directory sync")
 	}
 
-	if _, err := os.Stat(filepath.Join(root, dirReady, dsn.ID)); !errors.Is(err, os.ErrNotExist) {
+	_, err = os.Stat(filepath.Join(root, dirReady, dsn.ID))
+	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("DSN was published after ambiguous source sync: %v", err)
 	}
 
@@ -6869,7 +6960,9 @@ func TestAddDSNRequiresFreshSourceDurabilityBarrier(t *testing.T) {
 }
 
 func TestRecoverDSNAmbiguousSourceImages(t *testing.T) {
-	for _, durableLinked := range []bool{false, true} {
+	cases := []bool{false, true}
+
+	for _, durableLinked := range cases {
 		t.Run(fmt.Sprintf("linked=%t", durableLinked), func(t *testing.T) {
 			clearHooks(t)
 
@@ -6927,6 +7020,7 @@ func TestRecoverDSNAmbiguousSourceImages(t *testing.T) {
 			reopened := mustOpen(t, root, Limits{})
 
 			_, readyErr := os.Stat(filepath.Join(root, dirReady, dsn.ID))
+
 			if durableLinked {
 				if readyErr != nil || reopened.Len() != 2 {
 					t.Fatalf("linked image was not published: Len=%d err=%v Corrupt=%v", reopened.Len(), readyErr, reopened.Corrupt)
@@ -6939,7 +7033,9 @@ func TestRecoverDSNAmbiguousSourceImages(t *testing.T) {
 }
 
 func TestCorruptionTypingAndCheckedOutQuarantine(t *testing.T) {
-	for _, relocationFails := range []bool{false, true} {
+	cases := []bool{false, true}
+
+	for _, relocationFails := range cases {
 		t.Run(fmt.Sprintf("relocation-fails=%t", relocationFails), func(t *testing.T) {
 			clearHooks(t)
 
@@ -7029,7 +7125,8 @@ func TestAddFinishRestoresExactCachedPhysicalUsage(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if got := q.SpoolStats(); got.Used != baseline || got.Reserved != 0 {
+		got := q.SpoolStats()
+		if got.Used != baseline || got.Reserved != 0 {
 			t.Fatalf("cycle %d usage=%+v baseline=%d", i, got, baseline)
 		}
 	}
@@ -7090,7 +7187,8 @@ func TestOpenForMaintenanceAndDeadValidation(t *testing.T) {
 		t.Fatalf("maintenance open pruned valid dead entry: %v", err)
 	}
 
-	if _, err := os.Stat(invalid); !errors.Is(err, os.ErrNotExist) || len(maintenance.Corrupt) == 0 {
+	_, err = os.Stat(invalid)
+	if !errors.Is(err, os.ErrNotExist) || len(maintenance.Corrupt) == 0 {
 		t.Fatalf("invalid dead was not classified: stat=%v Corrupt=%v", err, maintenance.Corrupt)
 	}
 
@@ -7101,7 +7199,8 @@ func TestOpenForMaintenanceAndDeadValidation(t *testing.T) {
 
 	_ = mustOpen(t, root, limits)
 
-	if _, err := os.Stat(filepath.Join(root, dirDead, valid.ID)); !errors.Is(err, os.ErrNotExist) {
+	_, err = os.Stat(filepath.Join(root, dirDead, valid.ID))
+	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("normal Open did not prune retained dead entry: %v", err)
 	}
 }
@@ -7198,7 +7297,9 @@ func TestSchedulingRoundRobinsDueUsers(t *testing.T) {
 	b1.Username = "bob"
 	b1.NextAttempt = now.Add(-2 * time.Minute)
 
-	for _, env := range []*Envelope{a1, a2, b1} {
+	envelopes := []*Envelope{a1, a2, b1}
+
+	for _, env := range envelopes {
 		err := q.Add(env, []byte(env.ID))
 		if err != nil {
 			t.Fatal(err)
@@ -7291,7 +7392,8 @@ func TestAddContextCanceledBeforeAcceptanceQuarantinesUnacceptedReady(t *testing
 		t.Fatalf("AddContext error=%v want context.Canceled", err)
 	}
 
-	if _, err := os.Stat(readyDir); !errors.Is(err, os.ErrNotExist) {
+	_, err = os.Stat(readyDir)
+	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("unaccepted ready entry remains: %v", err)
 	}
 
@@ -7299,7 +7401,8 @@ func TestAddContextCanceledBeforeAcceptanceQuarantinesUnacceptedReady(t *testing
 		t.Fatalf("unaccepted entry was scheduled: Len=%d", q.Len())
 	}
 
-	if stats := q.SpoolStats(); stats.Reserved != 0 {
+	stats := q.SpoolStats()
+	if stats.Reserved != 0 {
 		t.Fatalf("canceled AddContext retained reservation: %+v", stats)
 	}
 
@@ -7309,7 +7412,9 @@ func TestAddContextCanceledBeforeAcceptanceQuarantinesUnacceptedReady(t *testing
 	}
 
 	wantDelta := estimatePersistentEntryAllocation(env.Size, len(meta))
-	if delta := q.SpoolStats().Used - before; delta != wantDelta {
+
+	delta := q.SpoolStats().Used - before
+	if delta != wantDelta {
 		t.Fatalf("canceled Add physical delta=%d want persistent-only %d", delta, wantDelta)
 	}
 
@@ -7440,7 +7545,9 @@ func TestRecoveryPreservesTransientlyUnreadableEntries(t *testing.T) {
 
 	unrelated := testEnv("transient-unrelated")
 
-	for _, env := range []*Envelope{source, readyBlocked, deadBlocked, unrelated} {
+	envelopes := []*Envelope{source, readyBlocked, deadBlocked, unrelated}
+
+	for _, env := range envelopes {
 		err := q.Add(env, []byte("body"))
 		if err != nil {
 			t.Fatal(err)
@@ -7454,7 +7561,8 @@ func TestRecoveryPreservesTransientlyUnreadableEntries(t *testing.T) {
 		t.Fatalf("dead checkout=%v err=%v", checkedOutDead, err)
 	}
 
-	if err := q.Bury(checkedOutDead); err != nil {
+	err = q.Bury(checkedOutDead)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -7512,8 +7620,11 @@ func TestRecoveryPreservesTransientlyUnreadableEntries(t *testing.T) {
 		t.Fatalf("unrelated checkout=%v err=%v", next, err)
 	}
 
-	for _, path := range []string{stagePath, filepath.Join(root, dirReady, source.ID), filepath.Join(root, dirReady, readyBlocked.ID), filepath.Join(root, dirDead, deadBlocked.ID)} {
-		if _, err := os.Stat(path); err != nil {
+	paths := []string{stagePath, filepath.Join(root, dirReady, source.ID), filepath.Join(root, dirReady, readyBlocked.ID), filepath.Join(root, dirDead, deadBlocked.ID)}
+
+	for _, path := range paths {
+		_, err = os.Stat(path)
+		if err != nil {
 			t.Fatalf("transient recovery relocated %s: %v", path, err)
 		}
 	}
@@ -7589,8 +7700,11 @@ func TestRecoverDSNPreservesLinkedPairOnTransientSourceRead(t *testing.T) {
 		t.Fatalf("Len=%d warnings=%v corrupt=%v", reopened.Len(), reopened.Warnings, reopened.Corrupt)
 	}
 
-	for _, path := range []string{stagePath, filepath.Join(root, dirReady, source.ID)} {
-		if _, err := os.Stat(path); err != nil {
+	paths := []string{stagePath, filepath.Join(root, dirReady, source.ID)}
+
+	for _, path := range paths {
+		_, err = os.Stat(path)
+		if err != nil {
 			t.Fatalf("linked pair was relocated after transient source read: %s: %v", path, err)
 		}
 	}
@@ -7606,7 +7720,9 @@ func TestRecoverCorruptDSNBlocksCandidatesAfterOneShotReadFault(t *testing.T) {
 	source := testEnv("corrupt-dsn-uncertain-source")
 	unrelated := testEnv("corrupt-dsn-unrelated")
 
-	for _, env := range []*Envelope{source, unrelated} {
+	envelopes := []*Envelope{source, unrelated}
+
+	for _, env := range envelopes {
 		err := q.Add(env, []byte("body"))
 		if err != nil {
 			t.Fatal(err)
@@ -7667,14 +7783,18 @@ func TestRecoverCorruptDSNBlocksCandidatesAfterOneShotReadFault(t *testing.T) {
 		t.Fatalf("Len=%d want no entries after incomplete source scan; warnings=%v corrupt=%v", reopened.Len(), reopened.Warnings, reopened.Corrupt)
 	}
 
-	if _, err := os.Stat(stagePath); err != nil {
+	_, err = os.Stat(stagePath)
+	if err != nil {
 		t.Fatalf("uncertain corrupt stage was relocated: %v", err)
 	}
 
-	if _, err := os.Stat(filepath.Join(root, dirReady, source.ID)); err != nil {
+	_, err = os.Stat(filepath.Join(root, dirReady, source.ID))
+	if err != nil {
 		t.Fatalf("uncertain source was relocated: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, dirReady, unrelated.ID)); err != nil {
+
+	_, err = os.Stat(filepath.Join(root, dirReady, unrelated.ID))
+	if err != nil {
 		t.Fatalf("unrelated candidate was relocated: %v", err)
 	}
 
@@ -7722,7 +7842,9 @@ func TestMetadataReplacementPhysicalAccountingAcrossAllocationBoundary(t *testin
 		}
 
 		newBytes, _ := disk.AllocatedBytes(dir)
-		if delta := q.SpoolStats().Used - before; delta != newBytes-oldBytes || delta <= 0 {
+
+		delta := q.SpoolStats().Used - before
+		if delta != newBytes-oldBytes || delta <= 0 {
 			t.Fatalf("retry growth delta=%d actual=%d", delta, newBytes-oldBytes)
 		}
 
@@ -7743,7 +7865,9 @@ func TestMetadataReplacementPhysicalAccountingAcrossAllocationBoundary(t *testin
 		}
 
 		newBytes, _ = disk.AllocatedBytes(dir)
-		if delta := q.SpoolStats().Used - before; delta != newBytes-oldBytes || delta >= 0 {
+
+		delta = q.SpoolStats().Used - before
+		if delta != newBytes-oldBytes || delta >= 0 {
 			t.Fatalf("retry shrink delta=%d actual=%d", delta, newBytes-oldBytes)
 		}
 
@@ -7752,7 +7876,8 @@ func TestMetadataReplacementPhysicalAccountingAcrossAllocationBoundary(t *testin
 			t.Fatal(err)
 		}
 
-		if used := q.SpoolStats().Used; used != baseline {
+		used := q.SpoolStats().Used
+		if used != baseline {
 			t.Fatalf("retry deletion usage=%d baseline=%d", used, baseline)
 		}
 	})
@@ -7800,7 +7925,9 @@ func TestMetadataReplacementPhysicalAccountingAcrossAllocationBoundary(t *testin
 		}
 
 		newBytes, _ := disk.AllocatedBytes(dir)
-		if delta := q.SpoolStats().Used - before; delta < newBytes-oldBytes {
+
+		delta := q.SpoolStats().Used - before
+		if delta < newBytes-oldBytes {
 			t.Fatalf("ambiguous Retry undercounted: delta=%d actual=%d", delta, newBytes-oldBytes)
 		}
 
@@ -7811,7 +7938,8 @@ func TestMetadataReplacementPhysicalAccountingAcrossAllocationBoundary(t *testin
 			t.Fatal(err)
 		}
 
-		if used := q.SpoolStats().Used; used != baseline {
+		used := q.SpoolStats().Used
+		if used != baseline {
 			t.Fatalf("ambiguous retry deletion usage=%d baseline=%d", used, baseline)
 		}
 	})
@@ -7854,7 +7982,9 @@ func TestMetadataReplacementPhysicalAccountingAcrossAllocationBoundary(t *testin
 		deadDir := filepath.Join(root, dirDead, env.ID)
 
 		deadBytes, _ := disk.AllocatedBytes(deadDir)
-		if delta := q.SpoolStats().Used - before; delta != deadBytes-oldBytes || delta <= 0 {
+
+		delta := q.SpoolStats().Used - before
+		if delta != deadBytes-oldBytes || delta <= 0 {
 			t.Fatalf("bury growth delta=%d actual=%d", delta, deadBytes-oldBytes)
 		}
 
@@ -7866,7 +7996,9 @@ func TestMetadataReplacementPhysicalAccountingAcrossAllocationBoundary(t *testin
 		}
 
 		readyBytes, _ := disk.AllocatedBytes(readyDir)
-		if delta := q.SpoolStats().Used - before; delta != readyBytes-deadBytes || delta >= 0 {
+
+		delta = q.SpoolStats().Used - before
+		if delta != readyBytes-deadBytes || delta >= 0 {
 			t.Fatalf("revive shrink delta=%d actual=%d", delta, readyBytes-deadBytes)
 		}
 
@@ -7875,7 +8007,8 @@ func TestMetadataReplacementPhysicalAccountingAcrossAllocationBoundary(t *testin
 			t.Fatal(err)
 		}
 
-		if used := q.SpoolStats().Used; used != baseline {
+		used := q.SpoolStats().Used
+		if used != baseline {
 			t.Fatalf("revive deletion usage=%d baseline=%d", used, baseline)
 		}
 	})
@@ -7951,7 +8084,9 @@ func TestMetadataReplacementPhysicalAccountingAcrossAllocationBoundary(t *testin
 		dsnBytes, _ := disk.AllocatedBytes(filepath.Join(root, dirReady, dsn.ID))
 
 		want := newSourceBytes - oldSourceBytes + dsnBytes
-		if delta := q.SpoolStats().Used - before; delta != want || newSourceBytes <= oldSourceBytes {
+
+		delta := q.SpoolStats().Used - before
+		if delta != want || newSourceBytes <= oldSourceBytes {
 			t.Fatalf("DSN link delta=%d want=%d source old=%d new=%d", delta, want, oldSourceBytes, newSourceBytes)
 		}
 
@@ -7965,14 +8100,17 @@ func TestMetadataReplacementPhysicalAccountingAcrossAllocationBoundary(t *testin
 			t.Fatal(err)
 		}
 
-		if used := q.SpoolStats().Used; used != baseline {
+		used := q.SpoolStats().Used
+		if used != baseline {
 			t.Fatalf("DSN deletion usage=%d baseline=%d", used, baseline)
 		}
 	})
 }
 
 func TestAcceptanceUnknownRecoversFinalSyncDurableImages(t *testing.T) {
-	for _, durableAccepted := range []bool{false, true} {
+	cases := []bool{false, true}
+
+	for _, durableAccepted := range cases {
 		t.Run(fmt.Sprintf("accepted=%t", durableAccepted), func(t *testing.T) {
 			clearHooks(t)
 

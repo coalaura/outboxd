@@ -186,6 +186,7 @@ func deadList(spool *queue.Queue) error {
 
 	if len(ids) == 0 {
 		fmt.Println("(no dead-letter messages)")
+
 		return nil
 	}
 
@@ -197,6 +198,7 @@ func deadList(spool *queue.Queue) error {
 		env, err := spool.LoadDead(id)
 		if err != nil {
 			fmt.Fprintf(w, "%s\t?\t?\t%v\n", id, err)
+
 			continue
 		}
 

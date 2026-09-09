@@ -42,6 +42,7 @@ func (q *Queue) pruneNamespace(namespace string, retention time.Duration, now ti
 	}
 
 	initialDead := make(map[string]struct{})
+
 	if namespace == q.dead {
 		for _, entry := range entries {
 			initialDead[entry.Name()] = struct{}{}

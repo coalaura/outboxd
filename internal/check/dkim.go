@@ -11,6 +11,7 @@ import (
 
 func checkDKIM(ctx context.Context, r Resolver, cfg *config.Config, key *DKIMKey) []Result {
 	selector := cfg.DKIM.Selector
+
 	if key != nil && key.Selector != "" {
 		selector = key.Selector
 	}

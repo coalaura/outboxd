@@ -167,7 +167,8 @@ func TestListedOnlyRejections(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		if got := smtpCommand(t, srv, test.recipient); got != test.want {
+		got := smtpCommand(t, srv, test.recipient)
+		if got != test.want {
 			t.Errorf("%s: got %q want %q", test.recipient, got, test.want)
 		}
 	}
@@ -176,7 +177,8 @@ func TestListedOnlyRejections(t *testing.T) {
 func TestAllModeUsesDefaultForUnknownRecipient(t *testing.T) {
 	srv, _, _ := testServer(t, "all")
 
-	if got := smtpCommand(t, srv, "unknown@example.com"); got != "550 5.1.1 This address does not accept replies" {
+	got := smtpCommand(t, srv, "unknown@example.com")
+	if got != "550 5.1.1 This address does not accept replies" {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -220,7 +222,8 @@ func TestRecipientRejectionsAreLogged(t *testing.T) {
 		want += fmt.Sprintf("Reply rejection from %q sender %q recipient %q: %s\n", "192.0.2.10", "sender@example.net", test.recipient, test.reason)
 	}
 
-	if got := log.String(); got != want {
+	got := log.String()
+	if got != want {
 		t.Fatalf("log:\n%s\nwant:\n%s", got, want)
 	}
 
@@ -231,7 +234,8 @@ func TestRecipientRejectionsAreLogged(t *testing.T) {
 		t.Fatal("Rcpt after reset succeeded")
 	}
 
-	if got := log.String(); !strings.HasSuffix(got, "sender \"\" recipient \"unknown@example.com\": recipient does not exist\n") {
+	got = log.String()
+	if !strings.HasSuffix(got, "sender \"\" recipient \"unknown@example.com\": recipient does not exist\n") {
 		t.Fatalf("reset did not clear sender in log: %s", got)
 	}
 }
@@ -254,7 +258,8 @@ func TestAllModeRejectionIsLogged(t *testing.T) {
 		t.Fatal("Rcpt succeeded")
 	}
 
-	if got := log.String(); !strings.Contains(got, "recipient \"unknown@example.com\": default rejection\n") {
+	got := log.String()
+	if !strings.Contains(got, "recipient \"unknown@example.com\": default rejection\n") {
 		t.Fatalf("log=%q", got)
 	}
 }
@@ -275,13 +280,15 @@ func TestDataIsNeverReachable(t *testing.T) {
 
 	readResponse(t, reader, "220")
 
-	for _, command := range []string{
+	commands := []string{
 		"EHLO sender.example\r\n",
 		"MAIL FROM:<sender@example.net>\r\n",
 		"RCPT TO:<anything@example.com>\r\n",
 		"DATA\r\n",
 		"BDAT 0 LAST\r\n",
-	} {
+	}
+
+	for _, command := range commands {
 		fmt.Fprint(conn, command)
 
 		response, readErr := reader.ReadString('\n')
@@ -356,7 +363,7 @@ func TestRejectedRecipientsAreBoundedPerConnection(t *testing.T) {
 	fmt.Fprint(conn, "MAIL FROM:<sender@example.net>\r\n")
 	readResponse(t, reader, "250")
 
-	for i := 0; i < maxCommandsPerConnection-2; i++ {
+	for range maxCommandsPerConnection - 2 {
 		fmt.Fprint(conn, "RCPT TO:<anything@example.com>\r\n")
 		readResponse(t, reader, "550")
 	}

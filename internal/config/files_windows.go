@@ -84,6 +84,7 @@ func openChecked(path string, private, allowSymlink bool) (*os.File, error) {
 	err = windows.GetFileInformationByHandleEx(handle, windows.FileAttributeTagInfo, (*byte)(unsafe.Pointer(&tag)), uint32(unsafe.Sizeof(tag)))
 	if err != nil {
 		windows.CloseHandle(handle)
+
 		return nil, err
 	}
 
@@ -151,11 +152,12 @@ func (cfg Config) CheckGeneratedParents(path string) error {
 	if err != nil {
 		return err
 	}
+
 	if relative == "." {
 		return nil
 	}
 
-	for _, component := range strings.Split(relative, string(filepath.Separator)) {
+	for component := range strings.SplitSeq(relative, string(filepath.Separator)) {
 		child, openErr := disk.OpenDirectoryAt(dir, component)
 		if openErr != nil {
 			_, statErr := os.Lstat(filepath.Join(dir.Name(), component))

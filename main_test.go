@@ -30,10 +30,12 @@ func TestVersionCLI(t *testing.T) {
 		Version = original
 	})
 
-	for name, input := range map[string]versionInput{
+	versionInputs := map[string]versionInput{
 		"flag":    {flag: true},
 		"command": {args: []string{"version"}},
-	} {
+	}
+
+	for name, input := range versionInputs {
 		t.Run(name, func(t *testing.T) {
 			var output bytes.Buffer
 
@@ -46,7 +48,8 @@ func TestVersionCLI(t *testing.T) {
 				t.Fatal("version invocation was not handled")
 			}
 
-			if got := output.String(); got != "v1.2.3\n" {
+			got := output.String()
+			if got != "v1.2.3\n" {
 				t.Fatalf("version output=%q", got)
 			}
 		})
@@ -73,13 +76,16 @@ func TestParseGlobalVersionFlagPreservesCommands(t *testing.T) {
 }
 
 func TestConfiguredLogLevel(t *testing.T) {
-	for value, want := range map[string]plain.Level{
+	logLevels := map[string]plain.Level{
 		"debug": plain.LevelDebug,
 		"print": plain.LevelPrint,
 		"warn":  plain.LevelWarn,
 		"error": plain.LevelError,
-	} {
-		if got := configuredLogLevel(value); got != want {
+	}
+
+	for value, want := range logLevels {
+		got := configuredLogLevel(value)
+		if got != want {
 			t.Errorf("configuredLogLevel(%q)=%v want %v", value, got, want)
 		}
 	}
@@ -135,7 +141,9 @@ func TestConfigUpdatePreservesValuesAndAddsDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, field := range []string{"log_level: print", "reply_rejection:", "max_connections:", "max_connections_per_ip:", "openpgp:", "identities: []"} {
+	wantFields := []string{"log_level: print", "reply_rejection:", "max_connections:", "max_connections_per_ip:", "openpgp:", "identities: []"}
+
+	for _, field := range wantFields {
 		if !bytes.Contains(rewritten, []byte(field)) {
 			t.Fatalf("updated config missing %q", field)
 		}
@@ -151,8 +159,11 @@ func TestConfigUpdateRequiresExistingValidConfig(t *testing.T) {
 		t.Fatal("config update created a missing config")
 	}
 
-	for _, candidate := range []string{path, path + ".lock"} {
-		if _, statErr := os.Stat(candidate); !os.IsNotExist(statErr) {
+	lockCandidates := []string{path, path + ".lock"}
+
+	for _, candidate := range lockCandidates {
+		_, statErr := os.Stat(candidate)
+		if !os.IsNotExist(statErr) {
 			t.Fatalf("config update created %s: %v", candidate, statErr)
 		}
 	}
@@ -183,7 +194,9 @@ func TestConfigUpdateRequiresExistingValidConfig(t *testing.T) {
 }
 
 func TestConfigCommandRequiresExactArguments(t *testing.T) {
-	for _, args := range [][]string{nil, {"update", "extra"}, {"unknown"}} {
+	badArgs := [][]string{nil, {"update", "extra"}, {"unknown"}}
+
+	for _, args := range badArgs {
 		err := configCommand("unused.yml", args)
 		if err == nil || err.Error() != "usage: outboxd config update" {
 			t.Fatalf("args=%q error=%v", args, err)
@@ -361,10 +374,12 @@ func TestOperationsRejectLinkedDataDirectory(t *testing.T) {
 		t.Skipf("cannot create test data-directory link: %v", err)
 	}
 
-	for name, operation := range map[string]func(string) error{
+	operations := map[string]func(string) error{
 		"provision": provision,
 		"dns":       dns,
-	} {
+	}
+
+	for name, operation := range operations {
 		t.Run(name, func(t *testing.T) {
 			err := operation(path)
 			if err == nil || !strings.Contains(err.Error(), "symbolic link or reparse point") {
@@ -373,8 +388,11 @@ func TestOperationsRejectLinkedDataDirectory(t *testing.T) {
 		})
 	}
 
-	for _, path := range []string{"queue", cfg.DKIM.PrivateKeyFile, cfg.DNS.OutputFile} {
-		if _, err := os.Lstat(filepath.Join(target, path)); !os.IsNotExist(err) {
+	managedPaths := []string{"queue", cfg.DKIM.PrivateKeyFile, cfg.DNS.OutputFile}
+
+	for _, path := range managedPaths {
+		_, err := os.Lstat(filepath.Join(target, path))
+		if !os.IsNotExist(err) {
 			t.Fatalf("operation created output below linked data directory %s: %v", path, err)
 		}
 	}
@@ -399,7 +417,8 @@ func TestProvisionCreatesDKIMKeyOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err = os.Stat(keyPath); !os.IsNotExist(err) {
+	_, err = os.Stat(keyPath)
+	if !os.IsNotExist(err) {
 		t.Fatalf("first provision must stop after creating config: %v", err)
 	}
 
@@ -478,11 +497,13 @@ func TestServeDoesNotGenerateMissingDKIMKeyOrReplaceDNS(t *testing.T) {
 		t.Fatalf("serve with missing DKIM key error=%v", err)
 	}
 
-	if _, err = os.Stat(keyPath); !os.IsNotExist(err) {
+	_, err = os.Stat(keyPath)
+	if !os.IsNotExist(err) {
 		t.Fatalf("serve generated missing DKIM key: %v", err)
 	}
 
-	if info, statErr := os.Stat(path + ".outboxd.lock"); statErr != nil || !info.Mode().IsRegular() {
+	info, statErr := os.Stat(path + ".outboxd.lock")
+	if statErr != nil || !info.Mode().IsRegular() {
 		t.Fatalf("serve did not create regular ownership lock: info=%v err=%v", info, statErr)
 	}
 
@@ -505,11 +526,13 @@ func TestServeMissingConfigDoesNotCreateIt(t *testing.T) {
 		t.Fatal("serve with missing config succeeded")
 	}
 
-	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+	_, statErr := os.Stat(path)
+	if !os.IsNotExist(statErr) {
 		t.Fatalf("serve created missing config: %v", statErr)
 	}
 
-	if _, statErr := os.Stat(path + ".outboxd.lock"); !os.IsNotExist(statErr) {
+	_, statErr = os.Stat(path + ".outboxd.lock")
+	if !os.IsNotExist(statErr) {
 		t.Fatalf("serve created ownership lock for missing config: %v", statErr)
 	}
 }
@@ -590,6 +613,7 @@ func filesystemSnapshot(t *testing.T, root string) []string {
 		}
 
 		entry := rel + ":" + info.Mode().String()
+
 		if !info.IsDir() {
 			body, err := os.ReadFile(path)
 			if err != nil {
@@ -694,8 +718,11 @@ func TestServeLocksQueueBeforeGeneratingAssets(t *testing.T) {
 	tlsKey := cfg.ResolvePath(cfg.TLS.PrivateKeyFile)
 	dnsOut := cfg.ResolvePath(cfg.DNS.OutputFile)
 
-	for _, p := range []string{tlsCert, tlsKey, dnsOut} {
-		if _, err = os.Stat(p); !os.IsNotExist(err) {
+	assetPaths := []string{tlsCert, tlsKey, dnsOut}
+
+	for _, p := range assetPaths {
+		_, err = os.Stat(p)
+		if !os.IsNotExist(err) {
 			t.Fatalf("asset must not exist before serve: %s (%v)", p, err)
 		}
 	}
@@ -705,8 +732,9 @@ func TestServeLocksQueueBeforeGeneratingAssets(t *testing.T) {
 		t.Fatalf("serve want ErrLocked, got %v", err)
 	}
 
-	for _, p := range []string{tlsCert, tlsKey, dnsOut} {
-		if _, err = os.Stat(p); !os.IsNotExist(err) {
+	for _, p := range assetPaths {
+		_, err = os.Stat(p)
+		if !os.IsNotExist(err) {
 			t.Fatalf("asset created despite lock failure: %s (%v)", p, err)
 		}
 	}

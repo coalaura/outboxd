@@ -33,7 +33,9 @@ func TestMessageBodyVariantsAreReadIndependently(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for index, want := range [][]byte{first, second} {
+	wants := [][]byte{first, second}
+
+	for index, want := range wants {
 		reader, err := q.ReaderVariant(envelope.ID, index)
 		if err != nil {
 			t.Fatal(err)

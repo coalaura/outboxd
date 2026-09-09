@@ -92,7 +92,8 @@ func TestOptionalDebugLogger(t *testing.T) {
 
 	deliverer.debugf("delivery timing: %s\n", time.Second)
 
-	if got := logger.String(); got != "delivery timing: 1s\n" {
+	got := logger.String()
+	if got != "delivery timing: 1s\n" {
 		t.Fatalf("debug log=%q", got)
 	}
 }
@@ -142,6 +143,7 @@ func servePlainSMTP(conn net.Conn, accepted chan<- struct{}, dataBytes chan<- st
 			_, _ = io.WriteString(conn, "250 ok\r\n")
 		case strings.HasPrefix(line, "DATA"):
 			_, _ = io.WriteString(conn, "354 go\r\n")
+
 			if accepted != nil {
 				accepted <- struct{}{}
 			}
@@ -316,7 +318,8 @@ func TestAttemptCancellationPreservesPartialMultiDomainProgress(t *testing.T) {
 
 	d := New(cfg, q, nopLogger{})
 
-	ipA, ipB := net.ParseIP("127.0.0.1"), net.ParseIP("127.0.0.2")
+	ipA := net.ParseIP("127.0.0.1")
+	ipB := net.ParseIP("127.0.0.2")
 
 	d.SetResolver(&fixedResolver{
 		mx: map[string][]*net.MX{
@@ -498,7 +501,9 @@ func TestDataCopyErrorAbortsWithoutTerminator(t *testing.T) {
 		return client, nil
 	}))
 
-	d.reader = func(string, int) (io.ReadCloser, error) { return io.NopCloser(&failingBody{}), nil }
+	d.reader = func(string, int) (io.ReadCloser, error) {
+		return io.NopCloser(&failingBody{}), nil
+	}
 
 	env := hardeningEnvelope("copy-error", time.Now(), queue.Recipient{
 		Address: "r@ex.com",
@@ -520,10 +525,12 @@ func TestDataCopyErrorAbortsWithoutTerminator(t *testing.T) {
 }
 
 func TestDataLengthMismatchAbortsWithoutTerminator(t *testing.T) {
-	for _, tt := range []dataLengthMismatchCase{
+	cases := []dataLengthMismatchCase{
 		{name: "short", body: "four", want: errBodyTooShort},
 		{name: "long", body: "sixsix", want: errBodyTooLong},
-	} {
+	}
+
+	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			q, err := queue.Open(t.TempDir(), queue.Limits{})
 			if err != nil {
@@ -698,7 +705,8 @@ func TestRunDomainAdmissionFairAtMinimumAttemptCapacity(t *testing.T) {
 
 	cancel()
 
-	if err := <-done; err != nil {
+	err = <-done
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -872,7 +880,8 @@ func TestRunMixedDomainAdmissionDoesNotCaptureLaterDomainCapacity(t *testing.T) 
 
 	cancel()
 
-	if err := <-done; err != nil {
+	err = <-done
+	if err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1052,7 +1061,9 @@ func TestAttemptAllTemporaryRCPTPreservesDetailsAndAggregateDiagnostic(t *testin
 		}
 	}
 
-	for _, diagnostic := range []string{"temporary RCPT failures", "a@temp.test", "b@temp.test", "451 4.7.1 greylisted"} {
+	diagnostics := []string{"temporary RCPT failures", "a@temp.test", "b@temp.test", "451 4.7.1 greylisted"}
+
+	for _, diagnostic := range diagnostics {
 		if !strings.Contains(got.LastError, diagnostic) {
 			t.Fatalf("LastError=%q missing %q", got.LastError, diagnostic)
 		}
@@ -1273,6 +1284,7 @@ func TestSMTPResponseBounds(t *testing.T) {
 
 	t.Run("banner", func(t *testing.T) {
 		client, server := net.Pipe()
+
 		go func() {
 			defer server.Close()
 
@@ -1290,6 +1302,7 @@ func TestSMTPResponseBounds(t *testing.T) {
 
 	t.Run("multiline EHLO", func(t *testing.T) {
 		client, server := net.Pipe()
+
 		go func() {
 			defer server.Close()
 
@@ -1420,7 +1433,8 @@ func TestRunQuarantinesCorruptBodyAndContinues(t *testing.T) {
 
 	d := New(testDeliverCfg(), q, log)
 
-	badIP, goodIP := net.ParseIP("127.0.0.1"), net.ParseIP("127.0.0.2")
+	badIP := net.ParseIP("127.0.0.1")
+	goodIP := net.ParseIP("127.0.0.2")
 
 	d.SetResolver(&fixedResolver{
 		mx: map[string][]*net.MX{
@@ -1503,7 +1517,8 @@ func TestRunQuarantinesCorruptBodyAndContinues(t *testing.T) {
 
 	cancel()
 
-	if err := <-done; err != nil {
+	err = <-done
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -1632,7 +1647,8 @@ func TestPerUserDeliveryIsolation(t *testing.T) {
 
 	cancel()
 
-	if err := <-done; err != nil {
+	err = <-done
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -1662,7 +1678,10 @@ func TestCandidateCeilings(t *testing.T) {
 
 	d := New(cfg, q, nopLogger{})
 
-	var addressLookups, dials atomic.Int32
+	var (
+		addressLookups atomic.Int32
+		dials          atomic.Int32
+	)
 
 	d.SetResolver(resolverFuncs{
 		mx: func(context.Context, string) ([]*net.MX, error) {
@@ -1740,8 +1759,13 @@ func TestMXEqualPreferenceOrderingBeforeTruncation(t *testing.T) {
 	d.orderMX = func(records []*net.MX) {
 		groups = append(groups, records[0].Pref)
 
-		for left, right := 0, len(records)-1; left < right; left, right = left+1, right-1 {
+		left := 0
+		right := len(records) - 1
+
+		for left < right {
 			records[left], records[right] = records[right], records[left]
+			left++
+			right--
 		}
 	}
 
@@ -1750,8 +1774,9 @@ func TestMXEqualPreferenceOrderingBeforeTruncation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got, want := candidateHostList(hosts), "c.test,b.test,a.test,e.test"; got != want {
-		t.Fatalf("MX cap/order=%q want %q", got, want)
+	got := candidateHostList(hosts)
+	if got != "c.test,b.test,a.test,e.test" {
+		t.Fatalf("MX cap/order=%q want %q", got, "c.test,b.test,a.test,e.test")
 	}
 
 	if fmt.Sprint(groups) != "[10 20 30]" {
@@ -1824,8 +1849,13 @@ func TestMXEqualPreferenceCandidatesCanRotateAcrossRetries(t *testing.T) {
 		}
 
 		if calls == 1 {
-			for left, right := 0, len(records)-1; left < right; left, right = left+1, right-1 {
+			left := 0
+			right := len(records) - 1
+
+			for left < right {
 				records[left], records[right] = records[right], records[left]
+				left++
+				right--
 			}
 		}
 	}
@@ -1840,12 +1870,14 @@ func TestMXEqualPreferenceCandidatesCanRotateAcrossRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got, want := candidateHostList(first), "d.test,c.test"; got != want {
-		t.Fatalf("first retry MXs=%q want %q", got, want)
+	got := candidateHostList(first)
+	if got != "d.test,c.test" {
+		t.Fatalf("first retry MXs=%q want %q", got, "d.test,c.test")
 	}
 
-	if got, want := candidateHostList(second), "a.test,b.test"; got != want {
-		t.Fatalf("second retry MXs=%q want %q", got, want)
+	got = candidateHostList(second)
+	if got != "a.test,b.test" {
+		t.Fatalf("second retry MXs=%q want %q", got, "a.test,b.test")
 	}
 }
 
@@ -1891,8 +1923,9 @@ func TestClientQuitDoesNotWaitForReply(t *testing.T) {
 		t.Fatal("QUIT waited for a server reply")
 	}
 
-	if line := <-received; line != "QUIT" {
-		t.Fatalf("command=%q want QUIT", line)
+	line := <-received
+	if line != "QUIT" {
+		t.Fatalf("received=%q want QUIT", line)
 	}
 
 	close(release)
@@ -2072,8 +2105,14 @@ func TestIPOrderingRunsBeforeTruncationAndRotatesRetries(t *testing.T) {
 		}
 
 		if calls == 1 {
-			for left, right := 0, len(ips)-1; left < right; left, right = left+1, right-1 {
+			left := 0
+			right := len(ips) - 1
+
+			for left < right {
 				ips[left], ips[right] = ips[right], ips[left]
+
+				left++
+				right--
 			}
 		}
 	}
@@ -2113,6 +2152,7 @@ func TestAttemptTimeoutIsNormalFailure(t *testing.T) {
 	d.SetResolver(resolverFuncs{
 		mx: func(ctx context.Context, _ string) ([]*net.MX, error) {
 			<-ctx.Done()
+
 			return nil, ctx.Err()
 		},
 		ips: func(context.Context, string, string) ([]net.IP, error) {
@@ -2143,7 +2183,9 @@ func TestAttemptTimeoutIsNormalFailure(t *testing.T) {
 }
 
 func TestBlockedOutboundWorkDoesNotBlockUnrelatedDelivery(t *testing.T) {
-	for _, mode := range []string{"resolver", "dial"} {
+	modes := []string{"resolver", "dial"}
+
+	for _, mode := range modes {
 		t.Run(mode, func(t *testing.T) {
 			q, err := queue.Open(t.TempDir(), queue.Limits{})
 			if err != nil {
@@ -2163,7 +2205,8 @@ func TestBlockedOutboundWorkDoesNotBlockUnrelatedDelivery(t *testing.T) {
 
 			d := New(cfg, q, nopLogger{})
 
-			badIP, goodIP := net.ParseIP("127.0.0.1"), net.ParseIP("127.0.0.2")
+			badIP := net.ParseIP("127.0.0.1")
+			goodIP := net.ParseIP("127.0.0.2")
 
 			blockedDone := make(chan struct{}, 1)
 
@@ -2255,7 +2298,8 @@ func TestBlockedOutboundWorkDoesNotBlockUnrelatedDelivery(t *testing.T) {
 
 			cancel()
 
-			if err := <-done; err != nil {
+			err = <-done
+			if err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -2322,7 +2366,9 @@ func TestRestrictedDestinationTable(t *testing.T) {
 func TestBackoffSaturates(t *testing.T) {
 	d := &Deliverer{initial: time.Duration(1 << 62), maximum: time.Duration(1<<63 - 1)}
 
-	for _, attempts := range []int{2, 10, 1000} {
+	attemptsList := []int{2, 10, 1000}
+
+	for _, attempts := range attemptsList {
 		got := d.backoff(attempts)
 		if got < 0 || got > d.maximum {
 			t.Fatalf("backoff(%d)=%s", attempts, got)

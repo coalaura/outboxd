@@ -12,7 +12,10 @@ import (
 func resetHooks(t *testing.T) {
 	t.Helper()
 	SetHooks(Hooks{})
-	t.Cleanup(func() { SetHooks(Hooks{}) })
+
+	t.Cleanup(func() {
+		SetHooks(Hooks{})
+	})
 }
 
 func TestRenameNoReplacePreservesExistingTarget(t *testing.T) {
@@ -36,7 +39,9 @@ func TestRenameNoReplacePreservesExistingTarget(t *testing.T) {
 		t.Fatal("RenameNoReplace() replaced an existing target")
 	}
 
-	for _, path := range []string{source, target} {
+	paths := []string{source, target}
+
+	for _, path := range paths {
 		info, statErr := os.Stat(path)
 		if statErr != nil || !info.IsDir() {
 			t.Fatalf("directory %s was not preserved: info=%v err=%v", path, info, statErr)

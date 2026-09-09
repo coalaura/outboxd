@@ -254,11 +254,14 @@ func (q *Queue) RetryReady(id string) (*Envelope, error) {
 	}
 
 	q.mu.Lock()
-	if queued := q.scheduled[id]; queued != nil {
+
+	queued := q.scheduled[id]
+	if queued != nil {
 		q.pending.Remove(queued)
 
 		delete(q.scheduled, id)
 	}
+
 	q.mu.Unlock()
 
 	envelope.NextAttempt = time.Now()
@@ -281,11 +284,14 @@ func (q *Queue) DeleteReady(id string) error {
 	}
 
 	q.mu.Lock()
-	if queued := q.scheduled[id]; queued != nil {
+
+	queued := q.scheduled[id]
+	if queued != nil {
 		q.pending.Remove(queued)
 
 		delete(q.scheduled, id)
 	}
+
 	q.mu.Unlock()
 
 	err = q.Finish(envelope)

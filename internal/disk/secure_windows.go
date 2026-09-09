@@ -227,8 +227,8 @@ func validateWindowsTree(dir *os.File) error {
 		}
 
 		err = windowsacl.ValidateHandle(windows.Handle(file.Fd()), path, true, false)
-
 		closeErr := file.Close()
+
 		if err != nil {
 			return err
 		}

@@ -164,7 +164,9 @@ func (k *Keeper) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	k.mu.Lock()
 
 	if time.Since(k.checked) < reloadInterval {
-		certificate, lastError := k.certificate, k.lastError
+		certificate := k.certificate
+		lastError := k.lastError
+
 		k.mu.Unlock()
 
 		if !certificateValid(certificate, time.Now()) {
@@ -179,7 +181,9 @@ func (k *Keeper) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	}
 
 	k.checked = time.Now()
-	oldCertificate, oldFingerprint := k.certificate, k.fingerprint
+	oldCertificate := k.certificate
+	oldFingerprint := k.fingerprint
+
 	k.mu.Unlock()
 
 	certPEM, keyPEM, fingerprint, err := k.readPair()
