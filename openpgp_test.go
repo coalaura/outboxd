@@ -9,13 +9,13 @@ type openPGPCommandCase struct {
 
 func TestOpenPGPCommandRequiresExactArguments(t *testing.T) {
 	tests := []openPGPCommandCase{
-		{args: nil, usage: "usage: outboxd openpgp <create|publish> ..."},
+		{args: nil, usage: "usage: outboxd openpgp <create|publish> [...]"},
 		{args: []string{"create"}, usage: "usage: outboxd openpgp create <username> <sender>"},
 		{args: []string{"create", "alice"}, usage: "usage: outboxd openpgp create <username> <sender>"},
 		{args: []string{"create", "alice", "alice@example.com", "extra"}, usage: "usage: outboxd openpgp create <username> <sender>"},
 		{args: []string{"publish"}, usage: "usage: outboxd openpgp publish <output-directory>"},
 		{args: []string{"publish", "one", "two"}, usage: "usage: outboxd openpgp publish <output-directory>"},
-		{args: []string{"unknown"}, usage: "usage: outboxd openpgp <create|publish> ..."},
+		{args: []string{"unknown"}, usage: "usage: outboxd openpgp <create|publish> [...]"},
 	}
 
 	for _, test := range tests {

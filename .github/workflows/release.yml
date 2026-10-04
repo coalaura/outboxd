@@ -149,7 +149,7 @@ jobs:
             -buildvcs=false \
             -ldflags "-s -w -X main.Version=${GITHUB_REF_NAME}" \
             -o "${package_dir}/${binary}" .
-          cp LICENSE README.md "$package_dir/"
+          cp LICENSE README.md UPGRADE.md "$package_dir/"
 
           licenses="${package_dir}/THIRD_PARTY_LICENSES"
           mkdir "$licenses"

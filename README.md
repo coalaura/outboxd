@@ -275,7 +275,11 @@ The application defaults to `config.yml` in the working directory. The supplied 
 
 `permissions` requires the daemon and configuration updates to be stopped. It repairs the configuration, its ownership and mutation locks and all regular files and directories beneath `server.data_directory`, including queue, DKIM, generated TLS and OpenPGP material. On Unix, the data directory's existing owner and group identify the service account; managed directories become `0700` and files become `0600`. When run as root on Linux, the config becomes `root:<service-group>` with mode `0440`; otherwise it becomes service-owned with mode `0600`. On Windows, run it as the service account to replace managed DACLs with outboxd's protected private DACL. The command rejects links, reparse points, mount crossings and non-regular objects and never changes external operator-managed certificate or key paths. After a successful repair, managed permissions satisfy the checks performed during startup; permission errors for external paths must be corrected by the operator.
 
-After replacing the binary, run `config update` as root with group `outboxd` to atomically rewrite an existing configuration in the current documented format, then rerun `setup.sh` to restore its service-readable ownership and mode. Configured values are retained and fields omitted by older versions receive current defaults. The command requires an existing valid configuration, does not provision keys or other assets and requires a daemon restart before the updated startup configuration takes effect. The canonical rewrite replaces custom YAML formatting and comments with outboxd's generated documentation.
+See [UPGRADE.md](UPGRADE.md) for version-specific migration instructions before replacing the binary.
+
+### Updating configuration comments and defaults
+
+After replacing the binary and completing any required configuration migration, run `config update` as root with group `outboxd` to atomically rewrite an existing configuration in the current documented format, then rerun `setup.sh` to restore its service-readable ownership and mode. Configured values are retained and fields omitted by older versions receive current defaults. The command requires an existing valid configuration, does not provision keys or other assets and requires a daemon restart before the updated startup configuration takes effect. The canonical rewrite replaces custom YAML formatting and comments with outboxd's generated documentation.
 
 ## Todo
 

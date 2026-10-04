@@ -4,8 +4,8 @@
 
 | Version  | Supported |
 | -------- | --------- |
-| 0.5.1    | Yes       |
-| <= 0.5.0 | No        |
+| 0.6.0    | Yes       |
+| <= 0.5.1 | No        |
 
 Only the latest release receives security updates. outboxd is new software; review the documentation and security notes before deploying it in production.
 
