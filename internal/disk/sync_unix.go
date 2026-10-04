@@ -25,7 +25,6 @@ func Sync(path string) error {
 	defer directory.Close()
 
 	err = directory.Sync()
-
 	if err != nil {
 		return err
 	}

@@ -101,9 +101,9 @@ func TestConfigUpdatePreservesValuesAndAddsDefaults(t *testing.T) {
 	}
 
 	body := "# operator comment\n" +
-		"server:\n  hostname: mail.example.com\n  domain: example.com\n  data_directory: ./state\n" +
+		"server:\n  hostname: mail.example.com\n  data_directory: ./state\n" +
 		"tls:\n  mode: files\n  certificate_file: cert.pem\n  private_key_file: key.pem\n  minimum_version: \"1.3\"\n" +
-		"dkim:\n  selector: outbound\n  private_key_file: dkim.key\n  headers: [From]\n" +
+		"domains:\n  - name: example.com\n    dkim:\n      selector: outbound\n      private_key_file: dkim.key\n      headers: [From]\n" +
 		"delivery:\n  tls_mode: required\n" +
 		"dns:\n  dmarc_policy: reject\n  public_ipv4: 203.0.113.10\n" +
 		"users:\n  - username: alice\n    password_hash: \"" + hash + "\"\n" +
@@ -128,8 +128,8 @@ func TestConfigUpdatePreservesValuesAndAddsDefaults(t *testing.T) {
 		t.Fatalf("server values changed: %+v", updated.Server)
 	}
 
-	if updated.TLS.Mode != "files" || updated.TLS.MinimumVersion != "1.3" || updated.DKIM.Selector != "outbound" {
-		t.Fatalf("signing or TLS values changed: tls=%+v dkim=%+v", updated.TLS, updated.DKIM)
+	if updated.TLS.Mode != "files" || updated.TLS.MinimumVersion != "1.3" || updated.Domains[0].DKIM.Selector != "outbound" {
+		t.Fatalf("signing or TLS values changed: tls=%+v dkim=%+v", updated.TLS, updated.Domains[0].DKIM)
 	}
 
 	if updated.DNS.DMARC != "reject" || updated.Server.MaxConnections != config.Default().Server.MaxConnections {
@@ -213,11 +213,11 @@ func TestServeDataDirectoryResolvedAgainstConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfgBody := "server:\n  hostname: mail.example.com\n  domain: example.com\n  data_directory: ./data\n" +
+	cfgBody := "server:\n  hostname: mail.example.com\n  data_directory: ./data\n" +
 		"  max_message_bytes: 1048576\n  max_recipients: 10\n  max_messages_per_hour: 100\n" +
 		"  max_recipients_per_hour: 1000\n  read_timeout: 5m\n  write_timeout: 5m\n" +
 		"tls:\n  mode: self_signed\n  certificate_file: tls/server.crt\n  private_key_file: tls/server.key\n  minimum_version: \"1.2\"\n" +
-		"dkim:\n  selector: mail\n  private_key_file: dkim/mail.key\n  headers: [From]\n" +
+		"domains:\n  - name: example.com\n    dkim:\n      selector: mail\n      private_key_file: dkim/mail.key\n      headers: [From]\n" +
 		"delivery:\n  tls_mode: opportunistic\n  max_attempts: 5\n  maximum_lifetime: 24h\n" +
 		"  initial_retry_delay: 1m\n  maximum_retry_delay: 1h\n  domain_concurrency: 2\n  global_concurrency: 4\n" +
 		"  connection_timeout: 30s\n  command_timeout: 2m\n  submission_timeout: 5m\n" +
@@ -276,9 +276,10 @@ func TestRunCheckDoesNotGenerateMissingDKIMKey(t *testing.T) {
 	}
 
 	cfg.Server.Hostname = "mail.example.com"
-	cfg.Server.Domain = "example.com"
+	cfg.Domains[0].Name = "example.com"
 	cfg.DNS.PublicIPv4 = "203.0.113.10"
 	cfg.TLS.AllowSelfSignedServing = true
+
 	cfg.Users = []config.User{
 		{
 			Username:       "alice",
@@ -298,7 +299,7 @@ func TestRunCheckDoesNotGenerateMissingDKIMKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	keyPath, err := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
+	keyPath, err := cfg.ResolveGeneratedPath(cfg.Domains[0].DKIM.PrivateKeyFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +330,7 @@ func TestRunCheckRejectsUnassignedDeliveryBindAddress(t *testing.T) {
 	}
 
 	cfg.Server.Hostname = "mail.example.com"
-	cfg.Server.Domain = "example.com"
+	cfg.Domains[0].Name = "example.com"
 	cfg.DNS.PublicIPv4 = "203.0.113.10"
 	cfg.TLS.AllowSelfSignedServing = true
 	cfg.Users = []config.User{
@@ -388,7 +389,7 @@ func TestOperationsRejectLinkedDataDirectory(t *testing.T) {
 		})
 	}
 
-	managedPaths := []string{"queue", cfg.DKIM.PrivateKeyFile, cfg.DNS.OutputFile}
+	managedPaths := []string{"queue", cfg.Domains[0].DKIM.PrivateKeyFile, cfg.DNS.OutputFile}
 
 	for _, path := range managedPaths {
 		_, err := os.Lstat(filepath.Join(target, path))
@@ -412,7 +413,7 @@ func TestProvisionCreatesDKIMKeyOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	keyPath, err := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
+	keyPath, err := cfg.ResolveGeneratedPath(cfg.Domains[0].DKIM.PrivateKeyFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -462,7 +463,7 @@ func TestServeDoesNotGenerateMissingDKIMKeyOrReplaceDNS(t *testing.T) {
 	}
 
 	cfg.Server.Hostname = "mail.example.com"
-	cfg.Server.Domain = "example.com"
+	cfg.Domains[0].Name = "example.com"
 	cfg.DNS.PublicIPv4 = "203.0.113.10"
 	cfg.TLS.AllowSelfSignedServing = true
 	cfg.Users = []config.User{{Username: "alice", PasswordHash: hash, AllowedSenders: []string{"alice@example.com"}, Enabled: true}}
@@ -487,7 +488,7 @@ func TestServeDoesNotGenerateMissingDKIMKeyOrReplaceDNS(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	keyPath, err := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
+	keyPath, err := cfg.ResolveGeneratedPath(cfg.Domains[0].DKIM.PrivateKeyFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,9 +553,10 @@ func TestRunCheckMissingTLSDoesNotMutateFilesystem(t *testing.T) {
 	}
 
 	cfg.Server.Hostname = "mail.example.com"
-	cfg.Server.Domain = "example.com"
+	cfg.Domains[0].Name = "example.com"
 	cfg.DNS.PublicIPv4 = "203.0.113.10"
 	cfg.TLS.AllowSelfSignedServing = true
+
 	cfg.Users = []config.User{
 		{
 			Username:       "alice",
@@ -670,11 +672,11 @@ func TestServeLocksQueueBeforeGeneratingAssets(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfgBody := "server:\n  hostname: mail.example.com\n  domain: example.com\n  data_directory: ./data\n" +
+	cfgBody := "server:\n  hostname: mail.example.com\n  data_directory: ./data\n" +
 		"  max_message_bytes: 1048576\n  max_recipients: 10\n  max_messages_per_hour: 100\n" +
 		"  max_recipients_per_hour: 1000\n  read_timeout: 5m\n  write_timeout: 5m\n" +
 		"tls:\n  mode: self_signed\n  certificate_file: tls/server.crt\n  private_key_file: tls/server.key\n  minimum_version: \"1.2\"\n" +
-		"dkim:\n  selector: mail\n  private_key_file: dkim/mail.key\n  headers: [From]\n" +
+		"domains:\n  - name: example.com\n    dkim:\n      selector: mail\n      private_key_file: dkim/mail.key\n      headers: [From]\n" +
 		"delivery:\n  tls_mode: opportunistic\n  max_attempts: 5\n  maximum_lifetime: 24h\n" +
 		"  initial_retry_delay: 1m\n  maximum_retry_delay: 1h\n  domain_concurrency: 2\n  global_concurrency: 4\n" +
 		"  connection_timeout: 30s\n  command_timeout: 2m\n  submission_timeout: 5m\n" +

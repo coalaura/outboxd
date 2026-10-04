@@ -54,6 +54,7 @@ func LoadFile(path string) (*Config, error) {
 	}
 
 	cfg.Users = nil
+	cfg.Domains = nil
 
 	dec := yaml.NewDecoder(bytes.NewReader(raw), yaml.DisallowUnknownField())
 

@@ -176,7 +176,7 @@ func (s *session) Data(r io.Reader) error {
 		prepared.EightBit = false
 	}
 
-	data, bodies, bodyIndexes, err := s.server.prepareVariants(ctx, prepared.Data, s.recipients, prepared.EightBit)
+	data, bodies, bodyIndexes, err := s.server.prepareVariants(ctx, prepared.From, prepared.Data, s.recipients, prepared.EightBit)
 	if err != nil {
 		if ctx.Err() != nil {
 			s.waitDataDeadlineClose()
@@ -264,7 +264,7 @@ func (s *session) Data(r io.Reader) error {
 	return errTemporaryFailure
 }
 
-func (s *Server) prepareVariants(ctx context.Context, message []byte, recipients []string, eightBit bool) ([]byte, []queue.Body, []int, error) {
+func (s *Server) prepareVariants(ctx context.Context, from string, message []byte, recipients []string, eightBit bool) ([]byte, []queue.Body, []int, error) {
 	variants := make(map[string]int, len(recipients))
 	bodyIndexes := make([]int, len(recipients))
 	bodies := make([]queue.Body, 0, len(recipients))
@@ -304,7 +304,7 @@ func (s *Server) prepareVariants(ctx context.Context, message []byte, recipients
 			variantEightBit = false
 		}
 
-		signature, err := s.signMessage(ctx, variant)
+		signature, err := s.signMessage(ctx, from, variant)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("dkim signing: %w", err)
 		}

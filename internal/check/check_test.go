@@ -74,11 +74,11 @@ func baseCfg() *config.Config {
 	cfg := config.Default()
 
 	cfg.Server.Hostname = "mail.example.com"
-	cfg.Server.Domain = "example.com"
+	cfg.Domains[0].Name = "example.com"
 	cfg.DNS.PublicIPv4 = "203.0.113.10"
 	cfg.DNS.DMARC = "none"
 	cfg.DNS.ReportURI = "mailto:dmarc@reports.example.net"
-	cfg.DKIM.Selector = "mail"
+	cfg.Domains[0].DKIM.Selector = "mail"
 	cfg.Users = []config.User{{
 		Username:       "alice",
 		AllowedSenders: []string{"alice@example.com", "bob@news.example.com"},
@@ -114,7 +114,7 @@ func TestHostnameAndFCrDNSPass(t *testing.T) {
 	results := Run(context.Background(), Options{
 		Config:   cfg,
 		Resolver: r,
-		DKIM:     &DKIMKey{Selector: "mail", PublicKey: "AAAA"},
+		DKIM:     map[string]string{"example.com": "AAAA"},
 	})
 
 	for _, res := range results {
@@ -251,7 +251,7 @@ func TestDMARCStrictTagParsing(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			r := &fakeResolver{txt: map[string][]string{"_dmarc.example.com": {test.record}}}
 
-			results := checkDMARC(context.Background(), r, cfg)
+			results := checkDMARC(context.Background(), r, cfg, cfg.Domains[0].Name)
 			if len(results) != 1 || results[0].Level != Fail {
 				t.Fatalf("record %q accepted: %+v", test.record, results)
 			}
@@ -277,11 +277,11 @@ func TestDKIMKeyMismatch(t *testing.T) {
 
 	results := Run(context.Background(), Options{
 		Config: cfg, Resolver: r,
-		DKIM: &DKIMKey{Selector: "mail", PublicKey: "AAAA"},
+		DKIM: map[string]string{"example.com": "AAAA"},
 	})
 
 	for _, res := range results {
-		if res.Name == "dkim" && res.Level == Fail {
+		if res.Name == "dkim_example.com" && res.Level == Fail {
 			return
 		}
 	}
@@ -296,7 +296,7 @@ func TestDuplicateDKIMFails(t *testing.T) {
 		"mail._domainkey.example.com": {"v=DKIM1; p=AAAA", "v=DKIM1; p=BBBB"},
 	}}
 
-	result := checkDKIM(context.Background(), r, cfg, nil)[0]
+	result := checkDKIM(context.Background(), r, &cfg.Domains[0], "")[0]
 	if result.Level != Fail {
 		t.Fatalf("duplicate DKIM level=%s", result.Level)
 	}
@@ -315,7 +315,7 @@ func TestDMARCConfiguredPolicyMismatchFails(t *testing.T) {
 			"_dmarc.example.com": {"v=DMARC1; p=" + test.policy + "; rua=mailto:dmarc@reports.example.net"},
 		}}
 
-		result := checkDMARC(context.Background(), r, cfg)[0]
+		result := checkDMARC(context.Background(), r, cfg, cfg.Domains[0].Name)[0]
 		if result.Level != test.level {
 			t.Fatalf("published p=%s level=%s want %s: %s", test.policy, result.Level, test.level, result.Message)
 		}

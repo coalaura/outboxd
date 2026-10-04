@@ -5,7 +5,6 @@ import "time"
 // gost:preserve-layout
 type Server struct {
 	Hostname                  string `yaml:"hostname"`
-	Domain                    string `yaml:"domain"`
 	MaxMessageBytes           int64  `yaml:"max_message_bytes"`
 	MaxRecipients             int    `yaml:"max_recipients"`
 	MaxMessagesPerHour        int    `yaml:"max_messages_per_hour"`
@@ -58,6 +57,11 @@ type TLS struct {
 	CertificateFile        string `yaml:"certificate_file"`
 	PrivateKeyFile         string `yaml:"private_key_file"`
 	MinimumVersion         string `yaml:"minimum_version"`
+}
+
+type Domain struct {
+	Name string `yaml:"name"`
+	DKIM DKIM   `yaml:"dkim"`
 }
 
 type DKIM struct {

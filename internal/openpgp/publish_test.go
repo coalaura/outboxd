@@ -54,6 +54,7 @@ func TestPublishCreatesPublicKeysAndBothWKDLayouts(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	cfg.Domains[0].Name = "example.com"
 	cfg.OpenPGP.Identities = []config.OpenPGPIdentity{{Sender: "alice@example.com", SigningKey: "openpgp/alice.asc", Signing: "required"}}
 
 	err = cfg.Save()

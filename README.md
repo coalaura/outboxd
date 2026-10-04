@@ -9,13 +9,13 @@ It accepts authenticated SMTP submission from configured users, durably queues m
 
 It is for sending mail: transactional mail, notifications, error reporting and application delivery. It is not an inbound mailbox server, IMAP server, spam filter or webmail application. An optional rejection-only SMTP endpoint can reject attempted replies without accepting their message data.
 
-The intended setup is one complete, understandable configuration file and one private data directory: set a hostname, sending domain and public IP, provision key material, add users, publish the generated DNS records, then start the daemon.
+The intended setup is one complete, understandable configuration file and one private data directory: set a hostname, sending domains and public IP, provision key material, add users, publish the generated DNS records, then start the daemon.
 
 ## What You Need
 
 - A server with a stable public IP and outbound TCP port 25 available.
 - A hostname such as `mail.example.com` with matching forward and reverse DNS.
-- A sending domain such as `example.com`.
+- One or more sending domains such as `example.com` and `example.net`, each with its own DKIM key and selector configuration.
 - A publicly trusted TLS certificate for the submission hostname. Certificate files are configured with `tls.mode: files`.
 - A private local filesystem for `data_directory`. Put it on a quota-controlled volume if disk exhaustion matters.
 
@@ -93,8 +93,17 @@ Configure certificate paths that match your deployment. Files under the private 
 ```yaml
 server:
   hostname: mail.example.com
-  domain: example.com
   data_directory: /opt/outboxd/data
+
+domains:
+  - name: example.com
+    dkim:
+      selector: mail
+      private_key_file: dkim/example.com.key
+  - name: example.net
+    dkim:
+      selector: outbound
+      private_key_file: dkim/example.net.key
 
 tls:
   mode: files
@@ -106,6 +115,12 @@ dns:
 ```
 
 Set the remaining options in the generated comments as needed. In particular, keep the default secure outbound TLS policy unless you intentionally need a weaker compatibility policy.
+
+Configure between 1 and 128 entries in `domains`. Each entry has its own `dkim.selector`, `dkim.private_key_file` and optional `dkim.headers`. Selectors may have the same name in different domains, but key paths and keys must be distinct. Relative key paths resolve below `server.data_directory`; all DKIM keys must stay inside that private directory. The default selector is `mail` and omitted headers use the standard signed-header set.
+
+DKIM signing follows the validated header `From` address. A subdomain inherits its nearest configured parent's signing identity unless it has its own entry. A user's `allowed_senders` still explicitly authorizes each envelope sender, header `From` and optional `Sender`; adding a domain grants no user additional addresses. Users can be authorized for addresses in several configured domains. All domains share the server hostname, submission endpoints, TLS certificate, durable queue and delivery policy. The `dns` settings, including DMARC/reporting policy and public addresses, apply to every domain.
+
+To add a domain, stop the daemon, add its entry and authorized sender addresses, run `provision`, publish the output of `dns`, run `check` and restart. Existing keys are retained. Drain outstanding mail before removing a domain or its key: generated failure notices use the original envelope sender's domain for their `From` address and DKIM identity, while retaining a null SMTP envelope sender.
 
 To reject replies without operating a receiving mail server, enable the rejection-only endpoint in the same configuration. The same `outboxd serve` process then listens on port 25; a second process is neither needed nor supported.
 
@@ -123,7 +138,7 @@ reply_rejection:
 
 `listed_only` uses customized messages for listed addresses and a generic nonexistent-recipient rejection for other addresses in an authoritative domain. `all` uses `default_message` for every otherwise-unlisted address in those domains. Other domains are always relay-denied. The endpoint rejects every recipient during SMTP and never accepts `DATA`, queues inbound messages, sends automatic replies or exposes submission users. It has independent connection limits and no STARTTLS requirement. Restart outboxd after changing this startup configuration.
 
-Provision again to create the data directory, spool and create-once DKIM key:
+Provision again to create the data directory, spool and create-once DKIM keys for all configured domains:
 
 ```bash
 sudo -u outboxd /opt/outboxd/outboxd -config /opt/outboxd/config.yml provision
@@ -153,29 +168,29 @@ sudo systemctl start outboxd
 sudo systemctl status outboxd
 ```
 
-`dns`, `check` and `serve` load an existing DKIM key; they never create or replace one. Run `provision` if the key is missing. Stop the daemon before running `dns`, changing the DKIM key or generated DNS path or changing the config/data-directory path.
+`dns`, `check` and `serve` load every configured DKIM key; they never create or replace one. Run `provision` if any key is missing. Stop the daemon before running `dns`, changing DKIM keys or the generated DNS path or changing the config/data-directory path.
 
 ## OpenPGP Signing, Encryption And Key Discovery
 
 OpenPGP/MIME signing is optional globally and explicit per exact header `From` identity. Add an `openpgp.identities` entry with `sender`, `signing_key` and `signing: required`. The sender local part is case-sensitive and its domain is case-insensitive. A message whose `From` has no configured identity remains unsigned; a configured identity is never allowed to fall back to unsigned delivery.
 
-Generate and configure an encrypted RSA-3072 key for an existing user's exact allowed sender with `outboxd -config /path/to/config.yml openpgp create <username> <sender>`. The command creates a random passphrase file and armored private key under `openpgp/senders` below `server.data_directory`, never overwrites existing material, validates the key through the production signing loader and atomically updates the configuration. It does not print the passphrase. The config is committed only after both private files are durable; if durability confirmation fails after config replacement, the command reports that partial-success state and preserves the referenced files. With the supplied Linux layout, run the command as root with group `outboxd`, run `sudo chown -R --no-dereference outboxd:outboxd /opt/outboxd/data/openpgp` so the service can traverse and read the complete generated tree, rerun `setup.sh` to restore config ownership and mode, and restart outboxd afterward.
+Generate and configure an encrypted RSA-3072 key for an existing user's exact allowed sender with `outboxd -config /path/to/config.yml openpgp create <username> <sender>`. The command creates a random passphrase file and armored private key under `openpgp/senders` below `server.data_directory`, never overwrites existing material, validates the key through the production signing loader and atomically updates the configuration. It does not print the passphrase. The config is committed only after both private files are durable; if durability confirmation fails after config replacement, the command reports that partial-success state and preserves the referenced files. With the supplied Linux layout, run the command as root with group `outboxd`, run `sudo chown -R --no-dereference outboxd:outboxd /opt/outboxd/data/openpgp` so the service can traverse and read the complete generated tree, rerun `setup.sh` to restore config ownership and mode and restart outboxd afterward.
 
 `signing_key` accepts one armored or binary private-key entity and must contain the configured sender as a key identity plus a currently valid signing key. For an encrypted private key, set `passphrase_file` to a private file containing exactly one passphrase line. Do not put passphrases in the YAML or command line. Relative paths resolve below `server.data_directory`; absolute paths are allowed. Keys and passphrase files must be private regular files and may not be symlinks or reparse points.
 
-Signing produces RFC 3156 `multipart/signed` data before recipient encryption, and DKIM is applied last to each final message variant. The exact canonical MIME entity placed in the signed first part is covered, with 8-bit MIME leaf bodies converted to quoted-printable. If key loading, canonicalization, signing or encryption fails, submission receives an error and the message is not queued or accepted. Normal `serve`, `check`, `dns` and `provision` operations never generate OpenPGP keys. outboxd supports OpenPGP/MIME, not inline PGP. `check` validates configured OpenPGP keys without modifying them. Keys and passphrases are loaded only at startup, so rotation requires a restart.
+Signing produces RFC 3156 `multipart/signed` data before recipient encryption and DKIM is applied last to each final message variant. The exact canonical MIME entity placed in the signed first part is covered, with 8-bit MIME leaf bodies converted to quoted-printable. If key loading, canonicalization, signing or encryption fails, submission receives an error and the message is not queued or accepted. Normal `serve`, `check`, `dns` and `provision` operations never generate OpenPGP keys. outboxd supports OpenPGP/MIME, not inline PGP. `check` validates configured OpenPGP keys without modifying them. Keys and passphrases are loaded only at startup, so rotation requires a restart.
 
-For static recipient encryption, set `openpgp.recipient_keys_directory` to a private directory containing armored `.asc` or binary `.pgp` public-key files. Each file must contain exactly one public entity, no private packets and a currently valid encryption key. outboxd derives exact recipient addresses from active, self-signed email user IDs; local parts are case-sensitive, while domains are case-insensitive and normalized to their ASCII IDNA form. A recipient with a configured key is always encrypted, and encryption failure never falls back to plaintext. Recipients without keys remain plaintext unless listed in `openpgp.require_encryption_for`; every required address must have a usable key or startup fails. Mixed plaintext and encrypted recipients are committed atomically as immutable per-recipient message variants and retries reuse those stored bytes.
+For static recipient encryption, set `openpgp.recipient_keys_directory` to a private directory containing armored `.asc` or binary `.pgp` public-key files. Each file must contain exactly one public entity, no private packets and a currently valid encryption key. outboxd derives exact recipient addresses from active, self-signed email user IDs; local parts are case-sensitive, while domains are case-insensitive and normalized to their ASCII IDNA form. A recipient with a configured key is always encrypted and encryption failure never falls back to plaintext. Recipients without keys remain plaintext unless listed in `openpgp.require_encryption_for`; every required address must have a usable key or startup fails. Mixed plaintext and encrypted recipients are committed atomically as immutable per-recipient message variants and retries reuse those stored bytes.
 
 Static recipient keys are operator-trusted input rather than automatically discovered keys. outboxd does not currently fetch recipient keys from WKD, OPENPGPKEY or keyservers. Verify key fingerprints independently before placing keys in the directory.
 
-outboxd derives a minimized public key containing the primary public key, exactly one active configured user ID and its self-signature, public subkeys and their binding signatures, and applicable revocations. It never publishes private packets, unrelated user IDs or third-party certifications. Three optional discovery mechanisms use these same bytes:
+outboxd derives a minimized public key containing the primary public key, exactly one active configured user ID and its self-signature, public subkeys and their binding signatures and applicable revocations. It never publishes private packets, unrelated user IDs or third-party certifications. Three optional discovery mechanisms use these same bytes:
 
-- Run `outboxd -config /path/to/config.yml openpgp publish <new-output-directory>` to atomically create armored public-key files, a manifest, and static advanced and direct WKD trees with empty policy files. The destination must not already exist. Deploy the preferred advanced tree at `openpgpkey.<domain>` over HTTPS, or the direct tree at the sending domain, following the URLs in `MANIFEST.txt`. outboxd does not run an HTTP service.
-- Set `autocrypt: true` on an identity to add one folded Autocrypt Level 1 header to its signed messages. The public key must have a currently valid encryption key. `Autocrypt` must be present in `dkim.headers`, as it is in new configurations, so outboxd rejects a configuration that would publish an unauthenticated header. No `prefer-encrypt=mutual` claim is emitted because static recipient encryption does not implement Autocrypt peer-state negotiation.
+- Run `outboxd -config /path/to/config.yml openpgp publish <new-output-directory>` to atomically create armored public-key files, a manifest and static advanced and direct WKD trees with empty policy files. The destination must not already exist. Deploy the preferred advanced tree at `openpgpkey.<domain>` over HTTPS or the direct tree at the sending domain, following the URLs in `MANIFEST.txt`. outboxd does not run an HTTP service.
+- Set `autocrypt: true` on an identity to add one folded Autocrypt Level 1 header to its signed messages. The public key must have a currently valid encryption key. `Autocrypt` must be present in the matching domain's `dkim.headers`, as it is in new configurations, so outboxd rejects a configuration that would publish an unauthenticated header. No `prefer-encrypt=mutual` claim is emitted because static recipient encryption does not implement Autocrypt peer-state negotiation.
 - Set `dns.publish_openpgpkey: true` to include RFC 7929 OPENPGPKEY records in `outboxd dns` output. The guide provides standard base64 RDATA and generic TYPE61 presentation. Treat OPENPGPKEY as authenticated discovery only when the resolver reports a DNSSEC Secure result.
 
-Discovery is not a substitute for key trust. WKD authenticates publication through the domain's HTTPS deployment, Autocrypt provides in-band discovery and continuity rather than strong identity authentication, and OPENPGPKEY depends on DNSSEC. Publish fingerprints through an independent trusted channel when identity assurance matters.
+Discovery is not a substitute for key trust. WKD authenticates publication through the domain's HTTPS deployment, Autocrypt provides in-band discovery and continuity rather than strong identity authentication and OPENPGPKEY depends on DNSSEC. Publish fingerprints through an independent trusted channel when identity assurance matters.
 
 ## TLS Certificates
 
@@ -185,11 +200,11 @@ outboxd checks the configured certificate and key during TLS handshakes, rate-li
 
 ## DNS Checklist
 
-`outboxd dns` writes and prints the records to publish. It includes the DKIM record and guidance for SPF, DMARC and TLS-RPT, plus OPENPGPKEY records when explicitly enabled. When reply rejection is enabled, it also includes MX records for each explicitly configured rejection domain; no MX records are generated for this feature while it is disabled.
+`outboxd dns` writes and prints the records to publish for every configured domain. It includes each domain's DKIM record and guidance for SPF, DMARC and TLS-RPT, plus OPENPGPKEY records when explicitly enabled. `outboxd check` verifies DKIM against each local key and checks DMARC for each domain, alongside shared hostname and sender SPF/MX checks. When reply rejection is enabled, it also includes MX records for each explicitly configured rejection domain; no MX records are generated for this feature while it is disabled.
 
 - Publish A (and optionally AAAA) for `server.hostname` using `dns.public_ipv4` and `dns.public_ipv6`.
 - Set reverse DNS for each sending IP to `server.hostname` and ensure the hostname resolves back to the same IP.
-- Publish the generated DKIM TXT record.
+- Publish each domain's generated DKIM TXT record.
 - If `dns.publish_openpgpkey` is enabled, publish each generated OPENPGPKEY record in a DNSSEC-signed zone.
 - Publish one SPF TXT record for each sending identity domain.
 - Start DMARC with `p=none`, inspect reports, then move to `quarantine` or `reject` when appropriate.
@@ -258,7 +273,7 @@ The application defaults to `config.yml` in the working directory. The supplied 
 
 `queue list`, `queue show` and `queue export` are read-only and may run while the daemon is serving. `queue retry` makes an existing message immediately due without clearing its attempt or recipient history. Retry and delete require the daemon to be stopped so they cannot race delivery. Deletion is crash-safe and refuses messages with linked DSN state.
 
-`permissions` requires the daemon and configuration updates to be stopped. It repairs the configuration, its ownership and mutation locks, and all regular files and directories beneath `server.data_directory`, including queue, DKIM, generated TLS and OpenPGP material. On Unix, the data directory's existing owner and group identify the service account; managed directories become `0700` and files become `0600`. When run as root on Linux, the config becomes `root:<service-group>` with mode `0440`; otherwise it becomes service-owned with mode `0600`. On Windows, run it as the service account to replace managed DACLs with outboxd's protected private DACL. The command rejects links, reparse points, mount crossings and non-regular objects, and never changes external operator-managed certificate or key paths. After a successful repair, managed permissions satisfy the checks performed during startup; permission errors for external paths must be corrected by the operator.
+`permissions` requires the daemon and configuration updates to be stopped. It repairs the configuration, its ownership and mutation locks and all regular files and directories beneath `server.data_directory`, including queue, DKIM, generated TLS and OpenPGP material. On Unix, the data directory's existing owner and group identify the service account; managed directories become `0700` and files become `0600`. When run as root on Linux, the config becomes `root:<service-group>` with mode `0440`; otherwise it becomes service-owned with mode `0600`. On Windows, run it as the service account to replace managed DACLs with outboxd's protected private DACL. The command rejects links, reparse points, mount crossings and non-regular objects and never changes external operator-managed certificate or key paths. After a successful repair, managed permissions satisfy the checks performed during startup; permission errors for external paths must be corrected by the operator.
 
 After replacing the binary, run `config update` as root with group `outboxd` to atomically rewrite an existing configuration in the current documented format, then rerun `setup.sh` to restore its service-readable ownership and mode. Configured values are retained and fields omitted by older versions receive current defaults. The command requires an existing valid configuration, does not provision keys or other assets and requires a daemon restart before the updated startup configuration takes effect. The canonical rewrite replaces custom YAML formatting and comments with outboxd's generated documentation.
 
@@ -269,7 +284,7 @@ After replacing the binary, run `config update` as root with group `outboxd` to 
 ## Security Notes
 
 - Use `tls.mode: files` with a publicly trusted certificate in production. `self_signed` is development-only and requires an explicit opt-in.
-- Keep the config root-owned and readable only by the `outboxd` group, and keep DKIM keys, OpenPGP keys, passphrase files and the data directory readable and writable only by the service account. On Windows, configure the service account and ACLs yourself.
+- Keep the config root-owned and readable only by the `outboxd` group and keep DKIM keys, OpenPGP keys, passphrase files and the data directory readable and writable only by the service account. On Windows, configure the service account and ACLs yourself.
 - Outbound delivery defaults to verified, required TLS. Do not enable plaintext or insecure TLS unless the compatibility tradeoff is deliberate.
 - outboxd does not accept inbound message data and does not implement inbound mail storage, DANE, MTA-STS or DNSSEC validation.
 - A private local filesystem with reliable rename/sync behavior is required for the queue durability guarantees.

@@ -428,7 +428,7 @@ func mintCert(t *testing.T, cn string) (tls.Certificate, *x509.CertPool, *x509.C
 
 func deliverCfg() *config.Config {
 	return &config.Config{
-		Server: config.Server{Hostname: "outboxd.test", Domain: "outboxd.test"},
+		Server: config.Server{Hostname: "outboxd.test"},
 		Delivery: config.Delivery{
 			TLSMode:                  "opportunistic",
 			AllowPlaintext:           new(true),

@@ -40,12 +40,12 @@ type Logger interface {
 type Server struct {
 	cfg               *config.Config
 	queue             *queue.Queue
-	signer            *sign.Signer
+	signer            *sign.Signers
 	log               Logger
 	queueAdd          func(context.Context, *queue.Envelope, []byte) error
 	openPGPSign       func(context.Context, string, []byte) ([]byte, bool, error)
 	openPGPRecipients *pgpsign.Recipients
-	signMessage       func(context.Context, []byte) (string, error)
+	signMessage       func(context.Context, string, []byte) (string, error)
 
 	connLimit   *connectionLimiter
 	connections *connectionTracker
@@ -171,12 +171,12 @@ func (s *Server) dataTimeout() time.Duration {
 }
 
 // New builds the submission server.
-func New(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signer, spool *queue.Queue, log Logger) *Server {
+func New(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signers, spool *queue.Queue, log Logger) *Server {
 	return NewWithOpenPGP(cfg, keeper, signer, nil, nil, spool, log)
 }
 
 // NewWithOpenPGP builds the submission server with optional OpenPGP/MIME transforms.
-func NewWithOpenPGP(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signer, pgpSigners *pgpsign.Signers, pgpRecipients *pgpsign.Recipients, spool *queue.Queue, log Logger) *Server {
+func NewWithOpenPGP(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signers, pgpSigners *pgpsign.Signers, pgpRecipients *pgpsign.Recipients, spool *queue.Queue, log Logger) *Server {
 	authWorkers := cfg.Server.AuthWorkers
 	if authWorkers <= 0 {
 		authWorkers = 4
@@ -214,13 +214,13 @@ func NewWithOpenPGP(cfg *config.Config, keeper *certs.Keeper, signer *sign.Signe
 	srv.openPGPSign = pgpSigners.Sign
 	srv.openPGPRecipients = pgpRecipients
 
-	srv.signMessage = func(ctx context.Context, data []byte) (string, error) {
+	srv.signMessage = func(ctx context.Context, from string, data []byte) (string, error) {
 		err := ctx.Err()
 		if err != nil {
 			return "", err
 		}
 
-		return srv.signer.Signature(data)
+		return srv.signer.Signature(from, data)
 	}
 
 	srv.starttls = srv.newSMTP(cfg, keeper)

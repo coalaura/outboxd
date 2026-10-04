@@ -21,7 +21,7 @@ func TestLoadIsReadOnly(t *testing.T) {
 
 	cfg.Server.DataDirectory = dir
 
-	path := filepath.Join(dir, cfg.DKIM.PrivateKeyFile)
+	path := filepath.Join(dir, cfg.Domains[0].DKIM.PrivateKeyFile)
 
 	_, err := Load(cfg)
 	if err == nil {
@@ -72,7 +72,7 @@ func TestEnsureCreatesKeyOnce(t *testing.T) {
 		t.Fatal("first provision did not create key")
 	}
 
-	path := filepath.Join(dir, cfg.DKIM.PrivateKeyFile)
+	path := filepath.Join(dir, cfg.Domains[0].DKIM.PrivateKeyFile)
 
 	before, err := os.ReadFile(path)
 	if err != nil {
@@ -93,7 +93,7 @@ func TestEnsureCreatesKeyOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if string(after) != string(before) || second.PublicKey != first.PublicKey {
+	if string(after) != string(before) || second.PublicKeys()[cfg.Domains[0].Name] != first.PublicKeys()[cfg.Domains[0].Name] {
 		t.Fatal("second provision changed key identity")
 	}
 }
@@ -105,7 +105,7 @@ func TestEnsureDoesNotReplaceMalformedExistingKey(t *testing.T) {
 
 	cfg.Server.DataDirectory = dir
 
-	path := filepath.Join(dir, cfg.DKIM.PrivateKeyFile)
+	path := filepath.Join(dir, cfg.Domains[0].DKIM.PrivateKeyFile)
 
 	err := os.MkdirAll(filepath.Dir(path), 0700)
 	if err != nil {
@@ -166,7 +166,7 @@ func TestDKIMKeyReadLimit(t *testing.T) {
 
 	cfg.Server.DataDirectory = dir
 
-	path := filepath.Join(dir, cfg.DKIM.PrivateKeyFile)
+	path := filepath.Join(dir, cfg.Domains[0].DKIM.PrivateKeyFile)
 
 	err := os.MkdirAll(filepath.Dir(path), 0700)
 	if err != nil {

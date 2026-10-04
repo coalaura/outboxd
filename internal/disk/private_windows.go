@@ -98,6 +98,7 @@ func validatePrivateDirectory(path string, requireProtected bool) error {
 		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
 		0,
 	)
+
 	if err != nil {
 		return err
 	}

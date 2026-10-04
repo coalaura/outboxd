@@ -15,7 +15,7 @@ type Config struct {
 	Server         Server         `yaml:"server"`
 	ReplyRejection ReplyRejection `yaml:"reply_rejection"`
 	TLS            TLS            `yaml:"tls"`
-	DKIM           DKIM           `yaml:"dkim"`
+	Domains        []Domain       `yaml:"domains"`
 	OpenPGP        OpenPGP        `yaml:"openpgp"`
 	Delivery       Delivery       `yaml:"delivery"`
 	DNS            DNS            `yaml:"dns"`

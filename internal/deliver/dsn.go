@@ -51,13 +51,18 @@ func (d *Deliverer) ensureDSN(envelope *queue.Envelope) error {
 		return err
 	}
 
+	domain, err := mailbox.DomainOf(envelope.Sender)
+	if err != nil {
+		return fmt.Errorf("dsn recipient domain: %w", err)
+	}
+
 	msg, err := buildDSN(d.cfg.Server.Hostname, envelope, body)
 	if err != nil {
 		return err
 	}
 
 	if d.signer != nil {
-		sig, err := d.signer.Signature(msg)
+		sig, err := d.signer.Signature("MAILER-DAEMON@"+domain, msg)
 		if err != nil {
 			return fmt.Errorf("dsn dkim: %w", err)
 		}
@@ -68,11 +73,6 @@ func (d *Deliverer) ensureDSN(envelope *queue.Envelope) error {
 		signed = append(signed, msg...)
 
 		msg = signed
-	}
-
-	domain, err := mailbox.DomainOf(envelope.Sender)
-	if err != nil {
-		return fmt.Errorf("dsn recipient domain: %w", err)
 	}
 
 	needUTF8 := dsnReportUTF8(envelope)
@@ -143,6 +143,11 @@ func dsnEnvelopeID(original, incarnation string, generation uint64) string {
 }
 
 func buildDSN(hostname string, env *queue.Envelope, original []byte) ([]byte, error) {
+	domain, err := mailbox.DomainOf(env.Sender)
+	if err != nil {
+		return nil, fmt.Errorf("dsn sender domain: %w", err)
+	}
+
 	if hostname == "" {
 		hostname = "localhost"
 	}
@@ -224,7 +229,7 @@ func buildDSN(hostname string, env *queue.Envelope, original []byte) ([]byte, er
 
 	var out bytes.Buffer
 
-	fmt.Fprintf(&out, "From: Mail Delivery System <MAILER-DAEMON@%s>\r\n", hostname)
+	fmt.Fprintf(&out, "From: Mail Delivery System <MAILER-DAEMON@%s>\r\n", domain)
 	fmt.Fprintf(&out, "To: <%s>\r\n", env.Sender)
 	out.WriteString("Subject: Undelivered Mail Returned to Sender\r\n")
 	fmt.Fprintf(&out, "Date: %s\r\n", now.Format(time.RFC1123Z))

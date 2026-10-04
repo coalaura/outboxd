@@ -176,8 +176,8 @@ func TestEndToEndLocalPath(t *testing.T) {
 
 	verifs, err := dkim.VerifyWithOptions(bytes.NewReader([]byte(snap.dataBody)), &dkim.VerifyOptions{
 		LookupTXT: func(domain string) ([]string, error) {
-			if strings.Contains(domain, cfg.DKIM.Selector) && strings.Contains(domain, cfg.Server.Domain) {
-				return []string{signer.Record()}, nil
+			if strings.Contains(domain, cfg.Domains[0].DKIM.Selector) && strings.Contains(domain, cfg.Domains[0].Name) {
+				return []string{signer.Records()[cfg.Domains[0].Name]}, nil
 			}
 
 			return nil, nil

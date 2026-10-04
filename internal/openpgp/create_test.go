@@ -301,7 +301,7 @@ func createTestConfigWithSenders(t *testing.T, senders []string) (*config.Config
 	}
 
 	cfg.Server.Hostname = "mail.example.com"
-	cfg.Server.Domain = "example.com"
+	cfg.Domains[0].Name = "example.com"
 
 	err = cfg.Init()
 	if err != nil {

@@ -79,7 +79,6 @@ func minimalYAML(dataDir, hash string) string {
 	return fmt.Sprintf(`
 server:
   hostname: mail.example.com
-  domain: example.com
   data_directory: %s
   max_message_bytes: 1048576
   max_recipients: 10
@@ -92,10 +91,12 @@ tls:
   certificate_file: tls/server.crt
   private_key_file: tls/server.key
   minimum_version: "1.2"
-dkim:
-  selector: mail
-  private_key_file: dkim/mail.key
-  headers: [From, Sender]
+domains:
+  - name: example.com
+    dkim:
+      selector: mail
+      private_key_file: dkim/mail.key
+      headers: [From, Sender]
 delivery:
   tls_mode: opportunistic
   max_attempts: 5
@@ -119,7 +120,7 @@ users:
 `, filepath.ToSlash(dataDir), hash)
 }
 
-func TestOldConfigsGetDefaults(t *testing.T) {
+func TestOmittedOptionalFieldsGetDefaults(t *testing.T) {
 	dir := t.TempDir()
 	data := filepath.Join(dir, "data")
 
@@ -129,7 +130,6 @@ func TestOldConfigsGetDefaults(t *testing.T) {
 	body := fmt.Sprintf(`
 server:
   hostname: mail.example.com
-  domain: example.com
   data_directory: %s
   max_message_bytes: 1048576
   max_recipients: 10
@@ -142,10 +142,12 @@ tls:
   certificate_file: tls/server.crt
   private_key_file: tls/server.key
   minimum_version: "1.2"
-dkim:
-  selector: mail
-  private_key_file: dkim/mail.key
-  headers: [From, Sender]
+domains:
+  - name: example.com
+    dkim:
+      selector: mail
+      private_key_file: dkim/mail.key
+      headers: [From, Sender]
 delivery:
   max_attempts: 5
   maximum_lifetime: 24h
@@ -243,7 +245,7 @@ func TestOpenPGPIdentityValidation(t *testing.T) {
 	cfg := Default()
 
 	cfg.Server.Hostname = "mail.example.com"
-	cfg.Server.Domain = "example.com"
+	cfg.Domains[0].Name = "example.com"
 	cfg.Users = []User{{Username: "alice", PasswordHash: validUserPHC(t), AllowedSenders: []string{"alice@example.com"}, Enabled: true}}
 	cfg.OpenPGP.Identities = []OpenPGPIdentity{{Sender: "Alice@EXAMPLE.com", SigningKey: "openpgp/alice.asc", Signing: "required"}}
 
@@ -276,14 +278,16 @@ func TestOpenPGPIdentityValidation(t *testing.T) {
 func TestAutocryptRequiresDKIMCoverage(t *testing.T) {
 	cfg := Default()
 
+	cfg.Domains[0].Name = "example.com"
+
 	cfg.OpenPGP.Identities = []OpenPGPIdentity{{Sender: "alice@example.com", SigningKey: "openpgp/alice.asc", Signing: "required", Autocrypt: true}}
 
-	cfg.DKIM.Headers = slices.DeleteFunc(cfg.DKIM.Headers, func(header string) bool {
+	cfg.Domains[0].DKIM.Headers = slices.DeleteFunc(cfg.Domains[0].DKIM.Headers, func(header string) bool {
 		return strings.EqualFold(header, "Autocrypt")
 	})
 
 	err := cfg.Validate()
-	if err == nil || !strings.Contains(err.Error(), "requires Autocrypt in dkim.headers") {
+	if err == nil || !strings.Contains(err.Error(), "requires Autocrypt in the signing domain's dkim.headers") {
 		t.Fatalf("Validate() error = %v", err)
 	}
 }
@@ -432,7 +436,7 @@ func TestIsReadyRequiresEnabledUser(t *testing.T) {
 	cfg := Default()
 
 	cfg.Server.Hostname = "mail.example.com"
-	cfg.Server.Domain = "example.com"
+	cfg.Domains[0].Name = "example.com"
 	cfg.DNS.PublicIPv4 = "203.0.113.1"
 	cfg.TLS.AllowSelfSignedServing = true
 	cfg.Users = []User{{
@@ -482,7 +486,7 @@ func TestSelfSignedServingRequiresExplicitOptIn(t *testing.T) {
 	cfg := Default()
 
 	cfg.Server.Hostname = "mail.example.com"
-	cfg.Server.Domain = "example.com"
+	cfg.Domains[0].Name = "example.com"
 	cfg.DNS.PublicIPv4 = "203.0.113.1"
 	cfg.Users = []User{{Enabled: true}}
 
@@ -1221,7 +1225,7 @@ func TestValidatePHCViaUser(t *testing.T) {
 	cfg := Default()
 
 	cfg.Server.Hostname = "mail.example.com"
-	cfg.Server.Domain = "example.com"
+	cfg.Domains[0].Name = "example.com"
 
 	cfg.initializeRuntime()
 
@@ -1243,7 +1247,7 @@ func TestValidatePrefixedPHCViaUser(t *testing.T) {
 	cfg := Default()
 
 	cfg.Server.Hostname = "mail.example.com"
-	cfg.Server.Domain = "example.com"
+	cfg.Domains[0].Name = "example.com"
 
 	cfg.initializeRuntime()
 
@@ -1264,8 +1268,8 @@ func TestDKIMHeadersRequireSender(t *testing.T) {
 	cfg := Default()
 
 	cfg.Server.Hostname = "mail.example.com"
-	cfg.Server.Domain = "example.com"
-	cfg.DKIM.Headers = []string{"From"}
+	cfg.Domains[0].Name = "example.com"
+	cfg.Domains[0].DKIM.Headers = []string{"From"}
 
 	cfg.initializeRuntime()
 

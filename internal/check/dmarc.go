@@ -9,9 +9,9 @@ import (
 	"github.com/coalaura/outboxd/internal/config"
 )
 
-func checkDMARC(ctx context.Context, r Resolver, cfg *config.Config) []Result {
-	name := "_dmarc." + strings.TrimSuffix(cfg.Server.Domain, ".")
-	checkName := "dmarc"
+func checkDMARC(ctx context.Context, r Resolver, cfg *config.Config, domain string) []Result {
+	name := "_dmarc." + domain
+	checkName := "dmarc_" + domain
 
 	txts, err := r.LookupTXT(ctx, name)
 	if err != nil {

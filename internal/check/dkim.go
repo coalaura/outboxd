@@ -9,15 +9,10 @@ import (
 	"github.com/coalaura/outboxd/internal/config"
 )
 
-func checkDKIM(ctx context.Context, r Resolver, cfg *config.Config, key *DKIMKey) []Result {
-	selector := cfg.DKIM.Selector
-
-	if key != nil && key.Selector != "" {
-		selector = key.Selector
-	}
-
-	name := fmt.Sprintf("%s._domainkey.%s", selector, strings.TrimSuffix(cfg.Server.Domain, "."))
-	checkName := "dkim"
+func checkDKIM(ctx context.Context, r Resolver, domain *config.Domain, publicKey string) []Result {
+	selector := domain.DKIM.Selector
+	name := fmt.Sprintf("%s._domainkey.%s", selector, domain.Name)
+	checkName := "dkim_" + domain.Name
 
 	txts, err := r.LookupTXT(ctx, name)
 	if err != nil {
@@ -53,7 +48,7 @@ func checkDKIM(ctx context.Context, r Resolver, cfg *config.Config, key *DKIMKey
 		}}
 	}
 
-	if key == nil || key.PublicKey == "" {
+	if publicKey == "" {
 		return []Result{{
 			Name:    checkName,
 			Level:   Warn,
@@ -71,7 +66,7 @@ func checkDKIM(ctx context.Context, r Resolver, cfg *config.Config, key *DKIMKey
 	}
 
 	// Compare base64 payloads (ignore padding differences).
-	if normalizeB64(pub) != normalizeB64(key.PublicKey) {
+	if normalizeB64(pub) != normalizeB64(publicKey) {
 		return []Result{{
 			Name:    checkName,
 			Level:   Fail,

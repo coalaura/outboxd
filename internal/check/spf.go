@@ -71,10 +71,15 @@ func checkSPF(ctx context.Context, r Resolver, cfg *config.Config) []Result {
 }
 
 func requiredSPFOwners(cfg *config.Config) []string {
-	domain := strings.ToLower(strings.TrimSuffix(cfg.Server.Domain, "."))
 	hostname := strings.ToLower(strings.TrimSuffix(cfg.Server.Hostname, "."))
 
-	set := map[string]struct{}{domain: {}}
+	set := make(map[string]struct{}, len(cfg.Domains)+1)
+
+	set[hostname] = struct{}{}
+
+	for i := range cfg.Domains {
+		set[cfg.Domains[i].Name] = struct{}{}
+	}
 
 	for i := range cfg.Users {
 		for _, sender := range cfg.Users[i].AllowedSenders {
@@ -90,10 +95,6 @@ func requiredSPFOwners(cfg *config.Config) []string {
 				set[strings.ToLower(sender[at+1:])] = struct{}{}
 			}
 		}
-	}
-
-	if hostname != domain {
-		set[hostname] = struct{}{}
 	}
 
 	owners := make([]string, 0, len(set))

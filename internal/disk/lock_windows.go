@@ -116,6 +116,7 @@ func lockWindowsFile(f *os.File, path string) (*FileLock, error) {
 		0,
 		&ol,
 	)
+
 	if err != nil {
 		_ = f.Close()
 
@@ -128,6 +129,7 @@ func lockWindowsFile(f *os.File, path string) (*FileLock, error) {
 
 	return &FileLock{impl: &winFileLock{f: f}}, nil
 }
+
 func (l *winFileLock) close() error {
 	if l.f == nil {
 		return nil

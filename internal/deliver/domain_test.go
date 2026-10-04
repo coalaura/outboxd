@@ -77,7 +77,9 @@ type mapDial struct {
 	m map[string]string
 }
 
-func dialMap(m map[string]string) Dialer { return mapDial{m: m} }
+func dialMap(m map[string]string) Dialer {
+	return mapDial{m: m}
+}
 
 func (m mapDial) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	target, ok := m.m[address]
@@ -92,7 +94,7 @@ func (m mapDial) DialContext(ctx context.Context, network, address string) (net.
 
 func testDeliverCfg() *config.Config {
 	return &config.Config{
-		Server: config.Server{Hostname: "outboxd.test", Domain: "outboxd.test"},
+		Server: config.Server{Hostname: "outboxd.test"},
 		Delivery: config.Delivery{
 			TLSMode:                  "opportunistic",
 			AllowPlaintext:           new(true),

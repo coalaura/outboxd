@@ -33,11 +33,10 @@ type Record struct {
 //
 // At most one SPF TXT is emitted per owner name. When the EHLO hostname equals
 // the envelope domain, a single SPF covers both identities.
-func Build(cfg *config.Config, dkim string) []Record {
+func Build(cfg *config.Config, dkim map[string]string) []Record {
 	hostname := strings.TrimSuffix(strings.ToLower(cfg.Server.Hostname), ".") + "."
-	domain := strings.TrimSuffix(strings.ToLower(cfg.Server.Domain), ".") + "."
 
-	records := make([]Record, 0, 8+len(cfg.ReplyRejection.Domains))
+	records := make([]Record, 0, 3+5*len(cfg.Domains)+len(cfg.ReplyRejection.Domains))
 
 	if cfg.DNS.PublicIPv4 != "" {
 		ip, err := netip.ParseAddr(cfg.DNS.PublicIPv4)
@@ -78,10 +77,8 @@ func Build(cfg *config.Config, dkim string) []Record {
 	for _, owner := range spfOwners {
 		purpose := "SPF; authorizes this server to send for this domain and rejects everything else"
 
-		if owner == hostname && owner != domain {
+		if owner == hostname {
 			purpose = "SPF for the EHLO/HELO name; receivers may check HELO separately from the envelope sender"
-		} else if owner != domain && owner != hostname {
-			purpose = "SPF for an allowed envelope-sender domain"
 		}
 
 		records = append(records, Record{
@@ -92,48 +89,60 @@ func Build(cfg *config.Config, dkim string) []Record {
 		})
 	}
 
-	records = append(records, Record{
-		Name:    fmt.Sprintf("%s._domainkey.%s", cfg.DKIM.Selector, domain),
-		Type:    "TXT",
-		Value:   dkim,
-		Purpose: "DKIM public key matching the generated private key",
-	})
+	for i := range cfg.Domains {
+		configured := &cfg.Domains[i]
 
-	records = append(records, Record{
-		Name:    "_dmarc." + domain,
-		Type:    "TXT",
-		Value:   dmarc(cfg),
-		Purpose: `DMARC policy; start with p=none (monitor), then stage to "quarantine" and "reject" once reports look clean`,
-	})
+		domain := configured.Name + "."
 
-	// External DMARC reporting hosts need an authorization record.
-	// outboxd does not accept inbound mail or DMARC reports — operators must
-	// point rua at a mailbox that does.
-	for _, host := range external(cfg.DNS.ReportURI, cfg.Server.Domain) {
 		records = append(records, Record{
-			Name:    fmt.Sprintf("%s._report._dmarc.%s.", strings.TrimSuffix(domain, "."), host),
+			Name:    fmt.Sprintf("%s._domainkey.%s", configured.DKIM.Selector, domain),
 			Type:    "TXT",
-			Value:   "v=DMARC1",
-			Purpose: fmt.Sprintf("authorizes %s to receive DMARC aggregate reports for %s (external destination)", host, cfg.Server.Domain),
+			Value:   dkim[configured.Name],
+			Purpose: "DKIM public key matching the generated private key",
 		})
-	}
 
-	// TLS-RPT is separate from DMARC reporting.
-	tlsURI := strings.TrimSpace(cfg.DNS.TLSRPTURI)
-	if tlsURI != "" {
 		records = append(records, Record{
-			Name:    "_smtp._tls." + domain,
+			Name:    "_dmarc." + domain,
 			Type:    "TXT",
-			Value:   fmt.Sprintf("v=TLSRPTv1; rua=%s", tlsURI),
-			Purpose: "optional SMTP TLS reporting endpoint (separate from DMARC rua)",
+			Value:   dmarc(cfg),
+			Purpose: `DMARC policy; start with p=none (monitor), then stage to "quarantine" and "reject" once reports look clean`,
 		})
+
+		// External DMARC reporting hosts need an authorization record.
+		// outboxd does not accept inbound mail or DMARC reports — operators must
+		// point rua at a mailbox that does.
+		for _, host := range external(cfg.DNS.ReportURI, configured.Name) {
+			records = append(records, Record{
+				Name:    fmt.Sprintf("%s._report._dmarc.%s.", strings.TrimSuffix(domain, "."), host),
+				Type:    "TXT",
+				Value:   "v=DMARC1",
+				Purpose: fmt.Sprintf("authorizes %s to receive DMARC aggregate reports for %s (external destination)", host, configured.Name),
+			})
+		}
+
+		// TLS-RPT is separate from DMARC reporting.
+		tlsURI := strings.TrimSpace(cfg.DNS.TLSRPTURI)
+		if tlsURI != "" {
+			records = append(records, Record{
+				Name:    "_smtp._tls." + domain,
+				Type:    "TXT",
+				Value:   fmt.Sprintf("v=TLSRPTv1; rua=%s", tlsURI),
+				Purpose: "optional SMTP TLS reporting endpoint (separate from DMARC rua)",
+			})
+		}
 	}
 
 	return records
 }
 
 // Write renders the DNS instructions next to the other generated files.
-func Write(cfg *config.Config, dkim string, publicIdentities ...pgpsign.PublicIdentity) (string, []byte, error) {
+func Write(cfg *config.Config, dkim map[string]string, publicIdentities ...pgpsign.PublicIdentity) (string, []byte, error) {
+	for i := range cfg.Domains {
+		if dkim[cfg.Domains[i].Name] == "" {
+			return "", nil, fmt.Errorf("missing DKIM record for %s", cfg.Domains[i].Name)
+		}
+	}
+
 	err := config.ValidateDMARCReportURIList(cfg.DNS.ReportURI)
 	if err != nil {
 		return "", nil, fmt.Errorf("dns.dmarc_report_uri: %w", err)
@@ -148,7 +157,7 @@ func Write(cfg *config.Config, dkim string, publicIdentities ...pgpsign.PublicId
 
 	buffer.Grow(4096)
 
-	fmt.Fprintf(&buffer, "DNS setup for %s (%s)\n", cfg.Server.Domain, time.Now().Format(time.RFC3339))
+	fmt.Fprintf(&buffer, "DNS setup for %s (%s)\n", cfg.Server.Hostname, time.Now().Format(time.RFC3339))
 
 	buffer.WriteString("- Outboxd is outbound submission + delivery only; it never accepts inbound message data\n")
 	buffer.WriteString("- Outbound TCP port 25 (sending mail) must be open from this host\n")
@@ -300,7 +309,9 @@ func uncoveredEnvelopeDomains(cfg *config.Config) []string {
 		}
 	}
 
-	add(cfg.Server.Domain)
+	for i := range cfg.Domains {
+		add(cfg.Domains[i].Name)
+	}
 
 	for i := range cfg.Users {
 		for _, sender := range cfg.Users[i].AllowedSenders {
@@ -362,7 +373,6 @@ func quote(value string) string {
 // the envelope domain, every distinct allowed-sender domain, and the HELO
 // hostname when it differs from those.
 func spfOwnerNames(cfg *config.Config) []string {
-	domain := strings.TrimSuffix(strings.ToLower(cfg.Server.Domain), ".") + "."
 	hostname := strings.TrimSuffix(strings.ToLower(cfg.Server.Hostname), ".") + "."
 
 	var owners []string
@@ -378,7 +388,9 @@ func spfOwnerNames(cfg *config.Config) []string {
 		}
 	}
 
-	add(domain)
+	for i := range cfg.Domains {
+		add(cfg.Domains[i].Name)
+	}
 
 	for i := range cfg.Users {
 		for _, sender := range cfg.Users[i].AllowedSenders {

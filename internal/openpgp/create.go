@@ -153,7 +153,6 @@ func Create(configPath, username, sender string) (*CreatedKey, error) {
 	passBody[len(passBody)-1] = '\n'
 
 	err = disk.WriteExclusive(passPath, passBody, 0600)
-
 	if err != nil {
 		writeErr := fmt.Errorf("write OpenPGP passphrase file: %w", err)
 

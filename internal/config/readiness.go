@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -9,8 +10,10 @@ import (
 func (cfg *Config) IsReady() error {
 	var problems []error
 
-	if strings.HasSuffix(cfg.Server.Domain, ".invalid") {
-		problems = append(problems, errors.New("replace server.domain with the sending domain"))
+	for i := range cfg.Domains {
+		if strings.HasSuffix(cfg.Domains[i].Name, ".invalid") {
+			problems = append(problems, fmt.Errorf("replace domains[%d].name with a sending domain", i))
+		}
 	}
 
 	if strings.HasSuffix(cfg.Server.Hostname, ".invalid") {
@@ -68,8 +71,10 @@ func (cfg *Config) Warnings() []string {
 		warnings = append(warnings, "delivery.tls_mode is opportunistic_insecure; certificate verification is disabled for STARTTLS — development/legacy only")
 	}
 
-	if cfg.Server.Domain == cfg.Server.Hostname {
-		warnings = append(warnings, "server.hostname equals server.domain; prefer a dedicated sending subdomain when the parent domain has other senders")
+	for i := range cfg.Domains {
+		if cfg.Domains[i].Name == cfg.Server.Hostname {
+			warnings = append(warnings, "server.hostname equals a sending domain; prefer a dedicated sending subdomain when the parent domain has other senders")
+		}
 	}
 
 	return warnings

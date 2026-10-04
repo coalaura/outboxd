@@ -58,6 +58,7 @@ func lockUnix(path string, extraFlags int) (*FileLock, error) {
 
 	return &FileLock{impl: &unixFileLock{f: f}}, nil
 }
+
 func (l *unixFileLock) close() error {
 	if l.f == nil {
 		return nil

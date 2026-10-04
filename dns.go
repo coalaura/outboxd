@@ -38,7 +38,7 @@ func dns(configPath string) error {
 		}
 	}
 
-	_, body, err := records.Write(cfg, signer.Record(), publicIdentities...)
+	_, body, err := records.Write(cfg, signer.Records(), publicIdentities...)
 	if err != nil {
 		return err
 	}

@@ -52,7 +52,7 @@ func serve(configPath string) error {
 		return err
 	}
 
-	log.Println("Loading DKIM key...")
+	log.Println("Loading domain DKIM keys...")
 
 	signer, err := sign.Load(cfg)
 	if err != nil {

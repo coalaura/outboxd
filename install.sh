@@ -251,6 +251,33 @@ set_config_value() {
     mv "$config_next" "$temporary_directory/config.yml"
 }
 
+set_config_domains() {
+    config_next=$temporary_directory/config.next
+
+    if ! awk -v domains="$sending_domains" '
+        /^domains:$/ {
+            print
+            count = split(domains, names, " ")
+            for (i = 1; i <= count; i++) {
+                print "  - name: " names[i]
+                print "    dkim:"
+                print "      selector: mail"
+                print "      private_key_file: dkim/" names[i] ".key"
+            }
+            replacing = 1
+            replaced++
+            next
+        }
+        replacing && /^[a-z_][a-z0-9_]*:/ { replacing = 0 }
+        !replacing { print }
+        END { if (replaced != 1) exit 1 }
+    ' "$temporary_directory/config.yml" >"$config_next"; then
+        fail "could not configure sending domains"
+    fi
+
+    mv "$config_next" "$temporary_directory/config.yml"
+}
+
 lowercase() {
     printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
 }
@@ -541,20 +568,30 @@ main() {
     fi
 
     while :; do
-        prompt "Sending domain" "$default_domain"
-        sending_domain=$(lowercase "$REPLY")
+        prompt "Sending domains (space-separated)" "$default_domain"
+        sending_domains=$(lowercase "$REPLY")
+        domains_valid=1
+        sending_domain=
 
-        case $sending_domain in
-            *.invalid)
-                ;;
-            *)
-                if valid_domain "$sending_domain"; then
-                    break
-                fi
-                ;;
-        esac
+        for domain in $sending_domains; do
+            if ! valid_domain "$domain"; then
+                domains_valid=0
+            fi
 
-        printf '%s\n' "Enter a valid sending domain." >&4
+            case $domain in
+                *.invalid) domains_valid=0 ;;
+            esac
+
+            if [ -z "$sending_domain" ]; then
+                sending_domain=$domain
+            fi
+        done
+
+        if [ "$domains_valid" -eq 1 ] && [ -n "$sending_domain" ]; then
+            break
+        fi
+
+        printf '%s\n' "Enter valid sending domains separated by spaces." >&4
     done
 
     while :; do
@@ -626,7 +663,7 @@ main() {
     fi
 
     set_config_value server hostname "$smtp_hostname"
-    set_config_value server domain "$sending_domain"
+    set_config_domains
     set_config_value server data_directory /opt/outboxd/data
     set_config_value dns public_ipv4 "${public_ipv4:-\"\"}"
     set_config_value dns public_ipv6 "${public_ipv6:-\"\"}"

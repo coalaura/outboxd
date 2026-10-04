@@ -46,7 +46,7 @@ func TestRepairPermissionsRepairsManagedTree(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dkimKey, err := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
+	dkimKey, err := cfg.ResolveGeneratedPath(cfg.Domains[0].DKIM.PrivateKeyFile)
 	if err != nil {
 		t.Fatal(err)
 	}

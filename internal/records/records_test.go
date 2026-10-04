@@ -12,10 +12,10 @@ func TestSPFDedupeWhenHostnameEqualsDomain(t *testing.T) {
 	cfg := config.Default()
 
 	cfg.Server.Hostname = "example.com"
-	cfg.Server.Domain = "example.com"
+	cfg.Domains[0].Name = "example.com"
 	cfg.DNS.PublicIPv4 = "203.0.113.1"
 
-	recs := Build(cfg, "v=DKIM1; p=x")
+	recs := Build(cfg, map[string]string{cfg.Domains[0].Name: "v=DKIM1; p=x"})
 
 	var spf int
 
@@ -38,14 +38,14 @@ func TestSPFForSenderDomainsAndIncludes(t *testing.T) {
 	cfg := config.Default()
 
 	cfg.Server.Hostname = "mail.example.com"
-	cfg.Server.Domain = "example.com"
+	cfg.Domains[0].Name = "example.com"
 	cfg.DNS.PublicIPv4 = "203.0.113.1"
 	cfg.DNS.SPFIncludes = []string{"_spf.google.com"}
 	cfg.Users = []config.User{{
 		AllowedSenders: []string{"a@example.com", "*@news.example.com"},
 	}}
 
-	recs := Build(cfg, "v=DKIM1; p=x")
+	recs := Build(cfg, map[string]string{cfg.Domains[0].Name: "v=DKIM1; p=x"})
 
 	owners := map[string]bool{}
 
@@ -80,10 +80,10 @@ func TestMappedIPv6IsNotEmittedAsIPv4(t *testing.T) {
 	cfg := config.Default()
 
 	cfg.Server.Hostname = "mail.example.com"
-	cfg.Server.Domain = "example.com"
+	cfg.Domains[0].Name = "example.com"
 	cfg.DNS.PublicIPv4 = "::ffff:192.0.2.1"
 
-	for _, record := range Build(cfg, "v=DKIM1; p=x") {
+	for _, record := range Build(cfg, map[string]string{cfg.Domains[0].Name: "v=DKIM1; p=x"}) {
 		if record.Type == "A" || strings.Contains(record.Value, "ip4:") {
 			t.Fatalf("mapped IPv6 emitted as IPv4: %+v", record)
 		}
@@ -94,12 +94,12 @@ func TestTLSRPTSeparateFromDMARC(t *testing.T) {
 	cfg := config.Default()
 
 	cfg.Server.Hostname = "mail.example.com"
-	cfg.Server.Domain = "example.com"
+	cfg.Domains[0].Name = "example.com"
 	cfg.DNS.ReportURI = "mailto:dmarc@example.com"
 	cfg.DNS.TLSRPTURI = "mailto:tlsrpt@example.com"
 	cfg.DNS.DMARC = "none"
 
-	recs := Build(cfg, "v=DKIM1; p=x")
+	recs := Build(cfg, map[string]string{cfg.Domains[0].Name: "v=DKIM1; p=x"})
 
 	var (
 		dmarc  string
@@ -156,10 +156,10 @@ func TestExternalDMARCHTTPSDestination(t *testing.T) {
 
 	cfg := config.Default()
 
-	cfg.Server.Domain = "example.com"
+	cfg.Domains[0].Name = "example.com"
 	cfg.DNS.ReportURI = "https://aggregate.example.org/v1/reports"
 
-	for _, record := range Build(cfg, "v=DKIM1; p=x") {
+	for _, record := range Build(cfg, map[string]string{cfg.Domains[0].Name: "v=DKIM1; p=x"}) {
 		if record.Name == "example.com._report._dmarc.aggregate.example.org." && record.Value == "v=DMARC1" {
 			return
 		}
@@ -175,7 +175,7 @@ func TestInstructionsListOnlyEnabledListenerPorts(t *testing.T) {
 	cfg.Server.DisableImplicitTLS = true
 	cfg.Server.SubmissionAddr = "127.0.0.1:2525"
 
-	_, body, err := Write(cfg, "v=DKIM1; p=x")
+	_, body, err := Write(cfg, map[string]string{cfg.Domains[0].Name: "v=DKIM1; p=x"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestReplyRejectionMXIsConditional(t *testing.T) {
 	cfg.Server.Hostname = "mail.example.com"
 	cfg.ReplyRejection.Domains = []string{"example.com", "news.example.com"}
 
-	for _, record := range Build(cfg, "v=DKIM1; p=x") {
+	for _, record := range Build(cfg, map[string]string{cfg.Domains[0].Name: "v=DKIM1; p=x"}) {
 		if record.Type == "MX" {
 			t.Fatalf("MX generated while disabled: %+v", record)
 		}
@@ -204,7 +204,7 @@ func TestReplyRejectionMXIsConditional(t *testing.T) {
 
 	cfg.ReplyRejection.Enabled = true
 
-	records := Build(cfg, "v=DKIM1; p=x")
+	records := Build(cfg, map[string]string{cfg.Domains[0].Name: "v=DKIM1; p=x"})
 
 	seen := map[string]string{}
 
@@ -225,13 +225,13 @@ func TestReplyRejectionGuidanceIncludesUncoveredEnvelopeDomains(t *testing.T) {
 	cfg := config.Default()
 
 	cfg.Server.Hostname = "mail.example.com"
-	cfg.Server.Domain = "example.com"
+	cfg.Domains[0].Name = "example.com"
 	cfg.Server.DataDirectory = t.TempDir()
 	cfg.ReplyRejection.Enabled = true
 	cfg.ReplyRejection.Domains = []string{"example.com"}
 	cfg.Users = []config.User{{AllowedSenders: []string{"sender@other.example", "*@news.example"}}}
 
-	_, body, err := Write(cfg, "v=DKIM1; p=x")
+	_, body, err := Write(cfg, map[string]string{cfg.Domains[0].Name: "v=DKIM1; p=x"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +269,7 @@ func TestOpenPGPRecordsUseRFC7929OwnerAndBinaryRDATA(t *testing.T) {
 
 	cfg.Server.DataDirectory = t.TempDir()
 
-	_, body, err := Write(cfg, "v=DKIM1; p=x", identity)
+	_, body, err := Write(cfg, map[string]string{cfg.Domains[0].Name: "v=DKIM1; p=x"}, identity)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -140,7 +140,7 @@ func TestEnsureDSNFlagsASCII(t *testing.T) {
 		_ = q.Close()
 	})
 
-	d := New(&config.Config{Server: config.Server{Hostname: "mail.test", Domain: "test"}}, q, nopLog{})
+	d := New(&config.Config{Server: config.Server{Hostname: "mail.test"}}, q, nopLog{})
 
 	now := time.Now()
 
@@ -246,7 +246,6 @@ func TestEnsureDSNFlagsFailedUTF8Recipient(t *testing.T) {
 	dir := t.TempDir()
 
 	q, err := queue.Open(dir, queue.Limits{})
-
 	if err != nil {
 		t.Fatal(err)
 	}

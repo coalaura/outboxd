@@ -165,7 +165,7 @@ func (cfg *Config) adopt(other *Config) {
 	cfg.Server = other.Server
 	cfg.ReplyRejection = other.ReplyRejection
 	cfg.TLS = other.TLS
-	cfg.DKIM = other.DKIM
+	cfg.Domains = other.Domains
 	cfg.OpenPGP = other.OpenPGP
 	cfg.Delivery = other.Delivery
 	cfg.DNS = other.DNS

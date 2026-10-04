@@ -289,15 +289,10 @@ func provision(configPath string) error {
 		return fmt.Errorf("provision DKIM key: %w", err)
 	}
 
-	path, err := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
-	if err != nil {
-		return err
-	}
-
 	if generated {
-		fmt.Fprintf(os.Stdout, "Provisioned DKIM key at %q (create-once).\n", path)
+		fmt.Fprintln(os.Stdout, "Provisioned missing domain DKIM keys (create-once).")
 	} else {
-		fmt.Fprintf(os.Stdout, "DKIM key already provisioned at %q; left unchanged.\n", path)
+		fmt.Fprintln(os.Stdout, "All domain DKIM keys already provisioned; left unchanged.")
 	}
 
 	_, err = pgpsign.Load(cfg)

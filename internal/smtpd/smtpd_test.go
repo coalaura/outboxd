@@ -63,13 +63,13 @@ func testServerParts(t *testing.T) (*config.Config, *certs.Keeper, *queue.Queue)
 		t.Fatal(err)
 	}
 
-	body := "server:\n  hostname: mail.test.example\n  domain: test.example\n  data_directory: " +
+	body := "server:\n  hostname: mail.test.example\n  data_directory: " +
 		filepath.ToSlash(dataDir) + "\n  max_message_bytes: 1048576\n  max_recipients: 10\n" +
 		"  max_messages_per_hour: 100\n  max_recipients_per_hour: 1000\n  read_timeout: 1m\n  write_timeout: 1m\n" +
 		"  submission_addr: \"127.0.0.1:0\"\n  implicit_tls_addr: \"127.0.0.1:0\"\n" +
 		"  max_connections: 16\n  max_connections_per_ip: 4\n  auth_workers: 2\n" +
 		"tls:\n  mode: self_signed\n  certificate_file: tls/server.crt\n  private_key_file: tls/server.key\n  minimum_version: \"1.2\"\n" +
-		"dkim:\n  selector: mail\n  private_key_file: dkim/mail.key\n  headers:\n    - From\n    - Sender\n    - To\n    - Subject\n    - Date\n    - Message-ID\n" +
+		"domains:\n  - name: test.example\n    dkim:\n      selector: mail\n      private_key_file: dkim/mail.key\n      headers: [From, Sender, To, Subject, Date, Message-ID]\n" +
 		"delivery:\n  tls_mode: opportunistic\n  max_attempts: 3\n  maximum_lifetime: 1h\n  initial_retry_delay: 1s\n  maximum_retry_delay: 1m\n" +
 		"  domain_concurrency: 1\n  global_concurrency: 2\n  connection_timeout: 5s\n  command_timeout: 30s\n  submission_timeout: 1m\n" +
 		"dns:\n  dmarc_policy: none\n  output_file: dns-records.txt\n"

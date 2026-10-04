@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -27,7 +28,7 @@ func (cfg *Config) Validate() error {
 		return err
 	}
 
-	err = validateDomain("server.domain", cfg.Server.Domain)
+	err = cfg.validateDomains()
 	if err != nil {
 		return err
 	}
@@ -161,60 +162,7 @@ func (cfg *Config) Validate() error {
 		return fmt.Errorf("tls.minimum_version must be 1.2 or 1.3, got %q", cfg.TLS.MinimumVersion)
 	}
 
-	err = validateDNSLabel("dkim.selector", cfg.DKIM.Selector)
-	if err != nil {
-		return err
-	}
-
-	if cfg.DKIM.PrivateKeyFile == "" {
-		return errors.New("dkim.private_key_file must not be empty")
-	}
-
-	_, err = cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
-	if err != nil {
-		return fmt.Errorf("dkim.private_key_file: %w", err)
-	}
-
-	var (
-		hasFromHeader   bool
-		hasSenderHeader bool
-		seenDKIMHeaders = make(map[string]struct{}, len(cfg.DKIM.Headers))
-	)
-
-	for _, header := range cfg.DKIM.Headers {
-		err = validateHeaderName(header)
-		if err != nil {
-			return fmt.Errorf("dkim.headers: %w", err)
-		}
-
-		canon := strings.ToLower(header)
-
-		_, ok := seenDKIMHeaders[canon]
-		if ok {
-			return fmt.Errorf("dkim.headers: duplicate %q", header)
-		}
-
-		seenDKIMHeaders[canon] = struct{}{}
-
-		switch canon {
-		case "from":
-			hasFromHeader = true
-		case "sender":
-			hasSenderHeader = true
-		}
-	}
-
-	if !hasFromHeader {
-		return errors.New("dkim.headers must contain From")
-	}
-
-	if !hasSenderHeader {
-		return errors.New("dkim.headers must contain Sender")
-	}
-
 	openPGPSenders := make(map[string]struct{}, len(cfg.OpenPGP.Identities))
-
-	_, signsAutocrypt := seenDKIMHeaders["autocrypt"]
 
 	if len(cfg.OpenPGP.Identities) > MaxOpenPGPIdentities {
 		return fmt.Errorf("openpgp.identities must contain at most %d entries", MaxOpenPGPIdentities)
@@ -247,8 +195,17 @@ func (cfg *Config) Validate() error {
 			return fmt.Errorf("openpgp.identities[%d].signing must be required", i)
 		}
 
+		domain := cfg.DomainFor(sender[at+1:])
+		if domain == nil {
+			return fmt.Errorf("openpgp.identities[%d].sender is outside configured domains", i)
+		}
+
+		signsAutocrypt := slices.ContainsFunc(domain.DKIM.Headers, func(header string) bool {
+			return strings.EqualFold(header, "Autocrypt")
+		})
+
 		if identity.Autocrypt && !signsAutocrypt {
-			return fmt.Errorf("openpgp.identities[%d].autocrypt requires Autocrypt in dkim.headers", i)
+			return fmt.Errorf("openpgp.identities[%d].autocrypt requires Autocrypt in the signing domain's dkim.headers", i)
 		}
 	}
 
@@ -395,12 +352,11 @@ func (cfg *Config) Validate() error {
 			return fmt.Errorf("users[%d]: %w", i, err)
 		}
 
-		// Sender outside the DKIM domain can never produce an aligned DMARC pass.
 		for _, sender := range user.AllowedSenders {
 			domain := strings.ToLower(sender[strings.LastIndexByte(sender, '@')+1:])
 
-			if domain != cfg.Server.Domain && !strings.HasSuffix(domain, "."+cfg.Server.Domain) {
-				return fmt.Errorf("users[%d]: sender %q is outside server.domain %q; DKIM signs with d=%s so this mail cannot pass DMARC", i, sender, cfg.Server.Domain, cfg.Server.Domain)
+			if cfg.DomainFor(domain) == nil {
+				return fmt.Errorf("users[%d]: sender %q is outside configured domains", i, sender)
 			}
 		}
 

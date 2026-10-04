@@ -56,7 +56,7 @@ type mxCandidate struct {
 
 // Signer produces DKIM-Signature headers for locally generated messages (DSNs).
 type Signer interface {
-	Signature(message []byte) (string, error)
+	Signature(from string, message []byte) (string, error)
 }
 
 // Deliverer drains the queue towards destination MX servers.

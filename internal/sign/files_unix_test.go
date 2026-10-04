@@ -22,7 +22,7 @@ func TestLoadRejectsAccessibleAndSymlinkedKeyUnix(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	path, _ := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
+	path, _ := cfg.ResolveGeneratedPath(cfg.Domains[0].DKIM.PrivateKeyFile)
 
 	err = os.Chmod(path, 0640)
 	if err != nil {

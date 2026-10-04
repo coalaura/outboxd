@@ -96,7 +96,7 @@ func (l *captureLog) String() string {
 }
 
 // testServerWithUser builds a submission stack with one Argon2id user and DKIM.
-func testServerWithUser(t *testing.T, password string) (*Server, *config.Config, *queue.Queue, *sign.Signer, *x509.CertPool) {
+func testServerWithUser(t *testing.T, password string) (*Server, *config.Config, *queue.Queue, *sign.Signers, *x509.CertPool) {
 	t.Helper()
 
 	base := t.TempDir()
@@ -112,7 +112,6 @@ func testServerWithUser(t *testing.T, password string) (*Server, *config.Config,
 	body := strings.Join([]string{
 		"server:",
 		"  hostname: mail.test.example",
-		"  domain: test.example",
 		"  data_directory: " + filepath.ToSlash(dataDir),
 		"  max_message_bytes: 1048576",
 		"  max_recipients: 10",
@@ -131,16 +130,12 @@ func testServerWithUser(t *testing.T, password string) (*Server, *config.Config,
 		"  certificate_file: tls/server.crt",
 		"  private_key_file: tls/server.key",
 		"  minimum_version: \"1.2\"",
-		"dkim:",
-		"  selector: mail",
-		"  private_key_file: dkim/mail.key",
-		"  headers:",
-		"    - From",
-		"    - Sender",
-		"    - To",
-		"    - Subject",
-		"    - Date",
-		"    - Message-ID",
+		"domains:",
+		"  - name: test.example",
+		"    dkim:",
+		"      selector: mail",
+		"      private_key_file: dkim/mail.key",
+		"      headers: [From, Sender, To, Subject, Date, Message-ID]",
 		"delivery:",
 		"  tls_mode: opportunistic",
 		"  max_attempts: 3",
@@ -773,7 +768,7 @@ func TestSigningAndQueueFailuresConsumeSubmissionBudget(t *testing.T) {
 	cl.authPlain(t, "alice", failureRatePassword)
 
 	srv.rates = newSubmissionLimiter(1, 1, 1, 1)
-	srv.signer = new(sign.Signer)
+	srv.signer = new(sign.Signers)
 
 	beginMessage(t, cl, "")
 	writeMessage(cl, "sign failure")
@@ -832,7 +827,7 @@ func TestOpenPGPFailureSkipsDKIMAndQueue(t *testing.T) {
 		return nil, false, errors.New("injected OpenPGP failure")
 	}
 
-	srv.signMessage = func(context.Context, []byte) (string, error) {
+	srv.signMessage = func(context.Context, string, []byte) (string, error) {
 		dkim.Add(1)
 
 		return "", nil
@@ -873,7 +868,7 @@ func TestOpenPGPExpansionFailureReturnsMessageTooLarge(t *testing.T) {
 		return nil, false, fmt.Errorf("signing expansion: %w", openpgp.ErrMessageTooLarge)
 	}
 
-	srv.signMessage = func(context.Context, []byte) (string, error) {
+	srv.signMessage = func(context.Context, string, []byte) (string, error) {
 		dkim.Add(1)
 
 		return "", nil
@@ -911,7 +906,7 @@ func TestOpenPGPTransformRunsBeforeDKIM(t *testing.T) {
 		return transformed, true, nil
 	}
 
-	srv.signMessage = func(_ context.Context, data []byte) (string, error) {
+	srv.signMessage = func(_ context.Context, _ string, data []byte) (string, error) {
 		if !bytes.Equal(data, transformed) {
 			return "", fmt.Errorf("DKIM received %q", data)
 		}
@@ -1347,7 +1342,7 @@ func TestDataDeadlineDuringSigningPreventsQueueAdd(t *testing.T) {
 		added  atomic.Int32
 	)
 
-	srv.signMessage = func(ctx context.Context, data []byte) (string, error) {
+	srv.signMessage = func(ctx context.Context, from string, data []byte) (string, error) {
 		signed.Add(1)
 		<-ctx.Done()
 

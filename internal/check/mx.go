@@ -108,8 +108,10 @@ func checkEnvelopeMX(ctx context.Context, r Resolver, cfg *config.Config) []Resu
 }
 
 func envelopeDomains(cfg *config.Config) []string {
-	set := map[string]struct{}{
-		strings.ToLower(strings.TrimSuffix(cfg.Server.Domain, ".")): {},
+	set := make(map[string]struct{}, len(cfg.Domains))
+
+	for i := range cfg.Domains {
+		set[cfg.Domains[i].Name] = struct{}{}
 	}
 
 	for i := range cfg.Users {

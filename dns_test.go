@@ -32,7 +32,7 @@ func TestDNSDoesNotGenerateMissingDKIMKeyOrReplaceOutput(t *testing.T) {
 
 	provisionOwnershipFiles(t, cfg)
 
-	keyPath, err := cfg.ResolveGeneratedPath(cfg.DKIM.PrivateKeyFile)
+	keyPath, err := cfg.ResolveGeneratedPath(cfg.Domains[0].DKIM.PrivateKeyFile)
 	if err != nil {
 		t.Fatal(err)
 	}

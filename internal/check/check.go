@@ -37,15 +37,6 @@ type Resolver interface {
 	LookupMX(ctx context.Context, name string) ([]*net.MX, error)
 }
 
-// DKIMKey is the local DKIM public key material used to verify the published record.
-type DKIMKey struct {
-	// Selector is the DNS selector label.
-	Selector string
-
-	// PublicKey is base64 SubjectPublicKeyInfo (same form as sign.Signer.PublicKey).
-	PublicKey string
-}
-
 // Options configures a Check run.
 type Options struct {
 	Config *config.Config
@@ -53,8 +44,8 @@ type Options struct {
 	// Resolver defaults to DefaultResolver when nil.
 	Resolver Resolver
 
-	// DKIM is optional; when set, the selector TXT is compared to the key.
-	DKIM *DKIMKey
+	// DKIM maps each domain to its local base64 SubjectPublicKeyInfo.
+	DKIM map[string]string
 
 	// Now overrides time for expiry-adjacent checks (unused now; reserved).
 	Now func() time.Time
@@ -98,8 +89,14 @@ func Run(ctx context.Context, opts Options) []Result {
 	out = append(out, checkHostnameAddrs(ctx, r, cfg)...)
 	out = append(out, checkFCrDNS(ctx, r, cfg)...)
 	out = append(out, checkSPF(ctx, r, cfg)...)
-	out = append(out, checkDKIM(ctx, r, cfg, opts.DKIM)...)
-	out = append(out, checkDMARC(ctx, r, cfg)...)
+
+	for i := range cfg.Domains {
+		domain := &cfg.Domains[i]
+
+		out = append(out, checkDKIM(ctx, r, domain, opts.DKIM[domain.Name])...)
+		out = append(out, checkDMARC(ctx, r, cfg, domain.Name)...)
+	}
+
 	out = append(out, checkEnvelopeMX(ctx, r, cfg)...)
 
 	return out

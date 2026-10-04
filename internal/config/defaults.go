@@ -14,8 +14,20 @@ func (cfg *Config) applyDefaults() {
 		return strings.EqualFold(strings.TrimSpace(header), "Sender")
 	}
 
-	if !slices.ContainsFunc(cfg.DKIM.Headers, isSender) {
-		cfg.DKIM.Headers = append(cfg.DKIM.Headers, "Sender")
+	for i := range cfg.Domains {
+		dkim := &cfg.Domains[i].DKIM
+
+		if dkim.Selector == "" {
+			dkim.Selector = "mail"
+		}
+
+		if dkim.Headers == nil {
+			dkim.Headers = defaultDKIMHeaders()
+		}
+
+		if !slices.ContainsFunc(dkim.Headers, isSender) {
+			dkim.Headers = append(dkim.Headers, "Sender")
+		}
 	}
 
 	if cfg.Server.DisableSubmission {
@@ -47,7 +59,6 @@ func Default() *Config {
 		LogLevel: "print",
 		Server: Server{
 			Hostname:                "mail.example.invalid",
-			Domain:                  "example.invalid",
 			MaxMessageBytes:         25 << 20,
 			MaxRecipients:           100,
 			MaxMessagesPerHour:      1000,
@@ -85,24 +96,14 @@ func Default() *Config {
 			PrivateKeyFile:  "tls/server.key",
 			MinimumVersion:  "1.2",
 		},
-		DKIM: DKIM{
-			Selector:       "mail",
-			PrivateKeyFile: "dkim/mail.key",
-			Headers: []string{
-				"From",
-				"Sender",
-				"To",
-				"Cc",
-				"Subject",
-				"Date",
-				"Message-ID",
-				"MIME-Version",
-				"Content-Type",
-				"Content-Transfer-Encoding",
-				"Reply-To",
-				"Autocrypt",
+		Domains: []Domain{{
+			Name: "example.invalid",
+			DKIM: DKIM{
+				Selector:       "mail",
+				PrivateKeyFile: "dkim/example.invalid.key",
+				Headers:        defaultDKIMHeaders(),
 			},
-		},
+		}},
 		Delivery: Delivery{
 			TLSMode:               "required",
 			AllowPlaintext:        &allowPlain,
@@ -128,4 +129,8 @@ func Default() *Config {
 		},
 		Users: nil,
 	}
+}
+
+func defaultDKIMHeaders() []string {
+	return []string{"From", "Sender", "To", "Cc", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type", "Content-Transfer-Encoding", "Reply-To", "Autocrypt"}
 }

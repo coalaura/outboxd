@@ -36,7 +36,7 @@ func runCheck(configPath string) error {
 		return fmt.Errorf("load local DKIM key: %w", err)
 	}
 
-	opts.DKIM = &check.DKIMKey{Selector: cfg.DKIM.Selector, PublicKey: signer.PublicKey}
+	opts.DKIM = signer.PublicKeys()
 
 	_, err = pgpsign.Load(cfg)
 	if err != nil {

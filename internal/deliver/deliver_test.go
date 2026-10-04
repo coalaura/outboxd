@@ -109,7 +109,6 @@ func testConfig() *config.Config {
 	return &config.Config{
 		Server: config.Server{
 			Hostname: "outboxd.test",
-			Domain:   "outboxd.test",
 		},
 		Delivery: config.Delivery{
 			TLSMode:                  "opportunistic",

@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"fmt"
 
 	"github.com/coalaura/outboxd/internal/disk"
 	"github.com/goccy/go-yaml"
@@ -49,7 +50,6 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.log_level":                            {yaml.HeadComment(` minimum log level: "debug", "print", "warn", or "error"; changes require a restart`)},
 		"$.server":                               {yaml.HeadComment("\n# authenticated SMTP submission server")},
 		"$.server.hostname":                      {yaml.HeadComment(" public SMTP hostname used for EHLO, TLS, and reverse DNS")},
-		"$.server.domain":                        {yaml.HeadComment(" sending domain used for DKIM, SPF, and DMARC; prefer a dedicated subdomain")},
 		"$.server.max_message_bytes":             {yaml.HeadComment(" maximum accepted message size in bytes (bounded so one DATA worker fits the 512 MiB processing budget)")},
 		"$.server.max_recipients":                {yaml.HeadComment(" maximum recipients accepted for one message")},
 		"$.server.max_messages_per_hour":         {yaml.HeadComment(" per-user hourly message rate (maximum 1000000)")},
@@ -94,10 +94,7 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.tls.private_key_file":          {yaml.HeadComment(" TLS private key; relative paths are resolved below data_directory")},
 		"$.tls.minimum_version":           {yaml.HeadComment(` minimum accepted TLS version: "1.2" or "1.3"`)},
 
-		"$.dkim":                  {yaml.HeadComment("\n# DKIM signing configuration")},
-		"$.dkim.selector":         {yaml.HeadComment(" DNS selector placed before _domainkey")},
-		"$.dkim.private_key_file": {yaml.HeadComment(" create-once signing key provisioned explicitly with 'outboxd provision'")},
-		"$.dkim.headers":          {yaml.HeadComment(" message headers included in the DKIM signature; From is mandatory")},
+		"$.domains": {yaml.HeadComment("\n# sending domains (1 to 128); each has an independent DKIM key; the most specific domain matching From signs the message")},
 
 		"$.openpgp":                          {yaml.HeadComment("\n# optional RFC 3156 OpenPGP/MIME signing, recipient encryption, and key publication")},
 		"$.openpgp.identities":               {yaml.HeadComment(" exact From identities and their generated or operator-managed private keys; sender local parts are case-sensitive, relative paths resolve below data_directory, signing must be required, and autocrypt publishes the minimized public key in signed messages")},
@@ -127,7 +124,7 @@ func (cfg *Config) marshal() ([]byte, error) {
 		"$.delivery.allow_private_destinations":       {yaml.HeadComment(" permit delivery to private/loopback MX addresses (default false)")},
 		"$.delivery.destination_allowlist":            {yaml.HeadComment(" exact destination IP addresses exempt from restricted-address filtering; prefer this to allowing all private destinations")},
 
-		"$.dns":                    {yaml.HeadComment("\n# values used to generate dns-records.txt (not outbound bind addresses)")},
+		"$.dns":                    {yaml.HeadComment("\n# shared DNS policy for all sending domains; values used to generate dns-records.txt (not outbound bind addresses)")},
 		"$.dns.public_ipv4":        {yaml.HeadComment(" static public IPv4 for A/SPF DNS generation")},
 		"$.dns.public_ipv6":        {yaml.HeadComment(" static public IPv6 for AAAA/SPF DNS generation; omit until forward and reverse DNS are ready")},
 		"$.dns.dmarc_policy":       {yaml.HeadComment(` start with "none"; stage to "quarantine" then "reject" after verifying alignment`)},
@@ -141,6 +138,16 @@ func (cfg *Config) marshal() ([]byte, error) {
 	}
 
 	cfg.dataMu.RLock()
+
+	for index := range cfg.Domains {
+		prefix := fmt.Sprintf("$.domains[%d]", index)
+
+		comments[prefix+".name"] = []*yaml.Comment{yaml.HeadComment(" sending domain; subdomains inherit this identity unless configured separately")}
+		comments[prefix+".dkim.selector"] = []*yaml.Comment{yaml.HeadComment(" DNS selector before _domainkey; defaults to mail; selectors may be reused across different domains")}
+		comments[prefix+".dkim.private_key_file"] = []*yaml.Comment{yaml.HeadComment(" required distinct create-once key path below data_directory; provision explicitly with 'outboxd provision'")}
+		comments[prefix+".dkim.headers"] = []*yaml.Comment{yaml.HeadComment(" headers covered by this domain's signature; From and Sender are mandatory; omitted lists use the standard headers")}
+	}
+
 	err := yaml.NewEncoder(&buffer, yaml.WithComment(comments), yaml.Indent(2)).Encode(cfg)
 	cfg.dataMu.RUnlock()
 
