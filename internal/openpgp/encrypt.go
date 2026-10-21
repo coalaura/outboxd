@@ -22,7 +22,7 @@ import (
 	"github.com/coalaura/outboxd/internal/mailbox"
 )
 
-// Recipients is an immutable startup snapshot of static recipient public keys.
+// Recipients is an immutable startup snapshot of recipient public keys.
 type Recipients struct {
 	keys     map[string]*pgp.Entity
 	required map[string]struct{}
@@ -58,10 +58,14 @@ func (r *Recipients) KeyID(recipient string) (string, bool, error) {
 	return fmt.Sprintf("%X", encryptionKey.PublicKey.Fingerprint), true, nil
 }
 
-// LoadRecipients reads and validates static recipient public keys.
+// LoadRecipients reads local keys and discovers missing required keys when WKD is enabled.
 func LoadRecipients(cfg *config.Config) (*Recipients, error) {
+	return loadRecipients(cfg, newWKDClient().lookup)
+}
+
+func loadRecipients(cfg *config.Config, lookup func(context.Context, string) ([]byte, error)) (*Recipients, error) {
 	recipients := &Recipients{
-		keys:     make(map[string]*pgp.Entity),
+		keys:     make(map[string]*pgp.Entity, len(cfg.OpenPGP.RequireEncryptionFor)),
 		required: make(map[string]struct{}, len(cfg.OpenPGP.RequireEncryptionFor)),
 		maximum:  cfg.Server.MaxMessageBytes,
 	}
@@ -75,9 +79,40 @@ func LoadRecipients(cfg *config.Config) (*Recipients, error) {
 		recipients.required[canonical] = struct{}{}
 	}
 
+	err := recipients.loadStatic(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), wkdLoadTimeout)
+	defer cancel()
+
+	for _, configured := range cfg.OpenPGP.RequireEncryptionFor {
+		address, _ := mailbox.CanonicalAddress(configured)
+		if recipients.keys[address] != nil {
+			continue
+		}
+
+		if !cfg.OpenPGP.UseWKD {
+			return nil, fmt.Errorf("required encryption recipient %q has no usable static key", address)
+		}
+
+		entity, err := loadWKDRecipient(ctx, cfg, address, lookup)
+		if err != nil {
+			return nil, fmt.Errorf("required encryption recipient %q: %w", address, err)
+		}
+
+		// Discovery authorizes only the requested mailbox, never other key user IDs.
+		recipients.keys[address] = entity
+	}
+
+	return recipients, nil
+}
+
+func (r *Recipients) loadStatic(cfg *config.Config) error {
 	configured := cfg.OpenPGP.RecipientKeysDirectory
 	if configured == "" {
-		return recipients, nil
+		return nil
 	}
 
 	directory := cfg.ResolvePath(configured)
@@ -85,23 +120,23 @@ func LoadRecipients(cfg *config.Config) (*Recipients, error) {
 	if !filepath.IsAbs(configured) {
 		err := cfg.CheckGeneratedParents(filepath.Join(directory, "recipient-key"))
 		if err != nil {
-			return nil, fmt.Errorf("check recipient key directory: %w", err)
+			return fmt.Errorf("check recipient key directory: %w", err)
 		}
 	}
 
 	err := disk.ValidatePath(directory)
 	if err != nil {
-		return nil, fmt.Errorf("validate recipient key directory: %w", err)
+		return fmt.Errorf("validate recipient key directory: %w", err)
 	}
 
 	err = disk.ValidatePrivateDirectory(directory)
 	if err != nil {
-		return nil, fmt.Errorf("validate recipient key directory: %w", err)
+		return fmt.Errorf("validate recipient key directory: %w", err)
 	}
 
 	entries, err := os.ReadDir(directory)
 	if err != nil {
-		return nil, fmt.Errorf("read recipient key directory: %w", err)
+		return fmt.Errorf("read recipient key directory: %w", err)
 	}
 
 	sort.Slice(entries, func(i, j int) bool {
@@ -119,32 +154,26 @@ func LoadRecipients(cfg *config.Config) (*Recipients, error) {
 		keyFiles++
 
 		if keyFiles > config.MaxOpenPGPRecipientKeys {
-			return nil, fmt.Errorf("recipient key directory contains more than %d key files", config.MaxOpenPGPRecipientKeys)
+			return fmt.Errorf("recipient key directory contains more than %d key files", config.MaxOpenPGPRecipientKeys)
 		}
 
 		path := filepath.Join(directory, entry.Name())
 
 		entity, addresses, err := readRecipientEntity(path)
 		if err != nil {
-			return nil, fmt.Errorf("recipient key %q: %w", entry.Name(), err)
+			return fmt.Errorf("recipient key %q: %w", entry.Name(), err)
 		}
 
 		for _, address := range addresses {
-			if _, exists := recipients.keys[address]; exists {
-				return nil, fmt.Errorf("recipient address %q is present in multiple key files", address)
+			if _, exists := r.keys[address]; exists {
+				return fmt.Errorf("recipient address %q is present in multiple key files", address)
 			}
 
-			recipients.keys[address] = entity
+			r.keys[address] = entity
 		}
 	}
 
-	for address := range recipients.required {
-		if recipients.keys[address] == nil {
-			return nil, fmt.Errorf("required encryption recipient %q has no usable static key", address)
-		}
-	}
-
-	return recipients, nil
+	return nil
 }
 
 func readRecipientEntity(path string) (*pgp.Entity, []string, error) {
@@ -155,6 +184,10 @@ func readRecipientEntity(path string) (*pgp.Entity, []string, error) {
 
 	defer clear(keyData)
 
+	return parseRecipientEntity(keyData)
+}
+
+func parseRecipientEntity(keyData []byte) (*pgp.Entity, []string, error) {
 	entities, err := pgp.ReadArmoredKeyRing(bytes.NewReader(keyData))
 	if err != nil {
 		entities, err = pgp.ReadKeyRing(bytes.NewReader(keyData))

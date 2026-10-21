@@ -327,6 +327,24 @@ func TestOpenPGPRequiredRecipientValidation(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "recipient_keys_directory") {
 		t.Fatalf("missing directory Validate() error = %v", err)
 	}
+
+	cfg.OpenPGP.UseWKD = true
+
+	err = cfg.Validate()
+	if err != nil {
+		t.Fatalf("WKD-only Validate() error = %v", err)
+	}
+
+	if cfg.OpenPGP.WKDCacheDirectory != "openpgp/cache" {
+		t.Fatalf("default WKD cache = %q", cfg.OpenPGP.WKDCacheDirectory)
+	}
+
+	cfg.OpenPGP.WKDCacheDirectory = "../outside"
+
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "wkd_cache_directory") {
+		t.Fatalf("escaping WKD cache Validate() error = %v", err)
+	}
 }
 
 func TestReplyRejectionValidation(t *testing.T) {

@@ -229,8 +229,15 @@ func (cfg *Config) Validate() error {
 		cfg.OpenPGP.RequireEncryptionFor[i] = recipient
 	}
 
-	if len(requiredEncryption) != 0 && cfg.OpenPGP.RecipientKeysDirectory == "" {
-		return errors.New("openpgp.recipient_keys_directory is required when require_encryption_for is not empty")
+	if len(requiredEncryption) != 0 && cfg.OpenPGP.RecipientKeysDirectory == "" && !cfg.OpenPGP.UseWKD {
+		return errors.New("openpgp.recipient_keys_directory or use_wkd is required when require_encryption_for is not empty")
+	}
+
+	if cfg.OpenPGP.UseWKD {
+		_, err := cfg.ResolveGeneratedPath(cfg.OpenPGP.WKDCacheDirectory)
+		if err != nil {
+			return fmt.Errorf("openpgp.wkd_cache_directory: %w", err)
+		}
 	}
 
 	switch cfg.Delivery.TLSMode {

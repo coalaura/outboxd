@@ -42,6 +42,10 @@ func (cfg *Config) applyDefaults() {
 		cfg.Delivery.TLSMode = "required"
 	}
 
+	if cfg.OpenPGP.WKDCacheDirectory == "" {
+		cfg.OpenPGP.WKDCacheDirectory = "openpgp/cache"
+	}
+
 	if cfg.DNS.DMARC == "" {
 		cfg.DNS.DMARC = "none"
 	}
@@ -104,6 +108,7 @@ func Default() *Config {
 				Headers:        defaultDKIMHeaders(),
 			},
 		}},
+		OpenPGP: OpenPGP{WKDCacheDirectory: "openpgp/cache"},
 		Delivery: Delivery{
 			TLSMode:               "required",
 			AllowPlaintext:        &allowPlain,

@@ -5,7 +5,7 @@
 
 outboxd is a single-binary outbound mail server for applications and services that need reliable, properly signed email delivery without painfully assembling and maintaining a multi-service mail stack.
 
-It accepts authenticated SMTP submission from configured users, durably queues mail, delivers directly to recipient MX servers, DKIM-signs messages and can optionally apply OpenPGP/MIME signatures per sender and encryption for recipients with operator-supplied keys.
+It accepts authenticated SMTP submission from configured users, durably queues mail, delivers directly to recipient MX servers, DKIM-signs messages and can optionally apply OpenPGP/MIME signatures per sender and encryption using local recipient keys or opt-in WKD discovery for required recipients.
 
 It is for sending mail: transactional mail, notifications, error reporting and application delivery. It is not an inbound mailbox server, IMAP server, spam filter or webmail application. An optional rejection-only SMTP endpoint can reject attempted replies without accepting their message data.
 
@@ -178,11 +178,17 @@ Generate and configure an encrypted RSA-3072 key for an existing user's exact al
 
 `signing_key` accepts one armored or binary private-key entity and must contain the configured sender as a key identity plus a currently valid signing key. For an encrypted private key, set `passphrase_file` to a private file containing exactly one passphrase line. Do not put passphrases in the YAML or command line. Relative paths resolve below `server.data_directory`; absolute paths are allowed. Keys and passphrase files must be private regular files and may not be symlinks or reparse points.
 
-Signing produces RFC 3156 `multipart/signed` data before recipient encryption and DKIM is applied last to each final message variant. The exact canonical MIME entity placed in the signed first part is covered, with 8-bit MIME leaf bodies converted to quoted-printable. If key loading, canonicalization, signing or encryption fails, submission receives an error and the message is not queued or accepted. Normal `serve`, `check`, `dns` and `provision` operations never generate OpenPGP keys. outboxd supports OpenPGP/MIME, not inline PGP. `check` validates configured OpenPGP keys without modifying them. Keys and passphrases are loaded only at startup, so rotation requires a restart.
+Signing produces RFC 3156 `multipart/signed` data before recipient encryption and DKIM is applied last to each final message variant. The exact canonical MIME entity placed in the signed first part is covered, with 8-bit MIME leaf bodies converted to quoted-printable. If key loading, canonicalization, signing or encryption fails, submission receives an error and the message is not queued or accepted. Normal `serve`, `check`, `dns` and `provision` operations never generate OpenPGP keys. outboxd supports OpenPGP/MIME, not inline PGP. `check` validates configured OpenPGP keys and may refresh the WKD cache when discovery is enabled. Keys and passphrases are loaded only at startup, so rotation requires a restart.
 
 For static recipient encryption, set `openpgp.recipient_keys_directory` to a private directory containing armored `.asc` or binary `.pgp` public-key files. Each file must contain exactly one public entity, no private packets and a currently valid encryption key. outboxd derives exact recipient addresses from active, self-signed email user IDs; local parts are case-sensitive, while domains are case-insensitive and normalized to their ASCII IDNA form. A recipient with a configured key is always encrypted and encryption failure never falls back to plaintext. Recipients without keys remain plaintext unless listed in `openpgp.require_encryption_for`; every required address must have a usable key or startup fails. Mixed plaintext and encrypted recipients are committed atomically as immutable per-recipient message variants and retries reuse those stored bytes.
 
-Static recipient keys are operator-trusted input rather than automatically discovered keys. outboxd does not currently fetch recipient keys from WKD, OPENPGPKEY or keyservers. Verify key fingerprints independently before placing keys in the directory.
+Static recipient keys are operator-trusted input rather than automatically discovered keys. Verify key fingerprints independently before placing keys in the directory.
+
+Set `openpgp.use_wkd: true` to attempt recipient WKD discovery during `serve` startup and `check`, only for addresses in `openpgp.require_encryption_for` without a local key. Local keys take precedence. Discovery prefers the advanced `openpgpkey.<domain>` HTTPS endpoint and tries the direct domain endpoint only when DNS reports the advanced hostname absent. A missing, invalid, expired or mismatched key fails startup/check; lookup and encryption failures never fall back to plaintext. Returned keys must contain exactly one public entity with a usable encryption key and an active self-signed identity matching the exact required mailbox. Other identities on a discovered key do not enable encryption for additional recipients. outboxd does not perform opportunistic recipient discovery, OPENPGPKEY lookups or keyserver searches.
+
+Successful WKD keys are cached privately under `openpgp.wkd_cache_directory` (default `openpgp/cache`, confined beneath `server.data_directory`). Startup/check reuses valid entries fetched within the last 24 hours and refreshes older or unusable keys; stale entries never rescue a failed lookup. Corrupt, mismatched or insecure cache files fail validation. Cache writes must complete durably before a discovered key is selected. Loaded keys remain an immutable startup snapshot; there is no background refresh or lookup during submission or retry. Restart to pick up remote key changes; remove the corresponding cache entry while stopped to force discovery before its freshness period ends.
+
+WKD uses verified HTTPS on port 443 without redirects or proxies, blocks private and reserved destinations before dialing, limits responses to 1 MiB and allows at most 10 seconds per lookup and two minutes of discovery per load. SMTP destination allowlists do not relax WKD destination checks. The cache follows the same private-directory, regular-file and no-link rules as other managed key material.
 
 outboxd derives a minimized public key containing the primary public key, exactly one active configured user ID and its self-signature, public subkeys and their binding signatures and applicable revocations. It never publishes private packets, unrelated user IDs or third-party certifications. Three optional discovery mechanisms use these same bytes:
 
@@ -280,10 +286,6 @@ See [UPGRADE.md](UPGRADE.md) for version-specific migration instructions before 
 ### Updating configuration comments and defaults
 
 After replacing the binary and completing any required configuration migration, run `config update` as root with group `outboxd` to atomically rewrite an existing configuration in the current documented format, then rerun `setup.sh` to restore its service-readable ownership and mode. Configured values are retained and fields omitted by older versions receive current defaults. The command requires an existing valid configuration, does not provision keys or other assets and requires a daemon restart before the updated startup configuration takes effect. The canonical rewrite replaces custom YAML formatting and comments with outboxd's generated documentation.
-
-## Todo
-
-- Optional recipient WKD lookup via `openpgp.use_wkd` and `openpgp.wkd_cache_directory` (`openpgp/cache`). Required recipients still prefer a local key; if none is present and WKD is enabled, discovery is attempted and a missing key fails. Encryption is never opportunistic.
 
 ## Security Notes
 

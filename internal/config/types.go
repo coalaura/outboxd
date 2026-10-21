@@ -74,6 +74,8 @@ type OpenPGP struct {
 	Identities             []OpenPGPIdentity `yaml:"identities"`
 	RecipientKeysDirectory string            `yaml:"recipient_keys_directory"`
 	RequireEncryptionFor   []string          `yaml:"require_encryption_for"`
+	UseWKD                 bool              `yaml:"use_wkd"`
+	WKDCacheDirectory      string            `yaml:"wkd_cache_directory"`
 }
 
 type OpenPGPIdentity struct {
