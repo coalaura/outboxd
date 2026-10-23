@@ -31,7 +31,7 @@ For a fresh Linux server with systemd, the guided installer downloads and verifi
 curl -fsSL https://src.ws2.sh/outboxd/install.sh | sh
 ```
 
-The installer reads prompts directly from the controlling terminal, parses the complete script before taking action, uses `sudo` when the shell is not already root and refuses to overwrite an existing `/opt/outboxd`. Review `install.sh` before running a network-delivered root installer. Release checksums detect download corruption or mismatched assets; because the checksum and archive come from the same GitHub release, they are not an independent signature.
+The installer reads prompts directly from the controlling terminal, parses the complete script before taking action, uses `sudo` when the shell is not already root and refuses to overwrite an existing `/opt/outboxd`. Review `install.sh` before running a network-delivered root installer. Release binaries from v0.7.0 onward are code-signed before packaging. Release checksums detect download corruption or mismatched assets; because the checksum and archive come from the same GitHub release, they are not an independent signature.
 
 ### Release archive
 
